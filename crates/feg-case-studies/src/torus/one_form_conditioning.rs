@@ -1,0 +1,4898 @@
+use crate::torus::diagnostics::{
+    build_analytic_torus_harmonic_basis, build_harmonic_orthogonality_constraints,
+    infer_torus_radii,
+};
+use crate::visual_output;
+use common::linalg::nalgebra::{CsrMatrix as FeecCsr, Matrix as FeecMatrix, Vector as FeecVector};
+use ddf::cochain::{cochain_projection, Cochain};
+use ddf::whitney::lsf::WhitneyLsf;
+use exterior::field::{EmbeddedDiffFormClosure, ExteriorField};
+use feg_infer::conditioning::linear::{
+    DerivedOperator, DerivedOperatorSet, DerivedVarianceMode, HarmonicSubspace, HutchinsonConfig,
+    LinearGaussianConditioningProblem, LinearGaussianConditioningResult,
+};
+use feg_infer::prior::matern::one_form::{
+    build_hodge_laplacian_1form, build_matern_precision_1form,
+    build_matern_precision_1form_for_alpha, feec_csr_to_gmrf, feec_vec_to_gmrf, MaternAlpha,
+    MaternConfig, MaternMassInverse,
+};
+use feg_infer::sparse::gmrf_vec_to_feec;
+use formoniq::io::sample_1form_cell_vectors;
+use gmrf_core::observation::{
+    apply_gaussian_observations, ht_weighted_observations, observation_selector,
+};
+use gmrf_core::types::Vector as GmrfVector;
+#[cfg(test)]
+use gmrf_core::types::{DenseMatrix as GmrfDenseMatrix, SparseMatrix as GmrfSparseMatrix};
+use gmrf_core::{
+    clip_vector_to_prior as gmrf_clip_vector_to_prior, estimate_constrained_transformed_variances,
+    ConstrainedPrecisionSolver, GmrfError, ProbeBatchConfig, ProbeDistribution, SparseRowOperator,
+    TransformedVarianceDecomposition, TransformedVarianceMode, VarianceFloor,
+};
+#[cfg(test)]
+use gmrf_core::{estimate_batched_transformed_hutchinson_decomposition, Gmrf};
+use manifold::{
+    geometry::coord::{
+        mesh::MeshCoords,
+        simplex::{barycenter_local, SimplexHandleExt},
+    },
+    topology::complex::Complex,
+};
+use std::collections::HashSet;
+use std::error::Error;
+use std::f64::consts::PI;
+use std::fs::{self, File};
+use std::io::{self, BufWriter, Write};
+use std::path::Path;
+use std::path::PathBuf;
+
+const EPS: f64 = 1e-12;
+const HARMONIC_TOROIDAL_SCALE: f64 = 0.75;
+const HARMONIC_POLOIDAL_SCALE: f64 = -0.50;
+const TOROIDAL_ALIGNMENT_MIN: f64 = 0.8;
+const POLOIDAL_ALIGNMENT_MAX: f64 = 0.2;
+const FAR_RADIUS_SCALE: f64 = 2.0;
+const DEFAULT_NUM_VARIANCE_PROBES: usize = 256;
+const DEFAULT_VARIANCE_BATCH_COUNT: usize = 8;
+const DEFAULT_RNG_SEED: u64 = 13;
+const OBSERVATION_PROFILE_DISTANCE_SCALES: &[f64] =
+    &[0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50, 2.00];
+const SMOOTHING_BANDWIDTH_SCALE: f64 = 0.5;
+const SMOOTHING_CUTOFF_SCALE: f64 = 1.0;
+const VARIANCE_OBJECT_EDGE_ALL: &str = "edge_all";
+const VARIANCE_OBJECT_EDGE_COMPATIBLE: &str = "edge_compatible";
+const VARIANCE_OBJECT_EDGE_TRANSVERSE: &str = "edge_transverse";
+const VARIANCE_OBJECT_COMPONENT_MATCHED: &str = "component_matched";
+const VARIANCE_OBJECT_COMPONENT_ORTHOGONAL: &str = "component_orthogonal";
+const VARIANCE_OBJECT_COMPONENT_TRACE: &str = "component_trace";
+const VARIANCE_OBJECT_SMOOTHED_MATCHED: &str = "smoothed_matched";
+const VARIANCE_OBJECT_SMOOTHED_ORTHOGONAL: &str = "smoothed_orthogonal";
+const VARIANCE_OBJECT_SMOOTHED_TRACE: &str = "smoothed_trace";
+const VARIANCE_OBJECT_CIRCULATION: &str = "circulation";
+
+const DEFAULT_OBSERVATION_TARGETS: [Torus1FormObservationTarget; 6] = [
+    Torus1FormObservationTarget {
+        theta: -0.50,
+        phi: -2.75,
+        direction: ObservationDirection::Toroidal,
+    },
+    Torus1FormObservationTarget {
+        theta: 1.50,
+        phi: -1.75,
+        direction: ObservationDirection::Toroidal,
+    },
+    Torus1FormObservationTarget {
+        theta: 2.00,
+        phi: 1.75,
+        direction: ObservationDirection::Toroidal,
+    },
+    Torus1FormObservationTarget {
+        theta: -3.00,
+        phi: -0.75,
+        direction: ObservationDirection::Poloidal,
+    },
+    Torus1FormObservationTarget {
+        theta: 0.75,
+        phi: -0.75,
+        direction: ObservationDirection::Poloidal,
+    },
+    Torus1FormObservationTarget {
+        theta: 1.25,
+        phi: -1.75,
+        direction: ObservationDirection::Poloidal,
+    },
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObservationDirection {
+    Toroidal,
+    Poloidal,
+}
+
+impl ObservationDirection {
+    fn matches_alignment(self, toroidal_alignment_sq: f64) -> bool {
+        match self {
+            Self::Toroidal => toroidal_alignment_sq >= TOROIDAL_ALIGNMENT_MIN,
+            Self::Poloidal => toroidal_alignment_sq <= POLOIDAL_ALIGNMENT_MAX,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Toroidal => "toroidal",
+            Self::Poloidal => "poloidal",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SurfaceVectorVarianceMode {
+    #[default]
+    Exact,
+    Hutchinson,
+    HutchinsonStabilized,
+}
+
+impl SurfaceVectorVarianceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::Hutchinson => "hutchinson",
+            Self::HutchinsonStabilized => "hutchinson-stabilized",
+        }
+    }
+}
+
+impl std::str::FromStr for SurfaceVectorVarianceMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "exact" => Ok(Self::Exact),
+            "hutchinson" => Ok(Self::Hutchinson),
+            "hutchinson-stabilized" => Ok(Self::HutchinsonStabilized),
+            _ => Err(format!(
+                "invalid surface-vector variance mode `{value}`; expected one of: exact, hutchinson, hutchinson-stabilized"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Torus1FormObservationTarget {
+    pub theta: f64,
+    pub phi: f64,
+    pub direction: ObservationDirection,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormConditioningConfig {
+    pub mesh_path: PathBuf,
+    pub alpha: MaternAlpha,
+    pub kappa: f64,
+    pub tau: f64,
+    pub noise_variance: f64,
+    pub surface_vector_variance_mode: SurfaceVectorVarianceMode,
+    pub num_variance_probes: usize,
+    pub variance_batch_count: usize,
+    pub rng_seed: u64,
+    pub neighbourhood_radius_scale: f64,
+    pub observation_targets: Vec<Torus1FormObservationTarget>,
+}
+
+impl Default for Torus1FormConditioningConfig {
+    fn default() -> Self {
+        Self {
+            mesh_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../meshes/torus_shell_resolution_1.msh"),
+            alpha: MaternAlpha::Two,
+            kappa: 4.0,
+            tau: 1.0,
+            noise_variance: 1e-8,
+            surface_vector_variance_mode: SurfaceVectorVarianceMode::Exact,
+            num_variance_probes: DEFAULT_NUM_VARIANCE_PROBES,
+            variance_batch_count: DEFAULT_VARIANCE_BATCH_COUNT,
+            rng_seed: DEFAULT_RNG_SEED,
+            neighbourhood_radius_scale: 0.75,
+            observation_targets: DEFAULT_OBSERVATION_TARGETS.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormSelectedObservation {
+    pub observation_index: usize,
+    pub edge_index: usize,
+    pub target_theta: f64,
+    pub target_phi: f64,
+    pub direction: ObservationDirection,
+    pub edge_theta: f64,
+    pub edge_phi: f64,
+    pub toroidal_alignment_sq: f64,
+    pub selection_distance: f64,
+    pub used_fallback: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormObservationSummary {
+    pub observation_index: usize,
+    pub edge_index: usize,
+    pub direction: ObservationDirection,
+    pub used_fallback: bool,
+    pub target_theta: f64,
+    pub target_phi: f64,
+    pub edge_theta: f64,
+    pub edge_phi: f64,
+    pub observation_value: f64,
+    pub posterior_mean_at_observation: f64,
+    pub abs_error_at_observation: f64,
+    pub prior_variance_at_observation: f64,
+    pub posterior_variance_at_observation: f64,
+    pub harmonic_free_truth_at_observation: f64,
+    pub harmonic_free_posterior_mean_at_observation: f64,
+    pub harmonic_free_abs_error_at_observation: f64,
+    pub harmonic_free_prior_variance_at_observation: f64,
+    pub harmonic_free_posterior_variance_at_observation: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RegionSummary {
+    pub count: usize,
+    pub mean_abs_error: f64,
+    pub harmonic_free_mean_abs_error: f64,
+    pub prior_variance_mean: f64,
+    pub posterior_variance_mean: f64,
+    pub variance_reduction_mean: f64,
+    pub variance_ratio_mean: f64,
+    pub harmonic_free_prior_variance_mean: f64,
+    pub harmonic_free_posterior_variance_mean: f64,
+    pub harmonic_free_variance_reduction_mean: f64,
+    pub harmonic_free_variance_ratio_mean: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObservedSummary {
+    pub count: usize,
+    pub max_abs_error: f64,
+    pub mean_abs_error: f64,
+    pub harmonic_free_mean_abs_error: f64,
+    pub prior_variance_mean: f64,
+    pub posterior_variance_mean: f64,
+    pub variance_reduction_mean: f64,
+    pub variance_ratio_mean: f64,
+    pub harmonic_free_prior_variance_mean: f64,
+    pub harmonic_free_posterior_variance_mean: f64,
+    pub harmonic_free_variance_reduction_mean: f64,
+    pub harmonic_free_variance_ratio_mean: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormBranchSummary {
+    pub observed: ObservedSummary,
+    pub near: RegionSummary,
+    pub far: RegionSummary,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormVarianceFieldSet {
+    pub prior: FeecVector,
+    pub posterior: FeecVector,
+    pub ratio: FeecVector,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormVarianceComponentFields {
+    pub toroidal: Torus1FormVarianceFieldSet,
+    pub poloidal: Torus1FormVarianceFieldSet,
+    pub trace: Torus1FormVarianceFieldSet,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormAmbientVarianceFields {
+    pub x: Torus1FormVarianceFieldSet,
+    pub y: Torus1FormVarianceFieldSet,
+    pub z: Torus1FormVarianceFieldSet,
+    pub trace: Torus1FormVarianceFieldSet,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormVariancePatternSummaryRow {
+    pub object: &'static str,
+    pub observation_count: usize,
+    pub very_local_ratio: f64,
+    pub local_ratio: f64,
+    pub range_ratio: f64,
+    pub far_ratio: f64,
+    pub localization_auc: f64,
+    pub monotonicity_score: f64,
+    pub very_local_orientation_contrast: f64,
+    pub local_orientation_contrast: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormVariancePatternShellProfileRow {
+    pub object: &'static str,
+    pub observation_index: usize,
+    pub observation_direction: ObservationDirection,
+    pub distance_min_scale: f64,
+    pub distance_max_scale: f64,
+    pub distance_min: f64,
+    pub distance_max: f64,
+    pub shell_mid_scale: f64,
+    pub count: usize,
+    pub mean_ratio: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormVariancePatternReport {
+    pub shell_distance_scales: Vec<f64>,
+    pub smoothing_bandwidth: f64,
+    pub smoothing_cutoff: f64,
+    pub reconstructed: Torus1FormVarianceComponentFields,
+    pub surface_vector: Torus1FormAmbientVarianceFields,
+    pub smoothed: Torus1FormVarianceComponentFields,
+    pub circulation: Torus1FormVarianceFieldSet,
+    pub summary_rows: Vec<Torus1FormVariancePatternSummaryRow>,
+    pub shell_profile_rows: Vec<Torus1FormVariancePatternShellProfileRow>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormBranchResult {
+    pub name: &'static str,
+    pub truth: FeecVector,
+    pub posterior_mean: FeecVector,
+    pub absolute_mean_error: FeecVector,
+    pub prior_variance: FeecVector,
+    pub posterior_variance: FeecVector,
+    pub variance_reduction: FeecVector,
+    pub harmonic_free_truth: FeecVector,
+    pub harmonic_free_posterior_mean: FeecVector,
+    pub harmonic_free_absolute_mean_error: FeecVector,
+    pub harmonic_free_prior_variance: FeecVector,
+    pub harmonic_free_posterior_variance: FeecVector,
+    pub harmonic_free_variance_reduction: FeecVector,
+    pub observed_mask: FeecVector,
+    pub nearest_observation_value: FeecVector,
+    pub nearest_observation_distance: FeecVector,
+    pub observation_values: Vec<f64>,
+    pub observation_summaries: Vec<Torus1FormObservationSummary>,
+    pub harmonic_coefficients_truth: [f64; 2],
+    pub harmonic_coefficients_posterior_mean: [f64; 2],
+    pub summary: Torus1FormBranchSummary,
+    pub variance_pattern: Torus1FormVariancePatternReport,
+}
+
+pub struct Torus1FormConditioningResult {
+    pub topology: Complex,
+    pub coords: MeshCoords,
+    pub edge_theta: FeecVector,
+    pub edge_phi: FeecVector,
+    pub toroidal_alignment_sq: FeecVector,
+    pub observation_targets: Vec<Torus1FormObservationTarget>,
+    pub selected_observations: Vec<Torus1FormSelectedObservation>,
+    pub observation_indices: Vec<usize>,
+    pub major_radius: f64,
+    pub minor_radius: f64,
+    pub surface_vector_variance_mode: SurfaceVectorVarianceMode,
+    pub alpha: MaternAlpha,
+    pub num_variance_probes: usize,
+    pub variance_batch_count: usize,
+    pub rng_seed: u64,
+    pub effective_range: f64,
+    pub neighbourhood_radius: f64,
+    pub far_radius: f64,
+    pub harmonic_free_constrained: Torus1FormBranchResult,
+    pub full_unconstrained: Torus1FormBranchResult,
+}
+
+struct TorusEdgeGeometry {
+    major_radius: f64,
+    minor_radius: f64,
+    theta: Vec<f64>,
+    phi: Vec<f64>,
+    toroidal_alignment_sq: Vec<f64>,
+}
+
+struct TorusCellGeometry {
+    major_radius: f64,
+    minor_radius: f64,
+    theta: Vec<f64>,
+    phi: Vec<f64>,
+}
+
+struct HutchinsonVarianceEstimates {
+    unconstrained: GmrfVector,
+    harmonic_free: GmrfVector,
+}
+
+#[cfg(test)]
+struct HutchinsonWorkspace {
+    gmrf: Gmrf,
+    harmonic_constraints: GmrfDenseMatrix,
+}
+
+type SparseRowLinearOperator = SparseRowOperator;
+
+struct VariancePatternSharedData {
+    major_radius: f64,
+    minor_radius: f64,
+    cell_theta: FeecVector,
+    cell_phi: FeecVector,
+    smoothing_bandwidth: f64,
+    smoothing_cutoff: f64,
+    reconstructed_prior: Torus1FormVarianceComponentEstimates,
+    reconstructed_posterior: Torus1FormVarianceComponentEstimates,
+    surface_vector_prior: Torus1FormAmbientVarianceEstimates,
+    surface_vector_posterior: Torus1FormAmbientVarianceEstimates,
+    smoothed_prior: Torus1FormVarianceComponentEstimates,
+    smoothed_posterior: Torus1FormVarianceComponentEstimates,
+    circulation_prior: HutchinsonVarianceEstimates,
+    circulation_posterior: HutchinsonVarianceEstimates,
+}
+
+struct Torus1FormVarianceComponentEstimates {
+    toroidal: HutchinsonVarianceEstimates,
+    poloidal: HutchinsonVarianceEstimates,
+}
+
+struct Torus1FormAmbientVarianceEstimates {
+    x: HutchinsonVarianceEstimates,
+    y: HutchinsonVarianceEstimates,
+    z: HutchinsonVarianceEstimates,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ObservationOrientationRelation {
+    Compatible,
+    Oblique,
+    Transverse,
+}
+
+impl ObservationOrientationRelation {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compatible => "compatible",
+            Self::Oblique => "oblique",
+            Self::Transverse => "transverse",
+        }
+    }
+}
+
+pub fn run_torus_1form_conditioning(
+    config: &Torus1FormConditioningConfig,
+) -> Result<Torus1FormConditioningResult, Box<dyn Error>> {
+    validate_config(config)?;
+
+    let mesh_bytes = fs::read(&config.mesh_path)?;
+    let (topology, coords) = manifold::io::gmsh::gmsh2coord_complex(&mesh_bytes);
+    let metric = coords.to_edge_lengths(&topology);
+    let geometry = build_torus_edge_geometry(&topology, &coords)?;
+    let cell_geometry = build_torus_cell_geometry(
+        &topology,
+        &coords,
+        geometry.major_radius,
+        geometry.minor_radius,
+    )
+    .map_err(invalid_data)?;
+    let hodge = build_hodge_laplacian_1form(&topology, &metric);
+    let harmonic_basis =
+        build_analytic_torus_harmonic_basis(&topology, &coords, &metric).map_err(invalid_data)?;
+    let harmonic_basis_orthonormal =
+        mass_orthonormalize_harmonic_basis(&harmonic_basis, &hodge.mass_u).map_err(invalid_data)?;
+    let harmonic_constraints =
+        build_harmonic_orthogonality_constraints(&harmonic_basis, &hodge.mass_u)
+            .map_err(invalid_data)?;
+    let seed = build_local_seed_cochain(
+        &topology,
+        &coords,
+        geometry.major_radius,
+        geometry.minor_radius,
+    );
+    let truth_harmonic_free =
+        remove_harmonic_content(&seed.coeffs, &harmonic_basis_orthonormal, &hodge.mass_u);
+    let harmonic_toroidal = harmonic_basis_orthonormal.column(0).into_owned();
+    let harmonic_poloidal = harmonic_basis_orthonormal.column(1).into_owned();
+    let truth_full = &truth_harmonic_free
+        + harmonic_toroidal.scale(HARMONIC_TOROIDAL_SCALE)
+        + harmonic_poloidal.scale(HARMONIC_POLOIDAL_SCALE);
+
+    let selected_observations =
+        select_observation_edges(&geometry, &config.observation_targets).map_err(invalid_data)?;
+    let observation_indices = selected_observations
+        .iter()
+        .map(|selected| selected.edge_index)
+        .collect::<Vec<_>>();
+    let observation_matrix = observation_selector(hodge.mass_u.nrows(), &observation_indices);
+    let observed_mask = build_observed_mask(hodge.mass_u.nrows(), &observation_indices);
+    let nearest_observation_slots =
+        build_nearest_observation_slots(&geometry, &observation_indices);
+    let nearest_observation_distance = build_nearest_observation_distance_field(
+        &geometry,
+        &observation_indices,
+        &nearest_observation_slots,
+    );
+    let edge_theta = FeecVector::from_vec(geometry.theta.clone());
+    let edge_phi = FeecVector::from_vec(geometry.phi.clone());
+    let toroidal_alignment_sq = FeecVector::from_vec(geometry.toroidal_alignment_sq.clone());
+
+    let prior_precision = build_matern_precision_1form_for_alpha(
+        &topology,
+        &metric,
+        &hodge,
+        config.alpha,
+        MaternConfig {
+            kappa: config.kappa,
+            tau: config.tau,
+            mass_inverse: MaternMassInverse::Nc1ProjectedSparseInverse,
+        },
+    );
+    let q_prior = feec_csr_to_gmrf(&prior_precision);
+    let effective_range = config.alpha.diagnostic_range_2d(config.kappa);
+    let neighbourhood_radius = config.neighbourhood_radius_scale * effective_range;
+    let far_radius = FAR_RADIUS_SCALE * effective_range;
+    let smoothing_bandwidth = SMOOTHING_BANDWIDTH_SCALE * effective_range;
+    let smoothing_cutoff = SMOOTHING_CUTOFF_SCALE * effective_range;
+
+    let toroidal_operator =
+        build_reconstructed_component_operator(&topology, &coords, &cell_geometry, true)
+            .map_err(invalid_data)?;
+    let poloidal_operator =
+        build_reconstructed_component_operator(&topology, &coords, &cell_geometry, false)
+            .map_err(invalid_data)?;
+    let surface_x_operator =
+        build_embedded_component_operator(&topology, &coords, 0).map_err(invalid_data)?;
+    let surface_y_operator =
+        build_embedded_component_operator(&topology, &coords, 1).map_err(invalid_data)?;
+    let surface_z_operator =
+        build_embedded_component_operator(&topology, &coords, 2).map_err(invalid_data)?;
+    let reconstructed_stacked_operator =
+        SparseRowLinearOperator::stack(&[&toroidal_operator, &poloidal_operator])
+            .map_err(|err| invalid_data(err.to_string()))?;
+    let surface_vector_stacked_operator = SparseRowLinearOperator::stack(&[
+        &surface_x_operator,
+        &surface_y_operator,
+        &surface_z_operator,
+    ])
+    .map_err(|err| invalid_data(err.to_string()))?;
+    let smoothing_operator =
+        build_gaussian_smoothing_operator(&cell_geometry, smoothing_bandwidth, smoothing_cutoff)
+            .map_err(invalid_data)?;
+    let smoothed_toroidal_operator =
+        SparseRowLinearOperator::compose(&smoothing_operator, &toroidal_operator)
+            .map_err(|err| invalid_data(err.to_string()))?;
+    let smoothed_poloidal_operator =
+        SparseRowLinearOperator::compose(&smoothing_operator, &poloidal_operator)
+            .map_err(|err| invalid_data(err.to_string()))?;
+    let smoothed_stacked_operator =
+        SparseRowLinearOperator::stack(&[&smoothed_toroidal_operator, &smoothed_poloidal_operator])
+            .map_err(|err| invalid_data(err.to_string()))?;
+    let circulation_operator =
+        build_local_circulation_operator(&topology, hodge.mass_u.nrows()).map_err(invalid_data)?;
+
+    let mut derived_operators = DerivedOperatorSet::new();
+    derived_operators.insert(
+        "reconstructed".to_string(),
+        DerivedOperator {
+            operator: reconstructed_stacked_operator.clone(),
+            variance_mode: DerivedVarianceMode::Hutchinson,
+        },
+    );
+    derived_operators.insert(
+        "surface_vector".to_string(),
+        DerivedOperator {
+            operator: surface_vector_stacked_operator.clone(),
+            variance_mode: match config.surface_vector_variance_mode {
+                SurfaceVectorVarianceMode::Exact => DerivedVarianceMode::Exact,
+                SurfaceVectorVarianceMode::Hutchinson
+                | SurfaceVectorVarianceMode::HutchinsonStabilized => {
+                    DerivedVarianceMode::Hutchinson
+                }
+            },
+        },
+    );
+    derived_operators.insert(
+        "smoothed".to_string(),
+        DerivedOperator {
+            operator: smoothed_stacked_operator.clone(),
+            variance_mode: DerivedVarianceMode::Hutchinson,
+        },
+    );
+    derived_operators.insert(
+        "circulation".to_string(),
+        DerivedOperator {
+            operator: circulation_operator.clone(),
+            variance_mode: DerivedVarianceMode::Hutchinson,
+        },
+    );
+
+    let conditioning_problem = LinearGaussianConditioningProblem {
+        prior_precision: q_prior.clone(),
+        observation_operator: observation_matrix.clone(),
+        observations: GmrfVector::zeros(observation_indices.len()),
+        noise_variance: config.noise_variance,
+        harmonic_subspace: Some(HarmonicSubspace {
+            basis: harmonic_basis_orthonormal.clone(),
+            constraints: harmonic_constraints.clone(),
+            projector: None,
+        }),
+        derived_operators,
+        hutchinson: HutchinsonConfig {
+            num_probes: config.num_variance_probes,
+            batch_count: config.variance_batch_count,
+            rng_seed: config.rng_seed,
+        },
+    };
+    let prepared_conditioning = conditioning_problem.prepare()?;
+
+    let truth_harmonic_free_gmrf = feec_vec_to_gmrf(&truth_harmonic_free);
+    let harmonic_free_observations = &observation_matrix * &truth_harmonic_free_gmrf;
+    let harmonic_free_conditioning =
+        prepared_conditioning.solve_with_observations(&harmonic_free_observations)?;
+
+    let truth_full_gmrf = feec_vec_to_gmrf(&truth_full);
+    let full_observations = &observation_matrix * &truth_full_gmrf;
+    let full_conditioning = prepared_conditioning.solve_with_observations(&full_observations)?;
+
+    let cell_count = cell_geometry.theta.len();
+    let reconstructed_prior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "reconstructed",
+            true,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let reconstructed_posterior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "reconstructed",
+            false,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_prior = split_ambient_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "surface_vector",
+            true,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_posterior_raw = split_ambient_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "surface_vector",
+            false,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_posterior =
+        if config.surface_vector_variance_mode == SurfaceVectorVarianceMode::HutchinsonStabilized {
+            clip_hutchinson_posterior_to_prior(&surface_vector_prior, &surface_vector_posterior_raw)
+        } else {
+            surface_vector_posterior_raw
+        };
+    let smoothed_prior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "smoothed",
+            true,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let smoothed_posterior = split_component_estimates(
+        decomposition_to_estimates(get_derived_decomposition(
+            &harmonic_free_conditioning,
+            "smoothed",
+            false,
+        )?),
+        cell_count,
+    )
+    .map_err(invalid_data)?;
+    let circulation_prior = decomposition_to_estimates(get_derived_decomposition(
+        &harmonic_free_conditioning,
+        "circulation",
+        true,
+    )?);
+    let circulation_posterior = decomposition_to_estimates(get_derived_decomposition(
+        &harmonic_free_conditioning,
+        "circulation",
+        false,
+    )?);
+
+    let variance_pattern_shared = VariancePatternSharedData {
+        major_radius: geometry.major_radius,
+        minor_radius: geometry.minor_radius,
+        cell_theta: FeecVector::from_vec(cell_geometry.theta.clone()),
+        cell_phi: FeecVector::from_vec(cell_geometry.phi.clone()),
+        smoothing_bandwidth,
+        smoothing_cutoff,
+        reconstructed_prior,
+        reconstructed_posterior,
+        surface_vector_prior,
+        surface_vector_posterior,
+        smoothed_prior,
+        smoothed_posterior,
+        circulation_prior,
+        circulation_posterior,
+    };
+
+    let harmonic_free_constrained = build_branch_result(
+        "harmonic_free_constrained",
+        &truth_harmonic_free,
+        &harmonic_free_conditioning,
+        true,
+        &edge_theta,
+        &edge_phi,
+        &toroidal_alignment_sq,
+        &variance_pattern_shared,
+        &harmonic_basis_orthonormal,
+        &hodge.mass_u,
+        &selected_observations,
+        &nearest_observation_slots,
+        &nearest_observation_distance,
+        &observed_mask,
+        effective_range,
+        neighbourhood_radius,
+        far_radius,
+    )?;
+
+    let full_unconstrained = build_branch_result(
+        "full_unconstrained",
+        &truth_full,
+        &full_conditioning,
+        false,
+        &edge_theta,
+        &edge_phi,
+        &toroidal_alignment_sq,
+        &variance_pattern_shared,
+        &harmonic_basis_orthonormal,
+        &hodge.mass_u,
+        &selected_observations,
+        &nearest_observation_slots,
+        &nearest_observation_distance,
+        &observed_mask,
+        effective_range,
+        neighbourhood_radius,
+        far_radius,
+    )?;
+
+    Ok(Torus1FormConditioningResult {
+        topology,
+        coords,
+        edge_theta,
+        edge_phi,
+        toroidal_alignment_sq,
+        observation_targets: config.observation_targets.clone(),
+        selected_observations,
+        observation_indices,
+        major_radius: geometry.major_radius,
+        minor_radius: geometry.minor_radius,
+        surface_vector_variance_mode: config.surface_vector_variance_mode,
+        alpha: config.alpha,
+        num_variance_probes: config.num_variance_probes,
+        variance_batch_count: config.variance_batch_count,
+        rng_seed: config.rng_seed,
+        effective_range,
+        neighbourhood_radius,
+        far_radius,
+        harmonic_free_constrained,
+        full_unconstrained,
+    })
+}
+
+pub fn write_torus_1form_conditioning_outputs(
+    result: &Torus1FormConditioningResult,
+    out_dir: impl AsRef<Path>,
+) -> Result<(), Box<dyn Error>> {
+    let out_dir = out_dir.as_ref();
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir)?;
+
+    write_selected_observations_csv(result, out_dir)?;
+    write_overall_summary(result, out_dir)?;
+    write_branch_outputs(result, &result.harmonic_free_constrained, out_dir)?;
+    write_branch_outputs(result, &result.full_unconstrained, out_dir)?;
+
+    Ok(())
+}
+
+fn build_branch_result(
+    name: &'static str,
+    truth: &FeecVector,
+    conditioning: &LinearGaussianConditioningResult,
+    enforce_harmonic_constraints: bool,
+    edge_theta: &FeecVector,
+    edge_phi: &FeecVector,
+    toroidal_alignment_sq: &FeecVector,
+    variance_pattern_shared: &VariancePatternSharedData,
+    harmonic_basis_orthonormal: &FeecMatrix,
+    mass_u: &FeecCsr,
+    selected_observations: &[Torus1FormSelectedObservation],
+    nearest_observation_slots: &[usize],
+    nearest_observation_distance: &FeecVector,
+    observed_mask: &FeecVector,
+    effective_range: f64,
+    neighbourhood_radius: f64,
+    far_radius: f64,
+) -> Result<Torus1FormBranchResult, Box<dyn Error>> {
+    let posterior_mean = if enforce_harmonic_constraints {
+        conditioning
+            .constrained_posterior_mean
+            .as_ref()
+            .ok_or_else(|| invalid_data("missing constrained posterior mean"))?
+            .clone()
+    } else {
+        conditioning.posterior_mean.clone()
+    };
+    let posterior_variance = if enforce_harmonic_constraints {
+        gmrf_vec_to_feec(&conditioning.posterior_latent_variance.constrained_diag)
+    } else {
+        gmrf_vec_to_feec(&conditioning.posterior_latent_variance.unconstrained_diag)
+    };
+    let prior_variance = if enforce_harmonic_constraints {
+        gmrf_vec_to_feec(&conditioning.prior_latent_variance.constrained_diag)
+    } else {
+        gmrf_vec_to_feec(&conditioning.prior_latent_variance.unconstrained_diag)
+    };
+
+    let posterior_mean = gmrf_vec_to_feec(&posterior_mean);
+    let observation_values = conditioning
+        .observations
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let absolute_mean_error = absolute_difference(&posterior_mean, truth);
+    let variance_reduction = &prior_variance - &posterior_variance;
+
+    let harmonic_free_truth = remove_harmonic_content(truth, harmonic_basis_orthonormal, mass_u);
+    let harmonic_free_posterior_mean =
+        remove_harmonic_content(&posterior_mean, harmonic_basis_orthonormal, mass_u);
+    let harmonic_free_absolute_mean_error =
+        absolute_difference(&harmonic_free_posterior_mean, &harmonic_free_truth);
+    let harmonic_free_prior_variance =
+        gmrf_vec_to_feec(&conditioning.prior_latent_variance.constrained_diag);
+    let harmonic_free_posterior_variance =
+        gmrf_vec_to_feec(&conditioning.posterior_latent_variance.constrained_diag);
+    let harmonic_free_variance_reduction =
+        &harmonic_free_prior_variance - &harmonic_free_posterior_variance;
+
+    let nearest_observation_value =
+        build_nearest_observation_value_field(nearest_observation_slots, &observation_values);
+    let harmonic_coefficients_truth =
+        harmonic_coefficients(truth, harmonic_basis_orthonormal, mass_u).map_err(invalid_data)?;
+    let harmonic_coefficients_posterior_mean =
+        harmonic_coefficients(&posterior_mean, harmonic_basis_orthonormal, mass_u)
+            .map_err(invalid_data)?;
+
+    let observation_summaries = build_observation_summaries(
+        selected_observations,
+        &observation_values,
+        &posterior_mean,
+        &absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+        &harmonic_free_truth,
+        &harmonic_free_posterior_mean,
+        &harmonic_free_absolute_mean_error,
+        &harmonic_free_prior_variance,
+        &harmonic_free_posterior_variance,
+    );
+    let summary = build_branch_summary(
+        selected_observations,
+        nearest_observation_distance,
+        &absolute_mean_error,
+        &harmonic_free_absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+        &harmonic_free_prior_variance,
+        &harmonic_free_posterior_variance,
+        neighbourhood_radius,
+        far_radius,
+    )
+    .map_err(invalid_data)?;
+    let variance_pattern = build_variance_pattern_report(
+        enforce_harmonic_constraints,
+        edge_theta,
+        edge_phi,
+        toroidal_alignment_sq,
+        selected_observations,
+        variance_pattern_shared,
+        &prior_variance,
+        &posterior_variance,
+        effective_range,
+    )
+    .map_err(invalid_data)?;
+
+    Ok(Torus1FormBranchResult {
+        name,
+        truth: truth.clone(),
+        posterior_mean,
+        absolute_mean_error,
+        prior_variance,
+        posterior_variance,
+        variance_reduction,
+        harmonic_free_truth,
+        harmonic_free_posterior_mean,
+        harmonic_free_absolute_mean_error,
+        harmonic_free_prior_variance,
+        harmonic_free_posterior_variance,
+        harmonic_free_variance_reduction,
+        observed_mask: observed_mask.clone(),
+        nearest_observation_value,
+        nearest_observation_distance: nearest_observation_distance.clone(),
+        observation_values,
+        observation_summaries,
+        harmonic_coefficients_truth,
+        harmonic_coefficients_posterior_mean,
+        summary,
+        variance_pattern,
+    })
+}
+
+fn get_derived_decomposition<'a>(
+    conditioning: &'a LinearGaussianConditioningResult,
+    name: &str,
+    prior: bool,
+) -> Result<&'a TransformedVarianceDecomposition, Box<dyn Error>> {
+    let map = if prior {
+        &conditioning.derived_prior_variances
+    } else {
+        &conditioning.derived_posterior_variances
+    };
+    map.get(name).ok_or_else(|| {
+        invalid_data(format!("missing derived variance decomposition `{name}`")).into()
+    })
+}
+
+fn decomposition_to_estimates(
+    decomposition: &TransformedVarianceDecomposition,
+) -> HutchinsonVarianceEstimates {
+    HutchinsonVarianceEstimates {
+        unconstrained: decomposition.unconstrained_diag.clone(),
+        harmonic_free: decomposition.constrained_diag.clone(),
+    }
+}
+
+fn validate_config(config: &Torus1FormConditioningConfig) -> Result<(), Box<dyn Error>> {
+    if !config.kappa.is_finite() || config.kappa <= 0.0 {
+        return Err(invalid_input("kappa must be finite and positive").into());
+    }
+    if !config.tau.is_finite() || config.tau <= 0.0 {
+        return Err(invalid_input("tau must be finite and positive").into());
+    }
+    if !config.noise_variance.is_finite() || config.noise_variance <= 0.0 {
+        return Err(invalid_input("noise_variance must be finite and positive").into());
+    }
+    if config.num_variance_probes == 0 {
+        return Err(invalid_input("num_variance_probes must be >= 1").into());
+    }
+    if config.variance_batch_count == 0 {
+        return Err(invalid_input("variance_batch_count must be >= 1").into());
+    }
+    if !config.neighbourhood_radius_scale.is_finite() || config.neighbourhood_radius_scale <= 0.0 {
+        return Err(invalid_input("neighbourhood_radius_scale must be finite and positive").into());
+    }
+    if config.observation_targets.is_empty() {
+        return Err(invalid_input("at least one observation target is required").into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn build_hutchinson_workspace(
+    precision: &GmrfSparseMatrix,
+    harmonic_constraints: &GmrfDenseMatrix,
+) -> Result<HutchinsonWorkspace, Box<dyn Error>> {
+    let q_factor = precision.cholesky_sqrt_lower()?;
+    let gmrf =
+        Gmrf::from_mean_and_precision(GmrfVector::zeros(precision.nrows()), precision.clone())?
+            .with_precision_sqrt(q_factor);
+    Ok(HutchinsonWorkspace {
+        gmrf,
+        harmonic_constraints: harmonic_constraints.clone(),
+    })
+}
+
+#[cfg(test)]
+fn exact_latent_variances(
+    workspace: &mut HutchinsonWorkspace,
+    harmonic_constraints: &GmrfDenseMatrix,
+) -> Result<HutchinsonVarianceEstimates, GmrfError> {
+    let decomposition = workspace
+        .gmrf
+        .exact_constrained_variance_decomposition(harmonic_constraints)?;
+    Ok(HutchinsonVarianceEstimates {
+        unconstrained: decomposition.unconstrained_diag,
+        harmonic_free: decomposition.constrained_diag,
+    })
+}
+
+#[cfg(test)]
+fn exact_transformed_variances(
+    workspace: &mut HutchinsonWorkspace,
+    operator: &SparseRowLinearOperator,
+) -> Result<HutchinsonVarianceEstimates, GmrfError> {
+    let decomposition = workspace
+        .gmrf
+        .exact_transformed_variance_decomposition(operator, &workspace.harmonic_constraints)?;
+    Ok(HutchinsonVarianceEstimates {
+        unconstrained: decomposition.unconstrained_diag,
+        harmonic_free: decomposition.constrained_diag,
+    })
+}
+
+#[cfg(test)]
+fn estimate_latent_hutchinson_variances(
+    workspace: &mut HutchinsonWorkspace,
+    dimension: usize,
+    num_variance_probes: usize,
+    variance_batch_count: usize,
+    rng_seed: u64,
+) -> Result<HutchinsonVarianceEstimates, Box<dyn Error>> {
+    let operator = SparseRowLinearOperator::identity(dimension);
+    estimate_transformed_hutchinson_variances(
+        workspace,
+        &operator,
+        num_variance_probes,
+        variance_batch_count,
+        rng_seed,
+    )
+}
+
+#[cfg(test)]
+fn estimate_transformed_hutchinson_variances(
+    workspace: &mut HutchinsonWorkspace,
+    operator: &SparseRowLinearOperator,
+    num_variance_probes: usize,
+    variance_batch_count: usize,
+    rng_seed: u64,
+) -> Result<HutchinsonVarianceEstimates, Box<dyn Error>> {
+    let estimate = estimate_batched_transformed_hutchinson_decomposition(
+        &mut workspace.gmrf,
+        operator,
+        &workspace.harmonic_constraints,
+        ProbeBatchConfig {
+            num_probes: num_variance_probes,
+            batch_count: variance_batch_count,
+            rng_seed,
+        },
+        VarianceFloor::PositiveMean { scale: 1e-12 },
+    )?;
+    Ok(HutchinsonVarianceEstimates {
+        unconstrained: estimate.decomposition.unconstrained_diag,
+        harmonic_free: estimate.decomposition.constrained_diag,
+    })
+}
+
+fn split_component_estimates(
+    stacked: HutchinsonVarianceEstimates,
+    cell_count: usize,
+) -> Result<Torus1FormVarianceComponentEstimates, String> {
+    if stacked.unconstrained.len() != 2 * cell_count
+        || stacked.harmonic_free.len() != 2 * cell_count
+    {
+        return Err(
+            "stacked component estimates must contain toroidal and poloidal blocks".to_string(),
+        );
+    }
+
+    Ok(Torus1FormVarianceComponentEstimates {
+        toroidal: HutchinsonVarianceEstimates {
+            unconstrained: GmrfVector::from_iterator(
+                cell_count,
+                (0..cell_count).map(|i| stacked.unconstrained[i]),
+            ),
+            harmonic_free: GmrfVector::from_iterator(
+                cell_count,
+                (0..cell_count).map(|i| stacked.harmonic_free[i]),
+            ),
+        },
+        poloidal: HutchinsonVarianceEstimates {
+            unconstrained: GmrfVector::from_iterator(
+                cell_count,
+                (0..cell_count).map(|i| stacked.unconstrained[cell_count + i]),
+            ),
+            harmonic_free: GmrfVector::from_iterator(
+                cell_count,
+                (0..cell_count).map(|i| stacked.harmonic_free[cell_count + i]),
+            ),
+        },
+    })
+}
+
+fn split_ambient_estimates(
+    stacked: HutchinsonVarianceEstimates,
+    cell_count: usize,
+) -> Result<Torus1FormAmbientVarianceEstimates, String> {
+    if stacked.unconstrained.len() != 3 * cell_count
+        || stacked.harmonic_free.len() != 3 * cell_count
+    {
+        return Err(
+            "stacked ambient estimates must contain x, y, and z component blocks".to_string(),
+        );
+    }
+
+    let block = |values: &GmrfVector, block_index: usize| {
+        GmrfVector::from_iterator(
+            cell_count,
+            (0..cell_count).map(|i| values[block_index * cell_count + i]),
+        )
+    };
+
+    Ok(Torus1FormAmbientVarianceEstimates {
+        x: HutchinsonVarianceEstimates {
+            unconstrained: block(&stacked.unconstrained, 0),
+            harmonic_free: block(&stacked.harmonic_free, 0),
+        },
+        y: HutchinsonVarianceEstimates {
+            unconstrained: block(&stacked.unconstrained, 1),
+            harmonic_free: block(&stacked.harmonic_free, 1),
+        },
+        z: HutchinsonVarianceEstimates {
+            unconstrained: block(&stacked.unconstrained, 2),
+            harmonic_free: block(&stacked.harmonic_free, 2),
+        },
+    })
+}
+
+fn clip_hutchinson_posterior_to_prior(
+    prior: &Torus1FormAmbientVarianceEstimates,
+    posterior: &Torus1FormAmbientVarianceEstimates,
+) -> Torus1FormAmbientVarianceEstimates {
+    Torus1FormAmbientVarianceEstimates {
+        x: clip_hutchinson_estimates_to_prior(&prior.x, &posterior.x),
+        y: clip_hutchinson_estimates_to_prior(&prior.y, &posterior.y),
+        z: clip_hutchinson_estimates_to_prior(&prior.z, &posterior.z),
+    }
+}
+
+fn clip_hutchinson_estimates_to_prior(
+    prior: &HutchinsonVarianceEstimates,
+    posterior: &HutchinsonVarianceEstimates,
+) -> HutchinsonVarianceEstimates {
+    HutchinsonVarianceEstimates {
+        unconstrained: clip_vector_to_prior(&prior.unconstrained, &posterior.unconstrained),
+        harmonic_free: clip_vector_to_prior(&prior.harmonic_free, &posterior.harmonic_free),
+    }
+}
+
+fn clip_vector_to_prior(prior: &GmrfVector, posterior: &GmrfVector) -> GmrfVector {
+    gmrf_clip_vector_to_prior(prior, posterior)
+        .expect("prior and posterior variance estimates must have matching dimensions")
+}
+
+fn classify_orientation_relation(
+    observation_direction: ObservationDirection,
+    toroidal_alignment_sq: f64,
+) -> ObservationOrientationRelation {
+    if observation_direction.matches_alignment(toroidal_alignment_sq) {
+        return ObservationOrientationRelation::Compatible;
+    }
+
+    let transverse = match observation_direction {
+        ObservationDirection::Toroidal => toroidal_alignment_sq <= POLOIDAL_ALIGNMENT_MAX,
+        ObservationDirection::Poloidal => toroidal_alignment_sq >= TOROIDAL_ALIGNMENT_MIN,
+    };
+    if transverse {
+        ObservationOrientationRelation::Transverse
+    } else {
+        ObservationOrientationRelation::Oblique
+    }
+}
+
+fn orientation_relation_filter_matches(
+    filter: Option<ObservationOrientationRelation>,
+    relation: ObservationOrientationRelation,
+) -> bool {
+    match filter {
+        Some(expected) => expected == relation,
+        None => true,
+    }
+}
+
+fn summarize_values(values: &[f64]) -> (usize, f64, f64, f64) {
+    if values.is_empty() {
+        return (0, f64::NAN, f64::NAN, f64::NAN);
+    }
+
+    let mut sum = 0.0;
+    let mut min_value = f64::INFINITY;
+    let mut max_value = f64::NEG_INFINITY;
+    for value in values.iter().copied() {
+        sum += value;
+        min_value = min_value.min(value);
+        max_value = max_value.max(value);
+    }
+
+    (
+        values.len(),
+        sum / values.len() as f64,
+        min_value,
+        max_value,
+    )
+}
+
+fn build_torus_edge_geometry(
+    topology: &Complex,
+    coords: &MeshCoords,
+) -> Result<TorusEdgeGeometry, io::Error> {
+    let (major_radius, minor_radius) = infer_torus_radii(coords).map_err(invalid_data)?;
+    let edge_skeleton = topology.skeleton(1);
+
+    let mut theta = Vec::with_capacity(edge_skeleton.len());
+    let mut phi = Vec::with_capacity(edge_skeleton.len());
+    let mut toroidal_alignment_sq = Vec::with_capacity(edge_skeleton.len());
+
+    for edge in edge_skeleton.handle_iter() {
+        let v0 = coords.coord(edge.vertices[0]);
+        let v1 = coords.coord(edge.vertices[1]);
+        let midpoint = (v0 + v1) / 2.0;
+        let rho = (midpoint[0] * midpoint[0] + midpoint[1] * midpoint[1])
+            .sqrt()
+            .max(EPS);
+        let midpoint_theta = midpoint[2].atan2(rho - major_radius);
+        let midpoint_phi = midpoint[1].atan2(midpoint[0]);
+
+        let tangent = v1 - v0;
+        let tangent_norm = tangent.norm();
+        let alignment_sq = if tangent_norm <= EPS {
+            0.0
+        } else {
+            let e_phi =
+                FeecVector::from_column_slice(&[-midpoint_phi.sin(), midpoint_phi.cos(), 0.0]);
+            let unit_tangent = tangent / tangent_norm;
+            unit_tangent.dot(&e_phi).powi(2).clamp(0.0, 1.0)
+        };
+
+        theta.push(midpoint_theta);
+        phi.push(midpoint_phi);
+        toroidal_alignment_sq.push(alignment_sq);
+    }
+
+    Ok(TorusEdgeGeometry {
+        major_radius,
+        minor_radius,
+        theta,
+        phi,
+        toroidal_alignment_sq,
+    })
+}
+
+fn build_torus_cell_geometry(
+    topology: &Complex,
+    coords: &MeshCoords,
+    major_radius: f64,
+    minor_radius: f64,
+) -> Result<TorusCellGeometry, String> {
+    let mut theta = Vec::with_capacity(topology.cells().len());
+    let mut phi = Vec::with_capacity(topology.cells().len());
+
+    for cell in topology.cells().handle_iter() {
+        let barycenter = cell.coord_simplex(coords).barycenter();
+        let x = barycenter[0];
+        let y = barycenter[1];
+        let z = barycenter[2];
+        let rho = (x * x + y * y).sqrt().max(EPS);
+        theta.push(z.atan2(rho - major_radius));
+        phi.push(y.atan2(x));
+    }
+
+    Ok(TorusCellGeometry {
+        major_radius,
+        minor_radius,
+        theta,
+        phi,
+    })
+}
+
+fn build_reconstructed_component_operator(
+    topology: &Complex,
+    coords: &MeshCoords,
+    cell_geometry: &TorusCellGeometry,
+    toroidal_component: bool,
+) -> Result<SparseRowLinearOperator, String> {
+    let topo_dim = topology.dim();
+    let cell_skeleton = topology.skeleton(topo_dim);
+    let bary_local = barycenter_local(topo_dim);
+    let mut rows = Vec::with_capacity(cell_skeleton.len());
+
+    for (cell_index, cell) in cell_skeleton.handle_iter().enumerate() {
+        let theta = cell_geometry.theta[cell_index];
+        let phi = cell_geometry.phi[cell_index];
+        let direction = if toroidal_component {
+            [-phi.sin(), phi.cos(), 0.0]
+        } else {
+            [
+                -theta.sin() * phi.cos(),
+                -theta.sin() * phi.sin(),
+                theta.cos(),
+            ]
+        };
+
+        let cell_coords = cell.coord_simplex(coords);
+        let jacobian_pinv = cell_coords.inv_linear_transform();
+        let mut row = Vec::new();
+        for dof_simp in cell.mesh_subsimps(1) {
+            let local_dof_simp = dof_simp.relative_to(&cell);
+            let lsf = WhitneyLsf::standard(topo_dim, local_dof_simp);
+            let local_value = lsf.at_point(&bary_local).into_grade1();
+            let ambient_value = if topo_dim == coords.dim() {
+                local_value
+            } else {
+                jacobian_pinv.transpose() * local_value
+            };
+            let coefficient = ambient_value[0] * direction[0]
+                + ambient_value[1] * direction[1]
+                + ambient_value[2] * direction[2];
+            if coefficient.abs() > EPS {
+                row.push((dof_simp.kidx(), coefficient));
+            }
+        }
+        rows.push(row);
+    }
+
+    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows).map_err(|err| err.to_string())
+}
+
+fn build_embedded_component_operator(
+    topology: &Complex,
+    coords: &MeshCoords,
+    component_index: usize,
+) -> Result<SparseRowLinearOperator, String> {
+    if component_index >= coords.dim() {
+        return Err(format!(
+            "ambient component index {} is out of range for coordinate dimension {}",
+            component_index,
+            coords.dim()
+        ));
+    }
+
+    let topo_dim = topology.dim();
+    let cell_skeleton = topology.skeleton(topo_dim);
+    let bary_local = barycenter_local(topo_dim);
+    let mut rows = Vec::with_capacity(cell_skeleton.len());
+
+    for cell in cell_skeleton.handle_iter() {
+        let cell_coords = cell.coord_simplex(coords);
+        let jacobian_pinv = cell_coords.inv_linear_transform();
+        let mut row = Vec::new();
+        for dof_simp in cell.mesh_subsimps(1) {
+            let local_dof_simp = dof_simp.relative_to(&cell);
+            let lsf = WhitneyLsf::standard(topo_dim, local_dof_simp);
+            let local_value = lsf.at_point(&bary_local).into_grade1();
+            let ambient_value = if topo_dim == coords.dim() {
+                local_value
+            } else {
+                jacobian_pinv.transpose() * local_value
+            };
+            let coefficient = ambient_value[component_index];
+            if coefficient.abs() > EPS {
+                row.push((dof_simp.kidx(), coefficient));
+            }
+        }
+        rows.push(row);
+    }
+
+    SparseRowLinearOperator::new(topology.skeleton(1).len(), rows).map_err(|err| err.to_string())
+}
+
+fn build_gaussian_smoothing_operator(
+    cell_geometry: &TorusCellGeometry,
+    bandwidth: f64,
+    cutoff: f64,
+) -> Result<SparseRowLinearOperator, String> {
+    if !bandwidth.is_finite() || bandwidth <= 0.0 {
+        return Err("smoothing bandwidth must be finite and positive".to_string());
+    }
+    if !cutoff.is_finite() || cutoff <= 0.0 {
+        return Err("smoothing cutoff must be finite and positive".to_string());
+    }
+
+    let mut rows = Vec::with_capacity(cell_geometry.theta.len());
+    for row_index in 0..cell_geometry.theta.len() {
+        let mut row = Vec::new();
+        let mut weight_sum = 0.0;
+        for col_index in 0..cell_geometry.theta.len() {
+            let distance = intrinsic_torus_distance(
+                cell_geometry.major_radius,
+                cell_geometry.minor_radius,
+                cell_geometry.theta[row_index],
+                cell_geometry.phi[row_index],
+                cell_geometry.theta[col_index],
+                cell_geometry.phi[col_index],
+            );
+            if distance > cutoff {
+                continue;
+            }
+            let weight = (-0.5 * (distance / bandwidth).powi(2)).exp();
+            if weight <= EPS {
+                continue;
+            }
+            row.push((col_index, weight));
+            weight_sum += weight;
+        }
+
+        if weight_sum <= EPS {
+            row.push((row_index, 1.0));
+            weight_sum = 1.0;
+        }
+        for (_, weight) in row.iter_mut() {
+            *weight /= weight_sum;
+        }
+        rows.push(row);
+    }
+
+    SparseRowLinearOperator::new(cell_geometry.theta.len(), rows).map_err(|err| err.to_string())
+}
+
+fn build_local_circulation_operator(
+    topology: &Complex,
+    edge_count: usize,
+) -> Result<SparseRowLinearOperator, String> {
+    let boundary = topology.boundary_operator(topology.dim());
+    let mut rows = vec![Vec::new(); topology.cells().len()];
+    for (edge_index, cell_index, value) in boundary.triplet_iter() {
+        if edge_index >= edge_count || cell_index >= rows.len() {
+            return Err("invalid face-boundary incidence entry".to_string());
+        }
+        if value.abs() > EPS {
+            rows[cell_index].push((edge_index, *value));
+        }
+    }
+    SparseRowLinearOperator::new(edge_count, rows).map_err(|err| err.to_string())
+}
+
+fn build_local_seed_cochain(
+    topology: &Complex,
+    coords: &MeshCoords,
+    major_radius: f64,
+    minor_radius: f64,
+) -> Cochain {
+    let seed = EmbeddedDiffFormClosure::ambient_one_form(
+        move |p| {
+            let x = p[0];
+            let y = p[1];
+            let z = p[2];
+            let rho = (x * x + y * y).sqrt().max(EPS);
+            let theta = z.atan2(rho - major_radius);
+            let phi = y.atan2(x);
+            let a = 0.7 * (2.0 * phi - theta).cos() + 0.2 * (3.0 * theta).sin();
+            let b = -0.5 * (phi + theta).sin() + 0.3 * (2.0 * theta).cos();
+
+            let toroidal = toroidal_covector(x, y);
+            let poloidal = poloidal_covector(x, y, z, rho, major_radius, minor_radius);
+            FeecVector::from_column_slice(&[
+                a * toroidal[0] + b * poloidal[0],
+                a * toroidal[1] + b * poloidal[1],
+                a * toroidal[2] + b * poloidal[2],
+            ])
+        },
+        coords.dim(),
+        topology.dim(),
+    );
+    cochain_projection(&seed, topology, coords, None)
+}
+
+fn toroidal_covector(x: f64, y: f64) -> [f64; 3] {
+    let rho2 = (x * x + y * y).max(EPS);
+    [-y / rho2, x / rho2, 0.0]
+}
+
+fn poloidal_covector(
+    x: f64,
+    y: f64,
+    z: f64,
+    rho: f64,
+    major_radius: f64,
+    minor_radius: f64,
+) -> [f64; 3] {
+    [
+        -z * x / (minor_radius * rho * rho),
+        -z * y / (minor_radius * rho * rho),
+        (rho - major_radius) / (minor_radius * rho),
+    ]
+}
+
+fn mass_orthonormalize_harmonic_basis(
+    harmonic_basis: &FeecMatrix,
+    mass_u: &FeecCsr,
+) -> Result<FeecMatrix, String> {
+    if harmonic_basis.ncols() == 0 {
+        return Err("harmonic basis must contain at least one column".to_string());
+    }
+
+    let mut columns = Vec::with_capacity(harmonic_basis.ncols());
+    for j in 0..harmonic_basis.ncols() {
+        let mut column = harmonic_basis.column(j).into_owned();
+        for previous in &columns {
+            let coeff = mass_inner_product(previous, &column, mass_u);
+            column -= previous * coeff;
+        }
+
+        let norm_sq = mass_inner_product(&column, &column, mass_u);
+        if !norm_sq.is_finite() || norm_sq <= EPS {
+            return Err(format!(
+                "harmonic basis column {j} became singular during orthonormalization"
+            ));
+        }
+        column /= norm_sq.sqrt();
+        columns.push(column);
+    }
+
+    Ok(FeecMatrix::from_columns(&columns))
+}
+
+fn harmonic_coefficients(
+    field: &FeecVector,
+    harmonic_basis_orthonormal: &FeecMatrix,
+    mass_u: &FeecCsr,
+) -> Result<[f64; 2], String> {
+    if harmonic_basis_orthonormal.ncols() != 2 {
+        return Err(format!(
+            "expected exactly two harmonic basis vectors on the torus, found {}",
+            harmonic_basis_orthonormal.ncols()
+        ));
+    }
+
+    Ok([
+        mass_inner_product(
+            &harmonic_basis_orthonormal.column(0).into_owned(),
+            field,
+            mass_u,
+        ),
+        mass_inner_product(
+            &harmonic_basis_orthonormal.column(1).into_owned(),
+            field,
+            mass_u,
+        ),
+    ])
+}
+
+fn remove_harmonic_content(
+    field: &FeecVector,
+    harmonic_basis_orthonormal: &FeecMatrix,
+    mass_u: &FeecCsr,
+) -> FeecVector {
+    let mut harmonic_free = field.clone();
+    for j in 0..harmonic_basis_orthonormal.ncols() {
+        let basis_col = harmonic_basis_orthonormal.column(j).into_owned();
+        let coeff = mass_inner_product(&basis_col, field, mass_u);
+        harmonic_free -= basis_col.scale(coeff);
+    }
+    harmonic_free
+}
+
+fn mass_inner_product(lhs: &FeecVector, rhs: &FeecVector, mass_u: &FeecCsr) -> f64 {
+    let weighted_rhs = mass_u * rhs;
+    lhs.dot(&weighted_rhs)
+}
+
+fn select_observation_edges(
+    geometry: &TorusEdgeGeometry,
+    targets: &[Torus1FormObservationTarget],
+) -> Result<Vec<Torus1FormSelectedObservation>, String> {
+    let mut used = HashSet::with_capacity(targets.len());
+    let mut selected = Vec::with_capacity(targets.len());
+
+    for (observation_index, target) in targets.iter().copied().enumerate() {
+        let mut best_matching = None::<(usize, f64)>;
+        let mut best_fallback = None::<(usize, f64)>;
+
+        for edge_index in 0..geometry.theta.len() {
+            if used.contains(&edge_index) {
+                continue;
+            }
+
+            let distance = intrinsic_torus_distance(
+                geometry.major_radius,
+                geometry.minor_radius,
+                geometry.theta[edge_index],
+                geometry.phi[edge_index],
+                target.theta,
+                target.phi,
+            );
+
+            update_best_candidate(&mut best_fallback, edge_index, distance);
+            if target
+                .direction
+                .matches_alignment(geometry.toroidal_alignment_sq[edge_index])
+            {
+                update_best_candidate(&mut best_matching, edge_index, distance);
+            }
+        }
+
+        let (edge_index, selection_distance, used_fallback) =
+            if let Some((edge_index, selection_distance)) = best_matching {
+                (edge_index, selection_distance, false)
+            } else if let Some((edge_index, selection_distance)) = best_fallback {
+                (edge_index, selection_distance, true)
+            } else {
+                return Err("failed to find a unique observation edge".to_string());
+            };
+
+        used.insert(edge_index);
+        selected.push(Torus1FormSelectedObservation {
+            observation_index,
+            edge_index,
+            target_theta: target.theta,
+            target_phi: target.phi,
+            direction: target.direction,
+            edge_theta: geometry.theta[edge_index],
+            edge_phi: geometry.phi[edge_index],
+            toroidal_alignment_sq: geometry.toroidal_alignment_sq[edge_index],
+            selection_distance,
+            used_fallback,
+        });
+    }
+
+    Ok(selected)
+}
+
+fn update_best_candidate(best: &mut Option<(usize, f64)>, edge_index: usize, distance: f64) {
+    match best {
+        Some((_, best_distance)) if distance >= *best_distance => {}
+        _ => *best = Some((edge_index, distance)),
+    }
+}
+
+fn build_nearest_observation_slots(
+    geometry: &TorusEdgeGeometry,
+    observation_indices: &[usize],
+) -> Vec<usize> {
+    (0..geometry.theta.len())
+        .map(|edge_index| {
+            observation_indices
+                .iter()
+                .enumerate()
+                .min_by(|(_, lhs_idx), (_, rhs_idx)| {
+                    let lhs_distance = intrinsic_torus_distance(
+                        geometry.major_radius,
+                        geometry.minor_radius,
+                        geometry.theta[edge_index],
+                        geometry.phi[edge_index],
+                        geometry.theta[**lhs_idx],
+                        geometry.phi[**lhs_idx],
+                    );
+                    let rhs_distance = intrinsic_torus_distance(
+                        geometry.major_radius,
+                        geometry.minor_radius,
+                        geometry.theta[edge_index],
+                        geometry.phi[edge_index],
+                        geometry.theta[**rhs_idx],
+                        geometry.phi[**rhs_idx],
+                    );
+                    lhs_distance
+                        .partial_cmp(&rhs_distance)
+                        .expect("intrinsic distances should be finite")
+                })
+                .map(|(slot, _)| slot)
+                .expect("at least one observation edge is required")
+        })
+        .collect()
+}
+
+fn build_nearest_observation_distance_field(
+    geometry: &TorusEdgeGeometry,
+    observation_indices: &[usize],
+    nearest_observation_slots: &[usize],
+) -> FeecVector {
+    FeecVector::from_iterator(
+        geometry.theta.len(),
+        (0..geometry.theta.len()).map(|edge_index| {
+            let slot = nearest_observation_slots[edge_index];
+            let obs_edge = observation_indices[slot];
+            intrinsic_torus_distance(
+                geometry.major_radius,
+                geometry.minor_radius,
+                geometry.theta[edge_index],
+                geometry.phi[edge_index],
+                geometry.theta[obs_edge],
+                geometry.phi[obs_edge],
+            )
+        }),
+    )
+}
+
+fn build_nearest_observation_value_field(
+    nearest_observation_slots: &[usize],
+    observation_values: &[f64],
+) -> FeecVector {
+    FeecVector::from_iterator(
+        nearest_observation_slots.len(),
+        nearest_observation_slots
+            .iter()
+            .map(|slot| observation_values[*slot]),
+    )
+}
+
+fn build_observed_mask(dimension: usize, observation_indices: &[usize]) -> FeecVector {
+    let mut mask = FeecVector::zeros(dimension);
+    for &idx in observation_indices {
+        mask[idx] = 1.0;
+    }
+    mask
+}
+
+fn intrinsic_torus_distance(
+    major_radius: f64,
+    minor_radius: f64,
+    theta: f64,
+    phi: f64,
+    theta_ref: f64,
+    phi_ref: f64,
+) -> f64 {
+    let delta_theta = wrap_angle_difference(theta, theta_ref);
+    let delta_phi = wrap_angle_difference(phi, phi_ref);
+    let phi_scale = major_radius + minor_radius * ((theta + theta_ref) * 0.5).cos();
+    ((minor_radius * delta_theta).powi(2) + (phi_scale * delta_phi).powi(2)).sqrt()
+}
+
+fn wrap_angle_difference(angle: f64, reference: f64) -> f64 {
+    let mut delta = angle - reference;
+    while delta <= -PI {
+        delta += 2.0 * PI;
+    }
+    while delta > PI {
+        delta -= 2.0 * PI;
+    }
+    delta
+}
+
+fn absolute_difference(lhs: &FeecVector, rhs: &FeecVector) -> FeecVector {
+    FeecVector::from_iterator(lhs.len(), (0..lhs.len()).map(|i| (lhs[i] - rhs[i]).abs()))
+}
+
+fn build_observation_summaries(
+    selected_observations: &[Torus1FormSelectedObservation],
+    observation_values: &[f64],
+    posterior_mean: &FeecVector,
+    absolute_mean_error: &FeecVector,
+    prior_variance: &FeecVector,
+    posterior_variance: &FeecVector,
+    harmonic_free_truth: &FeecVector,
+    harmonic_free_posterior_mean: &FeecVector,
+    harmonic_free_absolute_mean_error: &FeecVector,
+    harmonic_free_prior_variance: &FeecVector,
+    harmonic_free_posterior_variance: &FeecVector,
+) -> Vec<Torus1FormObservationSummary> {
+    selected_observations
+        .iter()
+        .zip(observation_values.iter().copied())
+        .map(|(selected, observation_value)| {
+            let edge_index = selected.edge_index;
+            Torus1FormObservationSummary {
+                observation_index: selected.observation_index,
+                edge_index,
+                direction: selected.direction,
+                used_fallback: selected.used_fallback,
+                target_theta: selected.target_theta,
+                target_phi: selected.target_phi,
+                edge_theta: selected.edge_theta,
+                edge_phi: selected.edge_phi,
+                observation_value,
+                posterior_mean_at_observation: posterior_mean[edge_index],
+                abs_error_at_observation: absolute_mean_error[edge_index],
+                prior_variance_at_observation: prior_variance[edge_index],
+                posterior_variance_at_observation: posterior_variance[edge_index],
+                harmonic_free_truth_at_observation: harmonic_free_truth[edge_index],
+                harmonic_free_posterior_mean_at_observation: harmonic_free_posterior_mean
+                    [edge_index],
+                harmonic_free_abs_error_at_observation: harmonic_free_absolute_mean_error
+                    [edge_index],
+                harmonic_free_prior_variance_at_observation: harmonic_free_prior_variance
+                    [edge_index],
+                harmonic_free_posterior_variance_at_observation: harmonic_free_posterior_variance
+                    [edge_index],
+            }
+        })
+        .collect()
+}
+
+fn build_branch_summary(
+    selected_observations: &[Torus1FormSelectedObservation],
+    nearest_observation_distance: &FeecVector,
+    absolute_mean_error: &FeecVector,
+    harmonic_free_absolute_mean_error: &FeecVector,
+    prior_variance: &FeecVector,
+    posterior_variance: &FeecVector,
+    harmonic_free_prior_variance: &FeecVector,
+    harmonic_free_posterior_variance: &FeecVector,
+    neighbourhood_radius: f64,
+    far_radius: f64,
+) -> Result<Torus1FormBranchSummary, String> {
+    let observed_indices = selected_observations
+        .iter()
+        .map(|selected| selected.edge_index)
+        .collect::<Vec<_>>();
+    let near_indices = (0..nearest_observation_distance.len())
+        .filter(|idx| nearest_observation_distance[*idx] <= neighbourhood_radius)
+        .collect::<Vec<_>>();
+    let far_indices = (0..nearest_observation_distance.len())
+        .filter(|idx| nearest_observation_distance[*idx] > far_radius)
+        .collect::<Vec<_>>();
+
+    Ok(Torus1FormBranchSummary {
+        observed: summarize_observed(
+            &observed_indices,
+            absolute_mean_error,
+            harmonic_free_absolute_mean_error,
+            prior_variance,
+            posterior_variance,
+            harmonic_free_prior_variance,
+            harmonic_free_posterior_variance,
+        )?,
+        near: summarize_region(
+            &near_indices,
+            absolute_mean_error,
+            harmonic_free_absolute_mean_error,
+            prior_variance,
+            posterior_variance,
+            harmonic_free_prior_variance,
+            harmonic_free_posterior_variance,
+        )?,
+        far: summarize_region(
+            &far_indices,
+            absolute_mean_error,
+            harmonic_free_absolute_mean_error,
+            prior_variance,
+            posterior_variance,
+            harmonic_free_prior_variance,
+            harmonic_free_posterior_variance,
+        )?,
+    })
+}
+
+fn summarize_region(
+    indices: &[usize],
+    absolute_mean_error: &FeecVector,
+    harmonic_free_absolute_mean_error: &FeecVector,
+    prior_variance: &FeecVector,
+    posterior_variance: &FeecVector,
+    harmonic_free_prior_variance: &FeecVector,
+    harmonic_free_posterior_variance: &FeecVector,
+) -> Result<RegionSummary, String> {
+    if indices.is_empty() {
+        return Ok(empty_region_summary());
+    }
+
+    let count = indices.len() as f64;
+    let mut mean_abs_error = 0.0;
+    let mut harmonic_free_mean_abs_error = 0.0;
+    let mut prior_variance_mean = 0.0;
+    let mut posterior_variance_mean = 0.0;
+    let mut variance_reduction_mean = 0.0;
+    let mut variance_ratio_mean = 0.0;
+    let mut harmonic_free_prior_variance_mean = 0.0;
+    let mut harmonic_free_posterior_variance_mean = 0.0;
+    let mut harmonic_free_variance_reduction_mean = 0.0;
+    let mut harmonic_free_variance_ratio_mean = 0.0;
+
+    for &idx in indices {
+        mean_abs_error += absolute_mean_error[idx];
+        harmonic_free_mean_abs_error += harmonic_free_absolute_mean_error[idx];
+        prior_variance_mean += prior_variance[idx];
+        posterior_variance_mean += posterior_variance[idx];
+        variance_reduction_mean += prior_variance[idx] - posterior_variance[idx];
+        variance_ratio_mean += safe_ratio(posterior_variance[idx], prior_variance[idx]);
+        harmonic_free_prior_variance_mean += harmonic_free_prior_variance[idx];
+        harmonic_free_posterior_variance_mean += harmonic_free_posterior_variance[idx];
+        harmonic_free_variance_reduction_mean +=
+            harmonic_free_prior_variance[idx] - harmonic_free_posterior_variance[idx];
+        harmonic_free_variance_ratio_mean += safe_ratio(
+            harmonic_free_posterior_variance[idx],
+            harmonic_free_prior_variance[idx],
+        );
+    }
+
+    Ok(RegionSummary {
+        count: indices.len(),
+        mean_abs_error: mean_abs_error / count,
+        harmonic_free_mean_abs_error: harmonic_free_mean_abs_error / count,
+        prior_variance_mean: prior_variance_mean / count,
+        posterior_variance_mean: posterior_variance_mean / count,
+        variance_reduction_mean: variance_reduction_mean / count,
+        variance_ratio_mean: variance_ratio_mean / count,
+        harmonic_free_prior_variance_mean: harmonic_free_prior_variance_mean / count,
+        harmonic_free_posterior_variance_mean: harmonic_free_posterior_variance_mean / count,
+        harmonic_free_variance_reduction_mean: harmonic_free_variance_reduction_mean / count,
+        harmonic_free_variance_ratio_mean: harmonic_free_variance_ratio_mean / count,
+    })
+}
+
+fn empty_region_summary() -> RegionSummary {
+    RegionSummary {
+        count: 0,
+        mean_abs_error: f64::NAN,
+        harmonic_free_mean_abs_error: f64::NAN,
+        prior_variance_mean: f64::NAN,
+        posterior_variance_mean: f64::NAN,
+        variance_reduction_mean: f64::NAN,
+        variance_ratio_mean: f64::NAN,
+        harmonic_free_prior_variance_mean: f64::NAN,
+        harmonic_free_posterior_variance_mean: f64::NAN,
+        harmonic_free_variance_reduction_mean: f64::NAN,
+        harmonic_free_variance_ratio_mean: f64::NAN,
+    }
+}
+
+fn summarize_observed(
+    indices: &[usize],
+    absolute_mean_error: &FeecVector,
+    harmonic_free_absolute_mean_error: &FeecVector,
+    prior_variance: &FeecVector,
+    posterior_variance: &FeecVector,
+    harmonic_free_prior_variance: &FeecVector,
+    harmonic_free_posterior_variance: &FeecVector,
+) -> Result<ObservedSummary, String> {
+    let region = summarize_region(
+        indices,
+        absolute_mean_error,
+        harmonic_free_absolute_mean_error,
+        prior_variance,
+        posterior_variance,
+        harmonic_free_prior_variance,
+        harmonic_free_posterior_variance,
+    )?;
+    let max_abs_error = indices
+        .iter()
+        .map(|idx| absolute_mean_error[*idx])
+        .fold(0.0_f64, f64::max);
+
+    Ok(ObservedSummary {
+        count: region.count,
+        max_abs_error,
+        mean_abs_error: region.mean_abs_error,
+        harmonic_free_mean_abs_error: region.harmonic_free_mean_abs_error,
+        prior_variance_mean: region.prior_variance_mean,
+        posterior_variance_mean: region.posterior_variance_mean,
+        variance_reduction_mean: region.variance_reduction_mean,
+        variance_ratio_mean: region.variance_ratio_mean,
+        harmonic_free_prior_variance_mean: region.harmonic_free_prior_variance_mean,
+        harmonic_free_posterior_variance_mean: region.harmonic_free_posterior_variance_mean,
+        harmonic_free_variance_reduction_mean: region.harmonic_free_variance_reduction_mean,
+        harmonic_free_variance_ratio_mean: region.harmonic_free_variance_ratio_mean,
+    })
+}
+
+fn safe_ratio(numerator: f64, denominator: f64) -> f64 {
+    if denominator.abs() <= EPS {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
+fn build_variance_pattern_report(
+    enforce_harmonic_constraints: bool,
+    edge_theta: &FeecVector,
+    edge_phi: &FeecVector,
+    toroidal_alignment_sq: &FeecVector,
+    selected_observations: &[Torus1FormSelectedObservation],
+    shared: &VariancePatternSharedData,
+    prior_variance: &FeecVector,
+    posterior_variance: &FeecVector,
+    effective_range: f64,
+) -> Result<Torus1FormVariancePatternReport, String> {
+    let reconstructed = build_component_field_set(
+        &shared.reconstructed_prior,
+        &shared.reconstructed_posterior,
+        enforce_harmonic_constraints,
+    );
+    let surface_vector = build_ambient_field_set(
+        &shared.surface_vector_prior,
+        &shared.surface_vector_posterior,
+        enforce_harmonic_constraints,
+    );
+    let smoothed = build_component_field_set(
+        &shared.smoothed_prior,
+        &shared.smoothed_posterior,
+        enforce_harmonic_constraints,
+    );
+    let circulation = build_variance_field_set(
+        &shared.circulation_prior,
+        &shared.circulation_posterior,
+        enforce_harmonic_constraints,
+    );
+
+    let edge_all_profiles = build_edge_shell_profile_rows(
+        VARIANCE_OBJECT_EDGE_ALL,
+        selected_observations,
+        edge_theta,
+        edge_phi,
+        toroidal_alignment_sq,
+        prior_variance,
+        posterior_variance,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        None,
+    );
+    let edge_compatible_profiles = build_edge_shell_profile_rows(
+        VARIANCE_OBJECT_EDGE_COMPATIBLE,
+        selected_observations,
+        edge_theta,
+        edge_phi,
+        toroidal_alignment_sq,
+        prior_variance,
+        posterior_variance,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        Some(ObservationOrientationRelation::Compatible),
+    );
+    let edge_transverse_profiles = build_edge_shell_profile_rows(
+        VARIANCE_OBJECT_EDGE_TRANSVERSE,
+        selected_observations,
+        edge_theta,
+        edge_phi,
+        toroidal_alignment_sq,
+        prior_variance,
+        posterior_variance,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        Some(ObservationOrientationRelation::Transverse),
+    );
+
+    let component_matched_profiles = build_domain_shell_profile_rows(
+        VARIANCE_OBJECT_COMPONENT_MATCHED,
+        selected_observations,
+        &shared.cell_theta,
+        &shared.cell_phi,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        |selected, cell_index| match selected.direction {
+            ObservationDirection::Toroidal => Some((
+                reconstructed.toroidal.prior[cell_index],
+                reconstructed.toroidal.posterior[cell_index],
+            )),
+            ObservationDirection::Poloidal => Some((
+                reconstructed.poloidal.prior[cell_index],
+                reconstructed.poloidal.posterior[cell_index],
+            )),
+        },
+    );
+    let component_orthogonal_profiles = build_domain_shell_profile_rows(
+        VARIANCE_OBJECT_COMPONENT_ORTHOGONAL,
+        selected_observations,
+        &shared.cell_theta,
+        &shared.cell_phi,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        |selected, cell_index| match selected.direction {
+            ObservationDirection::Toroidal => Some((
+                reconstructed.poloidal.prior[cell_index],
+                reconstructed.poloidal.posterior[cell_index],
+            )),
+            ObservationDirection::Poloidal => Some((
+                reconstructed.toroidal.prior[cell_index],
+                reconstructed.toroidal.posterior[cell_index],
+            )),
+        },
+    );
+    let component_trace_profiles = build_domain_shell_profile_rows(
+        VARIANCE_OBJECT_COMPONENT_TRACE,
+        selected_observations,
+        &shared.cell_theta,
+        &shared.cell_phi,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        |_, cell_index| {
+            Some((
+                reconstructed.trace.prior[cell_index],
+                reconstructed.trace.posterior[cell_index],
+            ))
+        },
+    );
+    let smoothed_matched_profiles = build_domain_shell_profile_rows(
+        VARIANCE_OBJECT_SMOOTHED_MATCHED,
+        selected_observations,
+        &shared.cell_theta,
+        &shared.cell_phi,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        |selected, cell_index| match selected.direction {
+            ObservationDirection::Toroidal => Some((
+                smoothed.toroidal.prior[cell_index],
+                smoothed.toroidal.posterior[cell_index],
+            )),
+            ObservationDirection::Poloidal => Some((
+                smoothed.poloidal.prior[cell_index],
+                smoothed.poloidal.posterior[cell_index],
+            )),
+        },
+    );
+    let smoothed_orthogonal_profiles = build_domain_shell_profile_rows(
+        VARIANCE_OBJECT_SMOOTHED_ORTHOGONAL,
+        selected_observations,
+        &shared.cell_theta,
+        &shared.cell_phi,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        |selected, cell_index| match selected.direction {
+            ObservationDirection::Toroidal => Some((
+                smoothed.poloidal.prior[cell_index],
+                smoothed.poloidal.posterior[cell_index],
+            )),
+            ObservationDirection::Poloidal => Some((
+                smoothed.toroidal.prior[cell_index],
+                smoothed.toroidal.posterior[cell_index],
+            )),
+        },
+    );
+    let smoothed_trace_profiles = build_domain_shell_profile_rows(
+        VARIANCE_OBJECT_SMOOTHED_TRACE,
+        selected_observations,
+        &shared.cell_theta,
+        &shared.cell_phi,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        |_, cell_index| {
+            Some((
+                smoothed.trace.prior[cell_index],
+                smoothed.trace.posterior[cell_index],
+            ))
+        },
+    );
+    let circulation_profiles = build_domain_shell_profile_rows(
+        VARIANCE_OBJECT_CIRCULATION,
+        selected_observations,
+        &shared.cell_theta,
+        &shared.cell_phi,
+        shared.major_radius,
+        shared.minor_radius,
+        effective_range,
+        |_, cell_index| {
+            Some((
+                circulation.prior[cell_index],
+                circulation.posterior[cell_index],
+            ))
+        },
+    );
+
+    let shell_profile_rows = [
+        edge_all_profiles.clone(),
+        edge_compatible_profiles.clone(),
+        edge_transverse_profiles.clone(),
+        component_matched_profiles.clone(),
+        component_orthogonal_profiles.clone(),
+        component_trace_profiles.clone(),
+        smoothed_matched_profiles.clone(),
+        smoothed_orthogonal_profiles.clone(),
+        smoothed_trace_profiles.clone(),
+        circulation_profiles.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+
+    let summary_rows = vec![
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_EDGE_ALL,
+            selected_observations.len(),
+            &edge_all_profiles,
+            Some((&edge_compatible_profiles, &edge_transverse_profiles)),
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_EDGE_COMPATIBLE,
+            selected_observations.len(),
+            &edge_compatible_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_EDGE_TRANSVERSE,
+            selected_observations.len(),
+            &edge_transverse_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_COMPONENT_MATCHED,
+            selected_observations.len(),
+            &component_matched_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_COMPONENT_ORTHOGONAL,
+            selected_observations.len(),
+            &component_orthogonal_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_COMPONENT_TRACE,
+            selected_observations.len(),
+            &component_trace_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_SMOOTHED_MATCHED,
+            selected_observations.len(),
+            &smoothed_matched_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_SMOOTHED_ORTHOGONAL,
+            selected_observations.len(),
+            &smoothed_orthogonal_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_SMOOTHED_TRACE,
+            selected_observations.len(),
+            &smoothed_trace_profiles,
+            None,
+        ),
+        build_variance_pattern_summary_row(
+            VARIANCE_OBJECT_CIRCULATION,
+            selected_observations.len(),
+            &circulation_profiles,
+            None,
+        ),
+    ];
+
+    Ok(Torus1FormVariancePatternReport {
+        shell_distance_scales: OBSERVATION_PROFILE_DISTANCE_SCALES.to_vec(),
+        smoothing_bandwidth: shared.smoothing_bandwidth,
+        smoothing_cutoff: shared.smoothing_cutoff,
+        reconstructed,
+        surface_vector,
+        smoothed,
+        circulation,
+        summary_rows,
+        shell_profile_rows,
+    })
+}
+
+fn build_variance_field_set(
+    prior: &HutchinsonVarianceEstimates,
+    posterior: &HutchinsonVarianceEstimates,
+    constrained: bool,
+) -> Torus1FormVarianceFieldSet {
+    let prior = gmrf_vec_to_feec(if constrained {
+        &prior.harmonic_free
+    } else {
+        &prior.unconstrained
+    });
+    let posterior = gmrf_vec_to_feec(if constrained {
+        &posterior.harmonic_free
+    } else {
+        &posterior.unconstrained
+    });
+    let ratio = ratio_vector(&posterior, &prior);
+    Torus1FormVarianceFieldSet {
+        prior,
+        posterior,
+        ratio,
+    }
+}
+
+fn build_component_field_set(
+    prior: &Torus1FormVarianceComponentEstimates,
+    posterior: &Torus1FormVarianceComponentEstimates,
+    constrained: bool,
+) -> Torus1FormVarianceComponentFields {
+    let toroidal = build_variance_field_set(&prior.toroidal, &posterior.toroidal, constrained);
+    let poloidal = build_variance_field_set(&prior.poloidal, &posterior.poloidal, constrained);
+    let trace_prior = &toroidal.prior + &poloidal.prior;
+    let trace_posterior = &toroidal.posterior + &poloidal.posterior;
+    let trace_ratio = ratio_vector(&trace_posterior, &trace_prior);
+    Torus1FormVarianceComponentFields {
+        toroidal,
+        poloidal,
+        trace: Torus1FormVarianceFieldSet {
+            prior: trace_prior,
+            posterior: trace_posterior,
+            ratio: trace_ratio,
+        },
+    }
+}
+
+fn build_ambient_field_set(
+    prior: &Torus1FormAmbientVarianceEstimates,
+    posterior: &Torus1FormAmbientVarianceEstimates,
+    constrained: bool,
+) -> Torus1FormAmbientVarianceFields {
+    let x = build_variance_field_set(&prior.x, &posterior.x, constrained);
+    let y = build_variance_field_set(&prior.y, &posterior.y, constrained);
+    let z = build_variance_field_set(&prior.z, &posterior.z, constrained);
+    let trace_prior = &x.prior + &y.prior + &z.prior;
+    let trace_posterior = &x.posterior + &y.posterior + &z.posterior;
+    let trace_ratio = ratio_vector(&trace_posterior, &trace_prior);
+
+    Torus1FormAmbientVarianceFields {
+        x,
+        y,
+        z,
+        trace: Torus1FormVarianceFieldSet {
+            prior: trace_prior,
+            posterior: trace_posterior,
+            ratio: trace_ratio,
+        },
+    }
+}
+
+fn ratio_vector(numerator: &FeecVector, denominator: &FeecVector) -> FeecVector {
+    FeecVector::from_iterator(
+        numerator.len(),
+        (0..numerator.len()).map(|i| safe_ratio(numerator[i], denominator[i])),
+    )
+}
+
+fn build_edge_shell_profile_rows(
+    object: &'static str,
+    selected_observations: &[Torus1FormSelectedObservation],
+    edge_theta: &FeecVector,
+    edge_phi: &FeecVector,
+    toroidal_alignment_sq: &FeecVector,
+    prior_variance: &FeecVector,
+    posterior_variance: &FeecVector,
+    major_radius: f64,
+    minor_radius: f64,
+    effective_range: f64,
+    relation_filter: Option<ObservationOrientationRelation>,
+) -> Vec<Torus1FormVariancePatternShellProfileRow> {
+    build_domain_shell_profile_rows(
+        object,
+        selected_observations,
+        edge_theta,
+        edge_phi,
+        major_radius,
+        minor_radius,
+        effective_range,
+        |selected, edge_index| {
+            if edge_index == selected.edge_index {
+                return None;
+            }
+            let relation = classify_orientation_relation(
+                selected.direction,
+                toroidal_alignment_sq[edge_index],
+            );
+            if !orientation_relation_filter_matches(relation_filter, relation) {
+                return None;
+            }
+            Some((prior_variance[edge_index], posterior_variance[edge_index]))
+        },
+    )
+}
+
+fn build_domain_shell_profile_rows<F>(
+    object: &'static str,
+    selected_observations: &[Torus1FormSelectedObservation],
+    domain_theta: &FeecVector,
+    domain_phi: &FeecVector,
+    major_radius: f64,
+    minor_radius: f64,
+    effective_range: f64,
+    mut value_at: F,
+) -> Vec<Torus1FormVariancePatternShellProfileRow>
+where
+    F: FnMut(&Torus1FormSelectedObservation, usize) -> Option<(f64, f64)>,
+{
+    let mut rows = Vec::new();
+    let mut previous_scale = 0.0;
+    for &distance_max_scale in OBSERVATION_PROFILE_DISTANCE_SCALES {
+        let distance_min_scale = previous_scale;
+        previous_scale = distance_max_scale;
+        let distance_min = distance_min_scale * effective_range;
+        let distance_max = distance_max_scale * effective_range;
+        let shell_mid_scale = 0.5 * (distance_min_scale + distance_max_scale);
+
+        for selected in selected_observations {
+            let mut count = 0_usize;
+            let mut prior_sum = 0.0;
+            let mut posterior_sum = 0.0;
+            for item_index in 0..domain_theta.len() {
+                let (prior, posterior) = match value_at(selected, item_index) {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let distance = intrinsic_torus_distance(
+                    major_radius,
+                    minor_radius,
+                    domain_theta[item_index],
+                    domain_phi[item_index],
+                    selected.edge_theta,
+                    selected.edge_phi,
+                );
+                if distance <= distance_min || distance > distance_max {
+                    continue;
+                }
+                prior_sum += prior;
+                posterior_sum += posterior;
+                count += 1;
+            }
+
+            rows.push(Torus1FormVariancePatternShellProfileRow {
+                object,
+                observation_index: selected.observation_index,
+                observation_direction: selected.direction,
+                distance_min_scale,
+                distance_max_scale,
+                distance_min,
+                distance_max,
+                shell_mid_scale,
+                count,
+                mean_ratio: safe_ratio(posterior_sum, prior_sum),
+            });
+        }
+    }
+
+    rows
+}
+
+fn build_variance_pattern_summary_row(
+    object: &'static str,
+    observation_count: usize,
+    profiles: &[Torus1FormVariancePatternShellProfileRow],
+    contrast_profiles: Option<(
+        &[Torus1FormVariancePatternShellProfileRow],
+        &[Torus1FormVariancePatternShellProfileRow],
+    )>,
+) -> Torus1FormVariancePatternSummaryRow {
+    let very_local_ratio = weighted_profile_mean(profiles, |row| row.distance_max_scale <= 0.20);
+    let local_ratio = weighted_profile_mean(profiles, |row| row.distance_max_scale <= 0.50);
+    let range_ratio = weighted_profile_mean(profiles, |row| row.distance_max_scale <= 1.00);
+    let far_ratio = weighted_profile_mean(profiles, |row| {
+        row.distance_min_scale >= 1.50 && row.distance_max_scale <= 2.00
+    });
+    let localization_auc = localization_auc(profiles);
+    let monotonicity_score = shell_monotonicity_score(profiles);
+    let (very_local_orientation_contrast, local_orientation_contrast) =
+        if let Some((compatible_profiles, transverse_profiles)) = contrast_profiles {
+            (
+                weighted_profile_mean(transverse_profiles, |row| row.distance_max_scale <= 0.20)
+                    - weighted_profile_mean(compatible_profiles, |row| {
+                        row.distance_max_scale <= 0.20
+                    }),
+                weighted_profile_mean(transverse_profiles, |row| {
+                    row.distance_min_scale >= 0.20 && row.distance_max_scale <= 0.50
+                }) - weighted_profile_mean(compatible_profiles, |row| {
+                    row.distance_min_scale >= 0.20 && row.distance_max_scale <= 0.50
+                }),
+            )
+        } else {
+            (f64::NAN, f64::NAN)
+        };
+
+    Torus1FormVariancePatternSummaryRow {
+        object,
+        observation_count,
+        very_local_ratio,
+        local_ratio,
+        range_ratio,
+        far_ratio,
+        localization_auc,
+        monotonicity_score,
+        very_local_orientation_contrast,
+        local_orientation_contrast,
+    }
+}
+
+fn weighted_profile_mean<F>(
+    profiles: &[Torus1FormVariancePatternShellProfileRow],
+    predicate: F,
+) -> f64
+where
+    F: Fn(&Torus1FormVariancePatternShellProfileRow) -> bool,
+{
+    let mut sum = 0.0;
+    let mut weight = 0.0;
+    for row in profiles
+        .iter()
+        .filter(|row| predicate(row) && row.count > 0)
+    {
+        sum += row.mean_ratio * row.count as f64;
+        weight += row.count as f64;
+    }
+    if weight <= 0.0 {
+        f64::NAN
+    } else {
+        sum / weight
+    }
+}
+
+fn localization_auc(profiles: &[Torus1FormVariancePatternShellProfileRow]) -> f64 {
+    let mut sum = 0.0;
+    let mut weight = 0.0;
+    for row in profiles.iter().filter(|row| row.count > 0) {
+        let shell_width = row.distance_max_scale - row.distance_min_scale;
+        let row_weight = shell_width * row.count as f64;
+        sum += row_weight * (1.0 - row.mean_ratio);
+        weight += row_weight;
+    }
+    if weight <= 0.0 {
+        f64::NAN
+    } else {
+        sum / weight
+    }
+}
+
+fn shell_monotonicity_score(profiles: &[Torus1FormVariancePatternShellProfileRow]) -> f64 {
+    let mut midpoints = Vec::new();
+    let mut means = Vec::new();
+    let mut previous_scale = 0.0;
+    for &distance_max_scale in OBSERVATION_PROFILE_DISTANCE_SCALES {
+        let distance_min_scale = previous_scale;
+        previous_scale = distance_max_scale;
+        let shell_rows = profiles.iter().filter(|row| {
+            (row.distance_min_scale - distance_min_scale).abs() <= EPS
+                && (row.distance_max_scale - distance_max_scale).abs() <= EPS
+                && row.count > 0
+        });
+
+        let mut weighted_sum = 0.0;
+        let mut weight = 0.0;
+        for row in shell_rows {
+            weighted_sum += row.mean_ratio * row.count as f64;
+            weight += row.count as f64;
+        }
+        if weight <= 0.0 {
+            continue;
+        }
+        midpoints.push(0.5 * (distance_min_scale + distance_max_scale));
+        means.push(weighted_sum / weight);
+    }
+
+    spearman_rank_correlation(&midpoints, &means)
+}
+
+fn spearman_rank_correlation(xs: &[f64], ys: &[f64]) -> f64 {
+    if xs.len() != ys.len() || xs.len() < 2 {
+        return f64::NAN;
+    }
+    let xr = average_ranks(xs);
+    let yr = average_ranks(ys);
+    pearson_correlation(&xr, &yr)
+}
+
+fn average_ranks(values: &[f64]) -> Vec<f64> {
+    let mut indexed = values.iter().copied().enumerate().collect::<Vec<_>>();
+    indexed.sort_by(|(_, lhs), (_, rhs)| lhs.partial_cmp(rhs).unwrap());
+
+    let mut ranks = vec![0.0; values.len()];
+    let mut start = 0_usize;
+    while start < indexed.len() {
+        let mut end = start + 1;
+        while end < indexed.len() && (indexed[end].1 - indexed[start].1).abs() <= EPS {
+            end += 1;
+        }
+        let avg_rank = 0.5 * ((start + 1) as f64 + end as f64);
+        for position in start..end {
+            ranks[indexed[position].0] = avg_rank;
+        }
+        start = end;
+    }
+    ranks
+}
+
+fn pearson_correlation(xs: &[f64], ys: &[f64]) -> f64 {
+    if xs.len() != ys.len() || xs.len() < 2 {
+        return f64::NAN;
+    }
+
+    let mean_x = xs.iter().sum::<f64>() / xs.len() as f64;
+    let mean_y = ys.iter().sum::<f64>() / ys.len() as f64;
+    let mut cov = 0.0;
+    let mut var_x = 0.0;
+    let mut var_y = 0.0;
+    for (&x, &y) in xs.iter().zip(ys.iter()) {
+        let dx = x - mean_x;
+        let dy = y - mean_y;
+        cov += dx * dy;
+        var_x += dx * dx;
+        var_y += dy * dy;
+    }
+    if var_x <= EPS || var_y <= EPS {
+        f64::NAN
+    } else {
+        cov / (var_x.sqrt() * var_y.sqrt())
+    }
+}
+
+fn write_branch_outputs(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let branch_dir = out_dir.join(branch.name);
+    fs::create_dir_all(&branch_dir)?;
+
+    let truth = Cochain::new(1, branch.truth.clone());
+    let posterior_mean = Cochain::new(1, branch.posterior_mean.clone());
+    let absolute_mean_error = Cochain::new(1, branch.absolute_mean_error.clone());
+    let prior_variance = Cochain::new(1, branch.prior_variance.clone());
+    let posterior_variance = Cochain::new(1, branch.posterior_variance.clone());
+    let variance_reduction = Cochain::new(1, branch.variance_reduction.clone());
+    let observed_mask = Cochain::new(1, branch.observed_mask.clone());
+    let nearest_observation_value = Cochain::new(1, branch.nearest_observation_value.clone());
+    let nearest_observation_distance = Cochain::new(1, branch.nearest_observation_distance.clone());
+    let harmonic_free_truth = Cochain::new(1, branch.harmonic_free_truth.clone());
+    let harmonic_free_posterior_mean = Cochain::new(1, branch.harmonic_free_posterior_mean.clone());
+    let harmonic_free_absolute_mean_error =
+        Cochain::new(1, branch.harmonic_free_absolute_mean_error.clone());
+    let harmonic_free_prior_variance = Cochain::new(1, branch.harmonic_free_prior_variance.clone());
+    let harmonic_free_posterior_variance =
+        Cochain::new(1, branch.harmonic_free_posterior_variance.clone());
+    let harmonic_free_variance_reduction =
+        Cochain::new(1, branch.harmonic_free_variance_reduction.clone());
+    let edge_theta = Cochain::new(1, result.edge_theta.clone());
+    let edge_phi = Cochain::new(1, result.edge_phi.clone());
+    let toroidal_alignment_sq = Cochain::new(1, result.toroidal_alignment_sq.clone());
+
+    visual_output::write_1cochain_fields(
+        branch_dir.join("fields.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            ("truth", &truth),
+            ("posterior_mean", &posterior_mean),
+            ("absolute_mean_error", &absolute_mean_error),
+            ("prior_variance", &prior_variance),
+            ("posterior_variance", &posterior_variance),
+            ("variance_reduction", &variance_reduction),
+            ("observed_mask", &observed_mask),
+            ("nearest_observation_value", &nearest_observation_value),
+            (
+                "nearest_observation_distance",
+                &nearest_observation_distance,
+            ),
+            ("harmonic_free_truth", &harmonic_free_truth),
+            (
+                "harmonic_free_posterior_mean",
+                &harmonic_free_posterior_mean,
+            ),
+            (
+                "harmonic_free_absolute_mean_error",
+                &harmonic_free_absolute_mean_error,
+            ),
+            (
+                "harmonic_free_prior_variance",
+                &harmonic_free_prior_variance,
+            ),
+            (
+                "harmonic_free_posterior_variance",
+                &harmonic_free_posterior_variance,
+            ),
+            (
+                "harmonic_free_variance_reduction",
+                &harmonic_free_variance_reduction,
+            ),
+            ("edge_theta", &edge_theta),
+            ("edge_phi", &edge_phi),
+            ("toroidal_alignment_sq", &toroidal_alignment_sq),
+        ],
+    )?;
+
+    visual_output::write_1form_vector_proxy_fields(
+        branch_dir.join("posterior_mean_vector.vtu"),
+        &result.coords,
+        &result.topology,
+        "posterior_mean_vector",
+        &posterior_mean,
+        &[
+            ("truth", &truth),
+            ("absolute_mean_error", &absolute_mean_error),
+            ("posterior_variance", &posterior_variance),
+            ("observed_mask", &observed_mask),
+        ],
+    )?;
+    write_branch_surface_vector_vtu(result, branch, &branch_dir)?;
+    write_branch_surface_vector_precision_formula(branch, &branch_dir)?;
+
+    write_branch_edge_csv(result, branch, &branch_dir)?;
+    write_branch_observation_csv(branch, &branch_dir)?;
+    write_branch_observation_variance_diagnostics(result, branch, &branch_dir)?;
+    write_branch_variance_pattern_outputs(result, branch, &branch_dir)?;
+    write_branch_summary(branch, result, &branch_dir)?;
+
+    Ok(())
+}
+
+fn write_branch_surface_vector_vtu(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let truth = Cochain::new(1, branch.truth.clone());
+    let posterior_mean = Cochain::new(1, branch.posterior_mean.clone());
+    let truth_vectors = sample_1form_cell_vectors(&result.coords, &result.topology, &truth)?;
+    let posterior_mean_vectors =
+        sample_1form_cell_vectors(&result.coords, &result.topology, &posterior_mean)?;
+    let posterior_mean_magnitude = vector_magnitudes(&posterior_mean_vectors);
+    let surface = &branch.variance_pattern.surface_vector;
+    let posterior_variance_vectors = ambient_variance_vectors(surface, false);
+    let prior_variance_vectors = ambient_variance_vectors(surface, true);
+    let posterior_marginal_std = surface.trace.posterior.map(|value| value.max(0.0).sqrt());
+
+    visual_output::write_top_cell_fields(
+        branch_dir.join("posterior_mean_surface_vector.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            ("truth_surface_vector", truth_vectors.as_slice()),
+            (
+                "posterior_mean_surface_vector",
+                posterior_mean_vectors.as_slice(),
+            ),
+            (
+                "posterior_directional_variance",
+                posterior_variance_vectors.as_slice(),
+            ),
+            (
+                "prior_directional_variance",
+                prior_variance_vectors.as_slice(),
+            ),
+        ],
+        &[
+            ("magnitude", posterior_mean_magnitude.as_slice()),
+            ("marginal_variance", surface.trace.posterior.as_slice()),
+            ("marginal_std", posterior_marginal_std.as_slice()),
+            ("prior_marginal_variance", surface.trace.prior.as_slice()),
+            ("marginal_variance_ratio", surface.trace.ratio.as_slice()),
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn write_branch_surface_vector_precision_formula(
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("surface_vector_precision.txt"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "Surface vector field model for branch '{}'",
+        branch.name
+    )?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "Let x denote the posterior 1-cochain random variable."
+    )?;
+    writeln!(
+        writer,
+        "Let A denote the barycenter reconstruction operator that maps edge cochains to"
+    )?;
+    writeln!(
+        writer,
+        "stacked cellwise Euclidean vectors, so v = A x with v in R^(3 N_cells)."
+    )?;
+    writeln!(writer)?;
+    writeln!(writer, "The observation-conditioned cochain precision is")?;
+    writeln!(writer, "  Q_post = Q_prior + (1 / sigma_obs^2) H^T H,")?;
+    writeln!(
+        writer,
+        "where H is the edge-observation selector matrix and sigma_obs^2 is the"
+    )?;
+    writeln!(writer, "observation noise variance.")?;
+    writeln!(writer)?;
+    if branch.name == "full_unconstrained" {
+        writeln!(writer, "For this unconstrained branch,")?;
+        writeln!(writer, "  Sigma_x = Q_post^(-1),")?;
+    } else {
+        writeln!(
+            writer,
+            "For this harmonic-free constrained branch, with constraint matrix C,"
+        )?;
+        writeln!(
+            writer,
+            "  Sigma_x = Q_post^(-1) - Q_post^(-1) C^T (C Q_post^(-1) C^T)^(-1) C Q_post^(-1),"
+        )?;
+        writeln!(
+            writer,
+            "which is the covariance of the Gaussian conditioned on C x = 0."
+        )?;
+    }
+    writeln!(writer)?;
+    writeln!(writer, "The pushed-forward surface-vector covariance is")?;
+    writeln!(writer, "  Sigma_v = A Sigma_x A^T.")?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "The corresponding surface-vector precision is therefore"
+    )?;
+    writeln!(writer, "  Q_v = (A Sigma_x A^T)^+,")?;
+    writeln!(
+        writer,
+        "where ^+ denotes the Moore-Penrose pseudoinverse, since A may introduce"
+    )?;
+    writeln!(
+        writer,
+        "linear dependencies between reconstructed cell vectors."
+    )?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "In the current implementation Q_v is not assembled explicitly."
+    )?;
+    writeln!(
+        writer,
+        "Instead, Hutchinson is applied in cochain space and pushed through A to estimate"
+    )?;
+    writeln!(
+        writer,
+        "the diagonal 3x3 cell blocks of Sigma_v needed for visualization."
+    )?;
+    writeln!(writer)?;
+    writeln!(
+        writer,
+        "The VTU outputs store only diagonal summaries of Sigma_v:"
+    )?;
+    writeln!(
+        writer,
+        "  directional_variance_i = [Sigma_v(ii,xx), Sigma_v(ii,yy), Sigma_v(ii,zz)],"
+    )?;
+    writeln!(
+        writer,
+        "  marginal_variance_i = trace(Sigma_v,i) = Sigma_v(ii,xx) + Sigma_v(ii,yy) + Sigma_v(ii,zz),"
+    )?;
+    writeln!(
+        writer,
+        "where Sigma_v,i is the 3x3 covariance block for cell i."
+    )?;
+    Ok(())
+}
+
+fn ambient_variance_vectors(
+    surface: &Torus1FormAmbientVarianceFields,
+    use_prior: bool,
+) -> Vec<[f64; 3]> {
+    let x = if use_prior {
+        &surface.x.prior
+    } else {
+        &surface.x.posterior
+    };
+    let y = if use_prior {
+        &surface.y.prior
+    } else {
+        &surface.y.posterior
+    };
+    let z = if use_prior {
+        &surface.z.prior
+    } else {
+        &surface.z.posterior
+    };
+    (0..x.len()).map(|i| [x[i], y[i], z[i]]).collect()
+}
+
+fn vector_magnitudes(vectors: &[[f64; 3]]) -> Vec<f64> {
+    vectors
+        .iter()
+        .map(|[x, y, z]| (x * x + y * y + z * z).sqrt())
+        .collect()
+}
+
+fn write_selected_observations_csv(
+    result: &Torus1FormConditioningResult,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("selected_observations.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,edge_index,direction,target_theta,target_phi,edge_theta,edge_phi,toroidal_alignment_sq,selection_distance,used_fallback"
+    )?;
+    for selected in &result.selected_observations {
+        writeln!(
+            writer,
+            "{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{}",
+            selected.observation_index,
+            selected.edge_index,
+            selected.direction.as_str(),
+            selected.target_theta,
+            selected.target_phi,
+            selected.edge_theta,
+            selected.edge_phi,
+            selected.toroidal_alignment_sq,
+            selected.selection_distance,
+            selected.used_fallback
+        )?;
+    }
+    Ok(())
+}
+
+fn write_overall_summary(
+    result: &Torus1FormConditioningResult,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("summary.txt"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "Torus 1-form Matérn conditioning")?;
+    writeln!(writer, "major_radius={}", result.major_radius)?;
+    writeln!(writer, "minor_radius={}", result.minor_radius)?;
+    writeln!(writer, "num_variance_probes={}", result.num_variance_probes)?;
+    writeln!(
+        writer,
+        "variance_batch_count={}",
+        result.variance_batch_count
+    )?;
+    writeln!(writer, "rng_seed={}", result.rng_seed)?;
+    writeln!(writer, "alpha={}", result.alpha.as_u32())?;
+    writeln!(writer, "latent_edge_variances=exact_sparse_inverse_diag")?;
+    writeln!(
+        writer,
+        "surface_vector_variance_mode={}",
+        result.surface_vector_variance_mode.as_str()
+    )?;
+    writeln!(writer, "transformed_variances=hutchinson")?;
+    writeln!(writer, "effective_range={}", result.effective_range)?;
+    writeln!(
+        writer,
+        "neighbourhood_radius={}",
+        result.neighbourhood_radius
+    )?;
+    writeln!(writer, "far_radius={}", result.far_radius)?;
+    writeln!(
+        writer,
+        "observation_count={}",
+        result.selected_observations.len()
+    )?;
+    Ok(())
+}
+
+fn write_branch_edge_csv(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("edge_fields.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "edge_index,theta,phi,toroidal_alignment_sq,truth,posterior_mean,absolute_mean_error,prior_variance,posterior_variance,variance_reduction,observed_mask,nearest_observation_value,nearest_observation_distance,harmonic_free_truth,harmonic_free_posterior_mean,harmonic_free_absolute_mean_error,harmonic_free_prior_variance,harmonic_free_posterior_variance,harmonic_free_variance_reduction"
+    )?;
+
+    for edge_index in 0..branch.truth.len() {
+        writeln!(
+            writer,
+            "{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            edge_index,
+            result.edge_theta[edge_index],
+            result.edge_phi[edge_index],
+            result.toroidal_alignment_sq[edge_index],
+            branch.truth[edge_index],
+            branch.posterior_mean[edge_index],
+            branch.absolute_mean_error[edge_index],
+            branch.prior_variance[edge_index],
+            branch.posterior_variance[edge_index],
+            branch.variance_reduction[edge_index],
+            branch.observed_mask[edge_index],
+            branch.nearest_observation_value[edge_index],
+            branch.nearest_observation_distance[edge_index],
+            branch.harmonic_free_truth[edge_index],
+            branch.harmonic_free_posterior_mean[edge_index],
+            branch.harmonic_free_absolute_mean_error[edge_index],
+            branch.harmonic_free_prior_variance[edge_index],
+            branch.harmonic_free_posterior_variance[edge_index],
+            branch.harmonic_free_variance_reduction[edge_index],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_branch_observation_csv(
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("observations.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,edge_index,direction,target_theta,target_phi,edge_theta,edge_phi,used_fallback,observation_value,posterior_mean_at_observation,abs_error_at_observation,prior_variance_at_observation,posterior_variance_at_observation,harmonic_free_truth_at_observation,harmonic_free_posterior_mean_at_observation,harmonic_free_abs_error_at_observation,harmonic_free_prior_variance_at_observation,harmonic_free_posterior_variance_at_observation"
+    )?;
+    for summary in &branch.observation_summaries {
+        writeln!(
+            writer,
+            "{},{},{},{:.12},{:.12},{:.12},{:.12},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            summary.observation_index,
+            summary.edge_index,
+            summary.direction.as_str(),
+            summary.target_theta,
+            summary.target_phi,
+            summary.edge_theta,
+            summary.edge_phi,
+            summary.used_fallback,
+            summary.observation_value,
+            summary.posterior_mean_at_observation,
+            summary.abs_error_at_observation,
+            summary.prior_variance_at_observation,
+            summary.posterior_variance_at_observation,
+            summary.harmonic_free_truth_at_observation,
+            summary.harmonic_free_posterior_mean_at_observation,
+            summary.harmonic_free_abs_error_at_observation,
+            summary.harmonic_free_prior_variance_at_observation,
+            summary.harmonic_free_posterior_variance_at_observation,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_branch_observation_variance_diagnostics(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    write_branch_observation_relative_edge_variance_csv(result, branch, branch_dir)?;
+    write_branch_observation_variance_profile_csv(result, branch, branch_dir)?;
+    write_branch_observation_variance_diagnostics_txt(result, branch, branch_dir)?;
+    Ok(())
+}
+
+fn write_branch_observation_relative_edge_variance_csv(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("observation_relative_edge_variance.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,observed_edge_index,observation_direction,edge_index,is_observed_edge,intrinsic_distance,toroidal_alignment_sq,orientation_relation,prior_variance,posterior_variance,variance_ratio,harmonic_free_prior_variance,harmonic_free_posterior_variance,harmonic_free_variance_ratio"
+    )?;
+
+    for selected in &result.selected_observations {
+        for edge_index in 0..branch.posterior_variance.len() {
+            let intrinsic_distance = intrinsic_torus_distance(
+                result.major_radius,
+                result.minor_radius,
+                result.edge_theta[edge_index],
+                result.edge_phi[edge_index],
+                selected.edge_theta,
+                selected.edge_phi,
+            );
+            let orientation_relation = classify_orientation_relation(
+                selected.direction,
+                result.toroidal_alignment_sq[edge_index],
+            );
+            writeln!(
+                writer,
+                "{},{},{},{},{},{:.12},{:.12},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+                selected.observation_index,
+                selected.edge_index,
+                selected.direction.as_str(),
+                edge_index,
+                edge_index == selected.edge_index,
+                intrinsic_distance,
+                result.toroidal_alignment_sq[edge_index],
+                orientation_relation.as_str(),
+                branch.prior_variance[edge_index],
+                branch.posterior_variance[edge_index],
+                safe_ratio(
+                    branch.posterior_variance[edge_index],
+                    branch.prior_variance[edge_index]
+                ),
+                branch.harmonic_free_prior_variance[edge_index],
+                branch.harmonic_free_posterior_variance[edge_index],
+                safe_ratio(
+                    branch.harmonic_free_posterior_variance[edge_index],
+                    branch.harmonic_free_prior_variance[edge_index],
+                ),
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_branch_observation_variance_profile_csv(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("observation_variance_profile.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,observed_edge_index,observation_direction,orientation_relation,distance_min_scale,distance_max_scale,distance_min,distance_max,count,mean_variance_ratio,min_variance_ratio,max_variance_ratio,mean_harmonic_free_variance_ratio,min_harmonic_free_variance_ratio,max_harmonic_free_variance_ratio"
+    )?;
+
+    let orientation_filters = [
+        (None, "all"),
+        (
+            Some(ObservationOrientationRelation::Compatible),
+            ObservationOrientationRelation::Compatible.as_str(),
+        ),
+        (
+            Some(ObservationOrientationRelation::Oblique),
+            ObservationOrientationRelation::Oblique.as_str(),
+        ),
+        (
+            Some(ObservationOrientationRelation::Transverse),
+            ObservationOrientationRelation::Transverse.as_str(),
+        ),
+    ];
+
+    let mut previous_scale = 0.0;
+    for &distance_max_scale in OBSERVATION_PROFILE_DISTANCE_SCALES {
+        let distance_min_scale = previous_scale;
+        previous_scale = distance_max_scale;
+
+        for selected in &result.selected_observations {
+            let distance_min = distance_min_scale * result.effective_range;
+            let distance_max = distance_max_scale * result.effective_range;
+
+            for (orientation_filter, orientation_label) in orientation_filters {
+                let mut variance_ratios = Vec::new();
+                let mut harmonic_free_variance_ratios = Vec::new();
+
+                for edge_index in 0..branch.posterior_variance.len() {
+                    if edge_index == selected.edge_index {
+                        continue;
+                    }
+
+                    let intrinsic_distance = intrinsic_torus_distance(
+                        result.major_radius,
+                        result.minor_radius,
+                        result.edge_theta[edge_index],
+                        result.edge_phi[edge_index],
+                        selected.edge_theta,
+                        selected.edge_phi,
+                    );
+                    if intrinsic_distance <= distance_min || intrinsic_distance > distance_max {
+                        continue;
+                    }
+
+                    let relation = classify_orientation_relation(
+                        selected.direction,
+                        result.toroidal_alignment_sq[edge_index],
+                    );
+                    if !orientation_relation_filter_matches(orientation_filter, relation) {
+                        continue;
+                    }
+
+                    variance_ratios.push(safe_ratio(
+                        branch.posterior_variance[edge_index],
+                        branch.prior_variance[edge_index],
+                    ));
+                    harmonic_free_variance_ratios.push(safe_ratio(
+                        branch.harmonic_free_posterior_variance[edge_index],
+                        branch.harmonic_free_prior_variance[edge_index],
+                    ));
+                }
+
+                let (count, mean_variance_ratio, min_variance_ratio, max_variance_ratio) =
+                    summarize_values(&variance_ratios);
+                let (
+                    _harmonic_count,
+                    mean_harmonic_free_variance_ratio,
+                    min_harmonic_free_variance_ratio,
+                    max_harmonic_free_variance_ratio,
+                ) = summarize_values(&harmonic_free_variance_ratios);
+
+                writeln!(
+                    writer,
+                    "{},{},{},{},{:.12},{:.12},{:.12},{:.12},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+                    selected.observation_index,
+                    selected.edge_index,
+                    selected.direction.as_str(),
+                    orientation_label,
+                    distance_min_scale,
+                    distance_max_scale,
+                    distance_min,
+                    distance_max,
+                    count,
+                    mean_variance_ratio,
+                    min_variance_ratio,
+                    max_variance_ratio,
+                    mean_harmonic_free_variance_ratio,
+                    min_harmonic_free_variance_ratio,
+                    max_harmonic_free_variance_ratio,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn write_branch_observation_variance_diagnostics_txt(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("observation_variance_diagnostics.txt"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "Observation-Oriented Variance Diagnostics")?;
+    writeln!(writer, "branch={}", branch.name)?;
+    writeln!(writer, "effective_range={}", result.effective_range)?;
+    writeln!(
+        writer,
+        "profile_distance_scales={:?}",
+        OBSERVATION_PROFILE_DISTANCE_SCALES
+    )?;
+    writeln!(
+        writer,
+        "note=profile shells exclude the observed edge itself and split nearby edges into compatible, oblique, and transverse orientation classes"
+    )?;
+
+    for selected in &result.selected_observations {
+        writeln!(
+            writer,
+            "observation={} edge={} direction={} toroidal_alignment_sq={:.6}",
+            selected.observation_index,
+            selected.edge_index,
+            selected.direction.as_str(),
+            selected.toroidal_alignment_sq,
+        )?;
+        for &(distance_max_scale, label) in
+            &[(0.20, "very_local"), (0.50, "local"), (1.00, "range_scale")]
+        {
+            let distance_max = distance_max_scale * result.effective_range;
+            let orientation_filters = [
+                (
+                    Some(ObservationOrientationRelation::Compatible),
+                    "compatible",
+                ),
+                (Some(ObservationOrientationRelation::Oblique), "oblique"),
+                (
+                    Some(ObservationOrientationRelation::Transverse),
+                    "transverse",
+                ),
+                (None, "all"),
+            ];
+
+            write!(
+                writer,
+                "  {}_radius_scale={:.2} intrinsic_radius={:.6}",
+                label, distance_max_scale, distance_max
+            )?;
+
+            for (orientation_filter, orientation_label) in orientation_filters {
+                let mut variance_ratios = Vec::new();
+                for edge_index in 0..branch.posterior_variance.len() {
+                    if edge_index == selected.edge_index {
+                        continue;
+                    }
+                    let intrinsic_distance = intrinsic_torus_distance(
+                        result.major_radius,
+                        result.minor_radius,
+                        result.edge_theta[edge_index],
+                        result.edge_phi[edge_index],
+                        selected.edge_theta,
+                        selected.edge_phi,
+                    );
+                    if intrinsic_distance <= 0.0 || intrinsic_distance > distance_max {
+                        continue;
+                    }
+
+                    let relation = classify_orientation_relation(
+                        selected.direction,
+                        result.toroidal_alignment_sq[edge_index],
+                    );
+                    if !orientation_relation_filter_matches(orientation_filter, relation) {
+                        continue;
+                    }
+                    variance_ratios.push(safe_ratio(
+                        branch.posterior_variance[edge_index],
+                        branch.prior_variance[edge_index],
+                    ));
+                }
+
+                let (count, mean_ratio, min_ratio, max_ratio) = summarize_values(&variance_ratios);
+                write!(
+                    writer,
+                    " {}_count={} {}_mean_ratio={:.6} {}_min_ratio={:.6} {}_max_ratio={:.6}",
+                    orientation_label,
+                    count,
+                    orientation_label,
+                    mean_ratio,
+                    orientation_label,
+                    min_ratio,
+                    orientation_label,
+                    max_ratio,
+                )?;
+            }
+            writeln!(writer)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn write_branch_variance_pattern_outputs(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    write_branch_variance_pattern_summary_csv(branch, branch_dir)?;
+    write_branch_variance_pattern_shell_profiles_csv(branch, branch_dir)?;
+    write_branch_variance_pattern_summary_txt(branch, branch_dir)?;
+    write_branch_variance_pattern_cell_vtus(result, branch, branch_dir)?;
+    write_branch_variance_pattern_observation_edge_vtus(result, branch, branch_dir)?;
+    Ok(())
+}
+
+fn write_branch_variance_pattern_summary_csv(
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("variance_pattern_summary.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "object,observation_count,very_local_ratio,local_ratio,range_ratio,far_ratio,localization_auc,monotonicity_score,very_local_orientation_contrast,local_orientation_contrast"
+    )?;
+    for row in &branch.variance_pattern.summary_rows {
+        writeln!(
+            writer,
+            "{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            row.object,
+            row.observation_count,
+            row.very_local_ratio,
+            row.local_ratio,
+            row.range_ratio,
+            row.far_ratio,
+            row.localization_auc,
+            row.monotonicity_score,
+            row.very_local_orientation_contrast,
+            row.local_orientation_contrast,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_branch_variance_pattern_shell_profiles_csv(
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("variance_pattern_shell_profiles.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "object,observation_index,observation_direction,distance_min_scale,distance_max_scale,distance_min,distance_max,shell_mid_scale,count,mean_ratio"
+    )?;
+    for row in &branch.variance_pattern.shell_profile_rows {
+        writeln!(
+            writer,
+            "{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{},{:.12}",
+            row.object,
+            row.observation_index,
+            row.observation_direction.as_str(),
+            row.distance_min_scale,
+            row.distance_max_scale,
+            row.distance_min,
+            row.distance_max,
+            row.shell_mid_scale,
+            row.count,
+            row.mean_ratio,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_branch_variance_pattern_summary_txt(
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("variance_pattern_summary.txt"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "Variance Pattern Summary")?;
+    writeln!(writer, "branch={}", branch.name)?;
+    writeln!(
+        writer,
+        "smoothing_bandwidth={}",
+        branch.variance_pattern.smoothing_bandwidth
+    )?;
+    writeln!(
+        writer,
+        "smoothing_cutoff={}",
+        branch.variance_pattern.smoothing_cutoff
+    )?;
+    writeln!(
+        writer,
+        "shell_distance_scales={:?}",
+        branch.variance_pattern.shell_distance_scales
+    )?;
+    writeln!(
+        writer,
+        "note=raw edge metrics diagnose anisotropy; smoothed matched-component and circulation are the primary radial-decay diagnostics"
+    )?;
+    for row in &branch.variance_pattern.summary_rows {
+        writeln!(
+            writer,
+            "object={} very_local_ratio={} local_ratio={} range_ratio={} far_ratio={} localization_auc={} monotonicity_score={} very_local_orientation_contrast={} local_orientation_contrast={}",
+            row.object,
+            row.very_local_ratio,
+            row.local_ratio,
+            row.range_ratio,
+            row.far_ratio,
+            row.localization_auc,
+            row.monotonicity_score,
+            row.very_local_orientation_contrast,
+            row.local_orientation_contrast,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_branch_variance_pattern_cell_vtus(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    visual_output::write_top_cell_scalar_fields(
+        branch_dir.join("reconstructed_component_variance.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            (
+                "prior_var_toroidal",
+                branch
+                    .variance_pattern
+                    .reconstructed
+                    .toroidal
+                    .prior
+                    .as_slice(),
+            ),
+            (
+                "post_var_toroidal",
+                branch
+                    .variance_pattern
+                    .reconstructed
+                    .toroidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "ratio_toroidal",
+                branch
+                    .variance_pattern
+                    .reconstructed
+                    .toroidal
+                    .ratio
+                    .as_slice(),
+            ),
+            (
+                "prior_var_poloidal",
+                branch
+                    .variance_pattern
+                    .reconstructed
+                    .poloidal
+                    .prior
+                    .as_slice(),
+            ),
+            (
+                "post_var_poloidal",
+                branch
+                    .variance_pattern
+                    .reconstructed
+                    .poloidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "ratio_poloidal",
+                branch
+                    .variance_pattern
+                    .reconstructed
+                    .poloidal
+                    .ratio
+                    .as_slice(),
+            ),
+            (
+                "trace_prior",
+                branch.variance_pattern.reconstructed.trace.prior.as_slice(),
+            ),
+            (
+                "trace_post",
+                branch
+                    .variance_pattern
+                    .reconstructed
+                    .trace
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "trace_ratio",
+                branch.variance_pattern.reconstructed.trace.ratio.as_slice(),
+            ),
+        ],
+    )?;
+    visual_output::write_top_cell_scalar_fields(
+        branch_dir.join("smoothed_component_variance.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            (
+                "smoothed_prior_toroidal",
+                branch.variance_pattern.smoothed.toroidal.prior.as_slice(),
+            ),
+            (
+                "smoothed_post_toroidal",
+                branch
+                    .variance_pattern
+                    .smoothed
+                    .toroidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "smoothed_ratio_toroidal",
+                branch.variance_pattern.smoothed.toroidal.ratio.as_slice(),
+            ),
+            (
+                "smoothed_prior_poloidal",
+                branch.variance_pattern.smoothed.poloidal.prior.as_slice(),
+            ),
+            (
+                "smoothed_post_poloidal",
+                branch
+                    .variance_pattern
+                    .smoothed
+                    .poloidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "smoothed_ratio_poloidal",
+                branch.variance_pattern.smoothed.poloidal.ratio.as_slice(),
+            ),
+            (
+                "smoothed_trace_prior",
+                branch.variance_pattern.smoothed.trace.prior.as_slice(),
+            ),
+            (
+                "smoothed_trace_post",
+                branch.variance_pattern.smoothed.trace.posterior.as_slice(),
+            ),
+            (
+                "smoothed_trace_ratio",
+                branch.variance_pattern.smoothed.trace.ratio.as_slice(),
+            ),
+        ],
+    )?;
+    visual_output::write_top_cell_scalar_fields(
+        branch_dir.join("circulation_variance.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            (
+                "prior_circulation",
+                branch.variance_pattern.circulation.prior.as_slice(),
+            ),
+            (
+                "post_circulation",
+                branch.variance_pattern.circulation.posterior.as_slice(),
+            ),
+            (
+                "ratio_circulation",
+                branch.variance_pattern.circulation.ratio.as_slice(),
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+fn write_branch_variance_pattern_observation_edge_vtus(
+    result: &Torus1FormConditioningResult,
+    branch: &Torus1FormBranchResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let observation_dir = branch_dir.join("observation_edge_vtus");
+    fs::create_dir_all(&observation_dir)?;
+    let variance_ratio = Cochain::new(
+        1,
+        ratio_vector(&branch.posterior_variance, &branch.prior_variance),
+    );
+    for selected in &result.selected_observations {
+        let distance = Cochain::new(
+            1,
+            FeecVector::from_iterator(
+                branch.posterior_variance.len(),
+                (0..branch.posterior_variance.len()).map(|edge_index| {
+                    intrinsic_torus_distance(
+                        result.major_radius,
+                        result.minor_radius,
+                        result.edge_theta[edge_index],
+                        result.edge_phi[edge_index],
+                        selected.edge_theta,
+                        selected.edge_phi,
+                    )
+                }),
+            ),
+        );
+        let compatible_mask = Cochain::new(
+            1,
+            FeecVector::from_iterator(
+                branch.posterior_variance.len(),
+                (0..branch.posterior_variance.len()).map(|edge_index| {
+                    f64::from(
+                        classify_orientation_relation(
+                            selected.direction,
+                            result.toroidal_alignment_sq[edge_index],
+                        ) == ObservationOrientationRelation::Compatible,
+                    )
+                }),
+            ),
+        );
+        let oblique_mask = Cochain::new(
+            1,
+            FeecVector::from_iterator(
+                branch.posterior_variance.len(),
+                (0..branch.posterior_variance.len()).map(|edge_index| {
+                    f64::from(
+                        classify_orientation_relation(
+                            selected.direction,
+                            result.toroidal_alignment_sq[edge_index],
+                        ) == ObservationOrientationRelation::Oblique,
+                    )
+                }),
+            ),
+        );
+        let transverse_mask = Cochain::new(
+            1,
+            FeecVector::from_iterator(
+                branch.posterior_variance.len(),
+                (0..branch.posterior_variance.len()).map(|edge_index| {
+                    f64::from(
+                        classify_orientation_relation(
+                            selected.direction,
+                            result.toroidal_alignment_sq[edge_index],
+                        ) == ObservationOrientationRelation::Transverse,
+                    )
+                }),
+            ),
+        );
+        visual_output::write_1cochain_fields(
+            observation_dir.join(format!("observation_{:02}.vtu", selected.observation_index)),
+            &result.coords,
+            &result.topology,
+            &[
+                ("distance_to_observation", &distance),
+                ("compatible_mask", &compatible_mask),
+                ("oblique_mask", &oblique_mask),
+                ("transverse_mask", &transverse_mask),
+                ("variance_ratio", &variance_ratio),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+fn write_branch_summary(
+    branch: &Torus1FormBranchResult,
+    result: &Torus1FormConditioningResult,
+    branch_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(branch_dir.join("summary.txt"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(writer, "branch={}", branch.name)?;
+    writeln!(writer, "effective_range={}", result.effective_range)?;
+    writeln!(
+        writer,
+        "neighbourhood_radius={}",
+        result.neighbourhood_radius
+    )?;
+    writeln!(writer, "far_radius={}", result.far_radius)?;
+    writeln!(
+        writer,
+        "harmonic_coefficients_truth={},{}",
+        branch.harmonic_coefficients_truth[0], branch.harmonic_coefficients_truth[1]
+    )?;
+    writeln!(
+        writer,
+        "harmonic_coefficients_posterior_mean={},{}",
+        branch.harmonic_coefficients_posterior_mean[0],
+        branch.harmonic_coefficients_posterior_mean[1]
+    )?;
+    write_observed_summary(&mut writer, &branch.summary.observed)?;
+    write_region_summary(&mut writer, "near", &branch.summary.near)?;
+    write_region_summary(&mut writer, "far", &branch.summary.far)?;
+    Ok(())
+}
+
+fn write_observed_summary(writer: &mut impl Write, observed: &ObservedSummary) -> io::Result<()> {
+    writeln!(writer, "observed_count={}", observed.count)?;
+    writeln!(writer, "observed_max_abs_error={}", observed.max_abs_error)?;
+    writeln!(
+        writer,
+        "observed_mean_abs_error={}",
+        observed.mean_abs_error
+    )?;
+    writeln!(
+        writer,
+        "observed_harmonic_free_mean_abs_error={}",
+        observed.harmonic_free_mean_abs_error
+    )?;
+    writeln!(
+        writer,
+        "observed_variance_ratio_mean={}",
+        observed.variance_ratio_mean
+    )?;
+    writeln!(
+        writer,
+        "observed_harmonic_free_variance_ratio_mean={}",
+        observed.harmonic_free_variance_ratio_mean
+    )?;
+    Ok(())
+}
+
+fn write_region_summary(
+    writer: &mut impl Write,
+    label: &str,
+    region: &RegionSummary,
+) -> io::Result<()> {
+    writeln!(writer, "{}_count={}", label, region.count)?;
+    writeln!(writer, "{}_mean_abs_error={}", label, region.mean_abs_error)?;
+    writeln!(
+        writer,
+        "{}_harmonic_free_mean_abs_error={}",
+        label, region.harmonic_free_mean_abs_error
+    )?;
+    writeln!(
+        writer,
+        "{}_variance_ratio_mean={}",
+        label, region.variance_ratio_mean
+    )?;
+    writeln!(
+        writer,
+        "{}_harmonic_free_variance_ratio_mean={}",
+        label, region.harmonic_free_variance_ratio_mean
+    )?;
+    writeln!(
+        writer,
+        "{}_variance_reduction_mean={}",
+        label, region.variance_reduction_mean
+    )?;
+    writeln!(
+        writer,
+        "{}_harmonic_free_variance_reduction_mean={}",
+        label, region.harmonic_free_variance_reduction_mean
+    )?;
+    Ok(())
+}
+
+fn invalid_input(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+fn invalid_data(message: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormConditioningKappa0Config {
+    pub mesh_path: PathBuf,
+    pub tau: f64,
+    pub noise_variance: f64,
+    pub surface_vector_variance_mode: SurfaceVectorVarianceMode,
+    pub num_variance_probes: usize,
+    pub variance_batch_count: usize,
+    pub rng_seed: u64,
+    pub observation_targets: Vec<Torus1FormObservationTarget>,
+}
+
+impl Default for Torus1FormConditioningKappa0Config {
+    fn default() -> Self {
+        Self {
+            mesh_path: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("../../meshes/torus_shell_resolution_1.msh"),
+            tau: 1.0,
+            noise_variance: 1e-8,
+            surface_vector_variance_mode: SurfaceVectorVarianceMode::HutchinsonStabilized,
+            num_variance_probes: DEFAULT_NUM_VARIANCE_PROBES,
+            variance_batch_count: DEFAULT_VARIANCE_BATCH_COUNT,
+            rng_seed: DEFAULT_RNG_SEED,
+            observation_targets: DEFAULT_OBSERVATION_TARGETS.to_vec(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormConditioningKappa0VarianceFields {
+    pub reconstructed: Torus1FormVarianceComponentFields,
+    pub surface_vector: Torus1FormAmbientVarianceFields,
+    pub circulation: Torus1FormVarianceFieldSet,
+}
+
+#[derive(Debug, Clone)]
+pub struct Torus1FormConditioningKappa0Result {
+    pub topology: Complex,
+    pub coords: MeshCoords,
+    pub edge_theta: FeecVector,
+    pub edge_phi: FeecVector,
+    pub toroidal_alignment_sq: FeecVector,
+    pub observation_targets: Vec<Torus1FormObservationTarget>,
+    pub selected_observations: Vec<Torus1FormSelectedObservation>,
+    pub observation_indices: Vec<usize>,
+    pub major_radius: f64,
+    pub minor_radius: f64,
+    pub surface_vector_variance_mode: SurfaceVectorVarianceMode,
+    pub num_variance_probes: usize,
+    pub variance_batch_count: usize,
+    pub rng_seed: u64,
+    pub truth: FeecVector,
+    pub posterior_mean: FeecVector,
+    pub absolute_mean_error: FeecVector,
+    pub prior_variance: FeecVector,
+    pub posterior_variance: FeecVector,
+    pub variance_reduction: FeecVector,
+    pub observed_mask: FeecVector,
+    pub nearest_observation_value: FeecVector,
+    pub nearest_observation_distance: FeecVector,
+    pub observation_values: Vec<f64>,
+    pub observation_summaries: Vec<Torus1FormObservationSummary>,
+    pub harmonic_coefficients_truth: [f64; 2],
+    pub harmonic_coefficients_posterior_mean: [f64; 2],
+    pub observed_summary: ObservedSummary,
+    pub variance_fields: Torus1FormConditioningKappa0VarianceFields,
+}
+
+pub fn run_torus_1form_conditioning_kappa0(
+    config: &Torus1FormConditioningKappa0Config,
+) -> Result<Torus1FormConditioningKappa0Result, Box<dyn Error>> {
+    validate_kappa0_config(config)?;
+
+    let mesh_bytes = fs::read(&config.mesh_path)?;
+    let (topology, coords) = manifold::io::gmsh::gmsh2coord_complex(&mesh_bytes);
+    let metric = coords.to_edge_lengths(&topology);
+    let geometry = build_torus_edge_geometry(&topology, &coords)?;
+    let cell_geometry = build_torus_cell_geometry(
+        &topology,
+        &coords,
+        geometry.major_radius,
+        geometry.minor_radius,
+    )
+    .map_err(invalid_data)?;
+    let hodge = build_hodge_laplacian_1form(&topology, &metric);
+    let harmonic_basis =
+        build_analytic_torus_harmonic_basis(&topology, &coords, &metric).map_err(invalid_data)?;
+    let harmonic_basis_orthonormal =
+        mass_orthonormalize_harmonic_basis(&harmonic_basis, &hodge.mass_u).map_err(invalid_data)?;
+    let harmonic_constraints =
+        build_harmonic_orthogonality_constraints(&harmonic_basis, &hodge.mass_u)
+            .map_err(invalid_data)?;
+
+    let seed = build_local_seed_cochain(
+        &topology,
+        &coords,
+        geometry.major_radius,
+        geometry.minor_radius,
+    );
+    let truth = remove_harmonic_content(&seed.coeffs, &harmonic_basis_orthonormal, &hodge.mass_u);
+
+    let selected_observations =
+        select_observation_edges(&geometry, &config.observation_targets).map_err(invalid_data)?;
+    let observation_indices = selected_observations
+        .iter()
+        .map(|selected| selected.edge_index)
+        .collect::<Vec<_>>();
+    let observation_matrix = observation_selector(hodge.mass_u.nrows(), &observation_indices);
+    let observed_mask = build_observed_mask(hodge.mass_u.nrows(), &observation_indices);
+    let nearest_observation_slots =
+        build_nearest_observation_slots(&geometry, &observation_indices);
+    let nearest_observation_distance = build_nearest_observation_distance_field(
+        &geometry,
+        &observation_indices,
+        &nearest_observation_slots,
+    );
+    let edge_theta = FeecVector::from_vec(geometry.theta.clone());
+    let edge_phi = FeecVector::from_vec(geometry.phi.clone());
+    let toroidal_alignment_sq = FeecVector::from_vec(geometry.toroidal_alignment_sq.clone());
+
+    let prior_precision = build_matern_precision_1form(
+        &topology,
+        &metric,
+        &hodge,
+        MaternConfig {
+            kappa: 0.0,
+            tau: config.tau,
+            mass_inverse: MaternMassInverse::Nc1ProjectedSparseInverse,
+        },
+    );
+    let q_prior = feec_csr_to_gmrf(&prior_precision);
+    let zero_observations = GmrfVector::zeros(observation_indices.len());
+    let (posterior_precision, _) = apply_gaussian_observations(
+        &q_prior,
+        &observation_matrix,
+        &zero_observations,
+        None,
+        config.noise_variance,
+    );
+
+    let toroidal_operator =
+        build_reconstructed_component_operator(&topology, &coords, &cell_geometry, true)
+            .map_err(invalid_data)?;
+    let poloidal_operator =
+        build_reconstructed_component_operator(&topology, &coords, &cell_geometry, false)
+            .map_err(invalid_data)?;
+    let surface_x_operator =
+        build_embedded_component_operator(&topology, &coords, 0).map_err(invalid_data)?;
+    let surface_y_operator =
+        build_embedded_component_operator(&topology, &coords, 1).map_err(invalid_data)?;
+    let surface_z_operator =
+        build_embedded_component_operator(&topology, &coords, 2).map_err(invalid_data)?;
+    let reconstructed_stacked_operator =
+        SparseRowLinearOperator::stack(&[&toroidal_operator, &poloidal_operator])
+            .map_err(|err| invalid_data(err.to_string()))?;
+    let surface_vector_stacked_operator = SparseRowLinearOperator::stack(&[
+        &surface_x_operator,
+        &surface_y_operator,
+        &surface_z_operator,
+    ])
+    .map_err(|err| invalid_data(err.to_string()))?;
+    let circulation_operator =
+        build_local_circulation_operator(&topology, hodge.mass_u.nrows()).map_err(invalid_data)?;
+
+    let identity_operator = SparseRowLinearOperator::identity(hodge.mass_u.nrows());
+    let prior_solver = ConstrainedPrecisionSolver::new(&q_prior, &harmonic_constraints)?;
+    let prior_latent_variances =
+        kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+            &prior_solver,
+            &identity_operator,
+            config.num_variance_probes,
+            config.variance_batch_count,
+            config.rng_seed.wrapping_add(0x0800),
+        )?);
+    let reconstructed_prior = split_component_estimates(
+        kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+            &prior_solver,
+            &reconstructed_stacked_operator,
+            config.num_variance_probes,
+            config.variance_batch_count,
+            config.rng_seed.wrapping_add(0x1000),
+        )?),
+        cell_geometry.theta.len(),
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_prior_estimates = match config.surface_vector_variance_mode {
+        SurfaceVectorVarianceMode::Exact => kappa0_estimates(exact_kappa0_transformed_variances(
+            &prior_solver,
+            &surface_vector_stacked_operator,
+        )?),
+        SurfaceVectorVarianceMode::Hutchinson | SurfaceVectorVarianceMode::HutchinsonStabilized => {
+            kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+                &prior_solver,
+                &surface_vector_stacked_operator,
+                config.num_variance_probes,
+                config.variance_batch_count,
+                config.rng_seed.wrapping_add(0x1800),
+            )?)
+        }
+    };
+    let surface_vector_prior =
+        split_ambient_estimates(surface_vector_prior_estimates, cell_geometry.theta.len())
+            .map_err(invalid_data)?;
+    let circulation_prior = kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+        &prior_solver,
+        &circulation_operator,
+        config.num_variance_probes,
+        config.variance_batch_count,
+        config.rng_seed.wrapping_add(0x3000),
+    )?);
+
+    let posterior_solver =
+        ConstrainedPrecisionSolver::new(&posterior_precision, &harmonic_constraints)?;
+    let posterior_latent_variances =
+        kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+            &posterior_solver,
+            &identity_operator,
+            config.num_variance_probes,
+            config.variance_batch_count,
+            config.rng_seed.wrapping_add(0x2800),
+        )?);
+    let reconstructed_posterior = split_component_estimates(
+        kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+            &posterior_solver,
+            &reconstructed_stacked_operator,
+            config.num_variance_probes,
+            config.variance_batch_count,
+            config.rng_seed.wrapping_add(0x1000),
+        )?),
+        cell_geometry.theta.len(),
+    )
+    .map_err(invalid_data)?;
+    let surface_vector_posterior_estimates = match config.surface_vector_variance_mode {
+        SurfaceVectorVarianceMode::Exact => kappa0_estimates(exact_kappa0_transformed_variances(
+            &posterior_solver,
+            &surface_vector_stacked_operator,
+        )?),
+        SurfaceVectorVarianceMode::Hutchinson | SurfaceVectorVarianceMode::HutchinsonStabilized => {
+            kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+                &posterior_solver,
+                &surface_vector_stacked_operator,
+                config.num_variance_probes,
+                config.variance_batch_count,
+                config.rng_seed.wrapping_add(0x1800),
+            )?)
+        }
+    };
+    let surface_vector_posterior =
+        if config.surface_vector_variance_mode == SurfaceVectorVarianceMode::HutchinsonStabilized {
+            clip_hutchinson_posterior_to_prior(
+                &surface_vector_prior,
+                &split_ambient_estimates(
+                    surface_vector_posterior_estimates,
+                    cell_geometry.theta.len(),
+                )
+                .map_err(invalid_data)?,
+            )
+        } else {
+            split_ambient_estimates(
+                surface_vector_posterior_estimates,
+                cell_geometry.theta.len(),
+            )
+            .map_err(invalid_data)?
+        };
+    let circulation_posterior = kappa0_estimates(estimate_kappa0_transformed_hutchinson_variances(
+        &posterior_solver,
+        &circulation_operator,
+        config.num_variance_probes,
+        config.variance_batch_count,
+        config.rng_seed.wrapping_add(0x3000),
+    )?);
+
+    let truth_gmrf = feec_vec_to_gmrf(&truth);
+    let observation_values = (&observation_matrix * &truth_gmrf)
+        .iter()
+        .copied()
+        .collect::<Vec<_>>();
+    let information = ht_weighted_observations(
+        &observation_matrix,
+        &GmrfVector::from_vec(observation_values.clone()),
+        1.0 / config.noise_variance,
+    );
+    let posterior_mean = gmrf_vec_to_feec(&posterior_solver.solve_mean(&information)?);
+
+    let prior_variance = gmrf_vec_to_feec(&prior_latent_variances.harmonic_free);
+    let posterior_variance = gmrf_vec_to_feec(&posterior_latent_variances.harmonic_free);
+    let absolute_mean_error = absolute_difference(&posterior_mean, &truth);
+    let variance_reduction = &prior_variance - &posterior_variance;
+    let nearest_observation_value =
+        build_nearest_observation_value_field(&nearest_observation_slots, &observation_values);
+    let harmonic_coefficients_truth =
+        harmonic_coefficients(&truth, &harmonic_basis_orthonormal, &hodge.mass_u)
+            .map_err(invalid_data)?;
+    let harmonic_coefficients_posterior_mean =
+        harmonic_coefficients(&posterior_mean, &harmonic_basis_orthonormal, &hodge.mass_u)
+            .map_err(invalid_data)?;
+    let observation_summaries = build_observation_summaries(
+        &selected_observations,
+        &observation_values,
+        &posterior_mean,
+        &absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+        &truth,
+        &posterior_mean,
+        &absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+    );
+    let observed_summary = summarize_observed(
+        &selected_observations
+            .iter()
+            .map(|selected| selected.edge_index)
+            .collect::<Vec<_>>(),
+        &absolute_mean_error,
+        &absolute_mean_error,
+        &prior_variance,
+        &posterior_variance,
+        &prior_variance,
+        &posterior_variance,
+    )
+    .map_err(invalid_data)?;
+
+    Ok(Torus1FormConditioningKappa0Result {
+        topology,
+        coords,
+        edge_theta,
+        edge_phi,
+        toroidal_alignment_sq,
+        observation_targets: config.observation_targets.clone(),
+        selected_observations,
+        observation_indices,
+        major_radius: geometry.major_radius,
+        minor_radius: geometry.minor_radius,
+        surface_vector_variance_mode: config.surface_vector_variance_mode,
+        num_variance_probes: config.num_variance_probes,
+        variance_batch_count: config.variance_batch_count,
+        rng_seed: config.rng_seed,
+        truth,
+        posterior_mean,
+        absolute_mean_error,
+        prior_variance,
+        posterior_variance,
+        variance_reduction,
+        observed_mask,
+        nearest_observation_value,
+        nearest_observation_distance,
+        observation_values,
+        observation_summaries,
+        harmonic_coefficients_truth,
+        harmonic_coefficients_posterior_mean,
+        observed_summary,
+        variance_fields: Torus1FormConditioningKappa0VarianceFields {
+            reconstructed: build_component_field_set(
+                &reconstructed_prior,
+                &reconstructed_posterior,
+                true,
+            ),
+            surface_vector: build_ambient_field_set(
+                &surface_vector_prior,
+                &surface_vector_posterior,
+                true,
+            ),
+            circulation: build_variance_field_set(&circulation_prior, &circulation_posterior, true),
+        },
+    })
+}
+
+pub fn write_torus_1form_conditioning_kappa0_outputs(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: impl AsRef<Path>,
+) -> Result<(), Box<dyn Error>> {
+    let out_dir = out_dir.as_ref();
+    let _ = fs::remove_dir_all(out_dir);
+    fs::create_dir_all(out_dir)?;
+
+    write_kappa0_selected_observations_csv(result, out_dir)?;
+    write_kappa0_summary(result, out_dir)?;
+    write_kappa0_fields_vtu(result, out_dir)?;
+    write_kappa0_surface_vector_vtu(result, out_dir)?;
+    write_kappa0_edge_csv(result, out_dir)?;
+    write_kappa0_observation_csv(result, out_dir)?;
+    write_kappa0_variance_field_vtus(result, out_dir)?;
+    crate::torus::kappa0_support::write_surface_vector_stats(
+        &result.coords,
+        &result.topology,
+        &result.posterior_mean,
+        &result.truth,
+        &result.variance_fields.surface_vector,
+        out_dir,
+        &out_dir.join("summary.txt"),
+    )?;
+
+    Ok(())
+}
+
+fn validate_kappa0_config(
+    config: &Torus1FormConditioningKappa0Config,
+) -> Result<(), Box<dyn Error>> {
+    if !config.tau.is_finite() || config.tau <= 0.0 {
+        return Err(invalid_input("tau must be finite and positive").into());
+    }
+    if !config.noise_variance.is_finite() || config.noise_variance <= 0.0 {
+        return Err(invalid_input("noise_variance must be finite and positive").into());
+    }
+    if config.num_variance_probes == 0 {
+        return Err(invalid_input("num_variance_probes must be >= 1").into());
+    }
+    if config.variance_batch_count == 0 {
+        return Err(invalid_input("variance_batch_count must be >= 1").into());
+    }
+    if config.observation_targets.is_empty() {
+        return Err(invalid_input("at least one observation target is required").into());
+    }
+    Ok(())
+}
+
+fn kappa0_estimates(constrained: GmrfVector) -> HutchinsonVarianceEstimates {
+    HutchinsonVarianceEstimates {
+        unconstrained: constrained.clone(),
+        harmonic_free: constrained,
+    }
+}
+
+fn exact_kappa0_transformed_variances(
+    solver: &ConstrainedPrecisionSolver,
+    operator: &SparseRowLinearOperator,
+) -> Result<GmrfVector, GmrfError> {
+    estimate_constrained_transformed_variances(solver, operator, TransformedVarianceMode::Exact)
+        .map(|estimate| estimate.values)
+}
+
+fn estimate_kappa0_transformed_hutchinson_variances(
+    solver: &ConstrainedPrecisionSolver,
+    operator: &SparseRowLinearOperator,
+    num_variance_probes: usize,
+    variance_batch_count: usize,
+    rng_seed: u64,
+) -> Result<GmrfVector, Box<dyn Error>> {
+    estimate_constrained_transformed_variances(
+        solver,
+        operator,
+        TransformedVarianceMode::Hutchinson {
+            config: ProbeBatchConfig {
+                num_probes: num_variance_probes,
+                batch_count: variance_batch_count,
+                rng_seed,
+            },
+            floor: VarianceFloor::PositiveMean { scale: 1e-12 },
+            distribution: ProbeDistribution::Rademacher,
+        },
+    )
+    .map(|estimate| estimate.values)
+    .map_err(|err| err.into())
+}
+
+fn write_kappa0_selected_observations_csv(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("selected_observations.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,edge_index,direction,target_theta,target_phi,edge_theta,edge_phi,toroidal_alignment_sq,selection_distance,used_fallback"
+    )?;
+    for selected in &result.selected_observations {
+        writeln!(
+            writer,
+            "{},{},{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{}",
+            selected.observation_index,
+            selected.edge_index,
+            selected.direction.as_str(),
+            selected.target_theta,
+            selected.target_phi,
+            selected.edge_theta,
+            selected.edge_phi,
+            selected.toroidal_alignment_sq,
+            selected.selection_distance,
+            selected.used_fallback,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_kappa0_summary(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("summary.txt"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "Torus 1-form Matérn conditioning (kappa=0, harmonic-free)"
+    )?;
+    writeln!(writer, "major_radius={}", result.major_radius)?;
+    writeln!(writer, "minor_radius={}", result.minor_radius)?;
+    writeln!(writer, "num_variance_probes={}", result.num_variance_probes)?;
+    writeln!(
+        writer,
+        "variance_batch_count={}",
+        result.variance_batch_count
+    )?;
+    writeln!(writer, "rng_seed={}", result.rng_seed)?;
+    writeln!(writer, "latent_edge_variances=exact_operator_solve")?;
+    writeln!(
+        writer,
+        "surface_vector_variance_mode={}",
+        result.surface_vector_variance_mode.as_str()
+    )?;
+    writeln!(
+        writer,
+        "observation_count={}",
+        result.selected_observations.len()
+    )?;
+    writeln!(
+        writer,
+        "harmonic_coefficients_truth={},{}",
+        result.harmonic_coefficients_truth[0], result.harmonic_coefficients_truth[1]
+    )?;
+    writeln!(
+        writer,
+        "harmonic_coefficients_posterior_mean={},{}",
+        result.harmonic_coefficients_posterior_mean[0],
+        result.harmonic_coefficients_posterior_mean[1]
+    )?;
+    writeln!(
+        writer,
+        "edge_mean_abs_error={}",
+        mean_feec(&result.absolute_mean_error)
+    )?;
+    writeln!(
+        writer,
+        "edge_max_abs_error={}",
+        max_feec(&result.absolute_mean_error)
+    )?;
+    writeln!(
+        writer,
+        "edge_variance_ratio_mean={}",
+        mean_feec(&ratio_vector(
+            &result.posterior_variance,
+            &result.prior_variance
+        ))
+    )?;
+    writeln!(
+        writer,
+        "circulation_variance_ratio_mean={}",
+        mean_feec(&result.variance_fields.circulation.ratio)
+    )?;
+    write_observed_summary(&mut writer, &result.observed_summary)?;
+    Ok(())
+}
+
+fn write_kappa0_fields_vtu(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let truth = Cochain::new(1, result.truth.clone());
+    let posterior_mean = Cochain::new(1, result.posterior_mean.clone());
+    let absolute_mean_error = Cochain::new(1, result.absolute_mean_error.clone());
+    let prior_variance = Cochain::new(1, result.prior_variance.clone());
+    let posterior_variance = Cochain::new(1, result.posterior_variance.clone());
+    let variance_reduction = Cochain::new(1, result.variance_reduction.clone());
+    let observed_mask = Cochain::new(1, result.observed_mask.clone());
+    let nearest_observation_value = Cochain::new(1, result.nearest_observation_value.clone());
+    let nearest_observation_distance = Cochain::new(1, result.nearest_observation_distance.clone());
+
+    visual_output::write_1cochain_fields(
+        out_dir.join("fields.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            ("truth", &truth),
+            ("posterior_mean", &posterior_mean),
+            ("absolute_mean_error", &absolute_mean_error),
+            ("prior_variance", &prior_variance),
+            ("posterior_variance", &posterior_variance),
+            ("variance_reduction", &variance_reduction),
+            ("observed_mask", &observed_mask),
+            ("nearest_observation_value", &nearest_observation_value),
+            (
+                "nearest_observation_distance",
+                &nearest_observation_distance,
+            ),
+        ],
+    )?;
+    visual_output::write_1form_vector_proxy_fields(
+        out_dir.join("posterior_mean_vector.vtu"),
+        &result.coords,
+        &result.topology,
+        "posterior_mean_vector",
+        &posterior_mean,
+        &[
+            ("truth", &truth),
+            ("absolute_mean_error", &absolute_mean_error),
+            ("posterior_variance", &posterior_variance),
+            ("observed_mask", &observed_mask),
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn write_kappa0_surface_vector_vtu(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let truth = Cochain::new(1, result.truth.clone());
+    let posterior_mean = Cochain::new(1, result.posterior_mean.clone());
+    let truth_vectors = sample_1form_cell_vectors(&result.coords, &result.topology, &truth)?;
+    let posterior_mean_vectors =
+        sample_1form_cell_vectors(&result.coords, &result.topology, &posterior_mean)?;
+    let posterior_mean_magnitude = vector_magnitudes(&posterior_mean_vectors);
+    let surface = &result.variance_fields.surface_vector;
+    let posterior_variance_vectors = ambient_variance_vectors(surface, false);
+    let prior_variance_vectors = ambient_variance_vectors(surface, true);
+    let posterior_marginal_std = surface.trace.posterior.map(|value| value.max(0.0).sqrt());
+
+    visual_output::write_top_cell_fields(
+        out_dir.join("posterior_mean_surface_vector.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            ("truth_surface_vector", truth_vectors.as_slice()),
+            (
+                "posterior_mean_surface_vector",
+                posterior_mean_vectors.as_slice(),
+            ),
+            (
+                "posterior_directional_variance",
+                posterior_variance_vectors.as_slice(),
+            ),
+            (
+                "prior_directional_variance",
+                prior_variance_vectors.as_slice(),
+            ),
+        ],
+        &[
+            ("magnitude", posterior_mean_magnitude.as_slice()),
+            ("marginal_variance", surface.trace.posterior.as_slice()),
+            ("marginal_std", posterior_marginal_std.as_slice()),
+            ("prior_marginal_variance", surface.trace.prior.as_slice()),
+            ("marginal_variance_ratio", surface.trace.ratio.as_slice()),
+        ],
+    )?;
+
+    Ok(())
+}
+
+fn write_kappa0_edge_csv(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("edge_fields.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "edge_index,theta,phi,toroidal_alignment_sq,truth,posterior_mean,absolute_mean_error,prior_variance,posterior_variance,variance_reduction,observed_mask,nearest_observation_value,nearest_observation_distance"
+    )?;
+
+    for edge_index in 0..result.truth.len() {
+        writeln!(
+            writer,
+            "{},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            edge_index,
+            result.edge_theta[edge_index],
+            result.edge_phi[edge_index],
+            result.toroidal_alignment_sq[edge_index],
+            result.truth[edge_index],
+            result.posterior_mean[edge_index],
+            result.absolute_mean_error[edge_index],
+            result.prior_variance[edge_index],
+            result.posterior_variance[edge_index],
+            result.variance_reduction[edge_index],
+            result.observed_mask[edge_index],
+            result.nearest_observation_value[edge_index],
+            result.nearest_observation_distance[edge_index],
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_kappa0_observation_csv(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    let file = File::create(out_dir.join("observations.csv"))?;
+    let mut writer = BufWriter::new(file);
+    writeln!(
+        writer,
+        "observation_index,edge_index,direction,target_theta,target_phi,edge_theta,edge_phi,used_fallback,observation_value,posterior_mean_at_observation,abs_error_at_observation,prior_variance_at_observation,posterior_variance_at_observation"
+    )?;
+
+    for summary in &result.observation_summaries {
+        writeln!(
+            writer,
+            "{},{},{},{:.12},{:.12},{:.12},{:.12},{},{:.12},{:.12},{:.12},{:.12},{:.12}",
+            summary.observation_index,
+            summary.edge_index,
+            summary.direction.as_str(),
+            summary.target_theta,
+            summary.target_phi,
+            summary.edge_theta,
+            summary.edge_phi,
+            summary.used_fallback,
+            summary.observation_value,
+            summary.posterior_mean_at_observation,
+            summary.abs_error_at_observation,
+            summary.prior_variance_at_observation,
+            summary.posterior_variance_at_observation,
+        )?;
+    }
+
+    Ok(())
+}
+
+fn write_kappa0_variance_field_vtus(
+    result: &Torus1FormConditioningKappa0Result,
+    out_dir: &Path,
+) -> Result<(), Box<dyn Error>> {
+    visual_output::write_top_cell_scalar_fields(
+        out_dir.join("reconstructed_component_variance.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            (
+                "prior_var_toroidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .toroidal
+                    .prior
+                    .as_slice(),
+            ),
+            (
+                "post_var_toroidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .toroidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "ratio_toroidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .toroidal
+                    .ratio
+                    .as_slice(),
+            ),
+            (
+                "prior_var_poloidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .poloidal
+                    .prior
+                    .as_slice(),
+            ),
+            (
+                "post_var_poloidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .poloidal
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "ratio_poloidal",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .poloidal
+                    .ratio
+                    .as_slice(),
+            ),
+            (
+                "trace_prior",
+                result.variance_fields.reconstructed.trace.prior.as_slice(),
+            ),
+            (
+                "trace_post",
+                result
+                    .variance_fields
+                    .reconstructed
+                    .trace
+                    .posterior
+                    .as_slice(),
+            ),
+            (
+                "trace_ratio",
+                result.variance_fields.reconstructed.trace.ratio.as_slice(),
+            ),
+        ],
+    )?;
+    visual_output::write_top_cell_scalar_fields(
+        out_dir.join("circulation_variance.vtu"),
+        &result.coords,
+        &result.topology,
+        &[
+            (
+                "prior_circulation",
+                result.variance_fields.circulation.prior.as_slice(),
+            ),
+            (
+                "post_circulation",
+                result.variance_fields.circulation.posterior.as_slice(),
+            ),
+            (
+                "ratio_circulation",
+                result.variance_fields.circulation.ratio.as_slice(),
+            ),
+        ],
+    )?;
+    Ok(())
+}
+
+fn mean_feec(values: &FeecVector) -> f64 {
+    if values.is_empty() {
+        f64::NAN
+    } else {
+        values.iter().sum::<f64>() / values.len() as f64
+    }
+}
+
+fn max_feec(values: &FeecVector) -> f64 {
+    values.iter().copied().fold(f64::NEG_INFINITY, f64::max)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gmrf_core::types::CooMatrix as GmrfCooMatrix;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn wrap_angle_difference_uses_shortest_arc() {
+        let delta = wrap_angle_difference(PI - 0.1, -PI + 0.1);
+        assert!((delta + 0.2).abs() < 1e-12);
+
+        let delta = wrap_angle_difference(-PI + 0.1, PI - 0.1);
+        assert!((delta - 0.2).abs() < 1e-12);
+    }
+
+    #[test]
+    fn intrinsic_torus_distance_wraps_phi_across_branch_cut() {
+        let distance = intrinsic_torus_distance(1.0, 0.3, 0.2, PI - 0.1, 0.2, -PI + 0.1);
+        let expected = (1.0 + 0.3 * 0.2_f64.cos()) * 0.2;
+        assert!((distance - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn safe_ratio_returns_zero_for_zero_denominator() {
+        assert_eq!(safe_ratio(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn classify_orientation_relation_distinguishes_compatible_oblique_and_transverse() {
+        assert_eq!(
+            classify_orientation_relation(ObservationDirection::Toroidal, 0.95),
+            ObservationOrientationRelation::Compatible
+        );
+        assert_eq!(
+            classify_orientation_relation(ObservationDirection::Toroidal, 0.50),
+            ObservationOrientationRelation::Oblique
+        );
+        assert_eq!(
+            classify_orientation_relation(ObservationDirection::Toroidal, 0.05),
+            ObservationOrientationRelation::Transverse
+        );
+
+        assert_eq!(
+            classify_orientation_relation(ObservationDirection::Poloidal, 0.05),
+            ObservationOrientationRelation::Compatible
+        );
+        assert_eq!(
+            classify_orientation_relation(ObservationDirection::Poloidal, 0.50),
+            ObservationOrientationRelation::Oblique
+        );
+        assert_eq!(
+            classify_orientation_relation(ObservationDirection::Poloidal, 0.95),
+            ObservationOrientationRelation::Transverse
+        );
+    }
+
+    #[test]
+    fn transformed_hutchinson_identity_matches_latent_estimator() {
+        let mut coo = GmrfCooMatrix::new(3, 3);
+        coo.push(0, 0, 4.0);
+        coo.push(0, 1, 1.0);
+        coo.push(1, 0, 1.0);
+        coo.push(1, 1, 3.5);
+        coo.push(1, 2, 0.5);
+        coo.push(2, 1, 0.5);
+        coo.push(2, 2, 2.5);
+        let precision = GmrfSparseMatrix::from(&coo);
+        let constraints = GmrfDenseMatrix::zeros(0, 3);
+
+        let mut latent_workspace = build_hutchinson_workspace(&precision, &constraints).unwrap();
+        let latent =
+            estimate_latent_hutchinson_variances(&mut latent_workspace, 3, 24, 4, 17).unwrap();
+
+        let mut transformed_workspace =
+            build_hutchinson_workspace(&precision, &constraints).unwrap();
+        let identity = SparseRowLinearOperator::identity(3);
+        let transformed = estimate_transformed_hutchinson_variances(
+            &mut transformed_workspace,
+            &identity,
+            24,
+            4,
+            17,
+        )
+        .unwrap();
+
+        assert_eq!(latent.unconstrained, transformed.unconstrained);
+        assert_eq!(latent.harmonic_free, transformed.harmonic_free);
+    }
+
+    #[test]
+    fn exact_latent_variances_match_gmrf_decomposition() {
+        let mut coo = GmrfCooMatrix::new(3, 3);
+        coo.push(0, 0, 4.0);
+        coo.push(0, 1, 1.0);
+        coo.push(1, 0, 1.0);
+        coo.push(1, 1, 3.5);
+        coo.push(1, 2, 0.5);
+        coo.push(2, 1, 0.5);
+        coo.push(2, 2, 2.5);
+        let precision = GmrfSparseMatrix::from(&coo);
+        let constraints = GmrfDenseMatrix::from_fn(1, 3, |_, j| if j == 0 { 1.0 } else { 0.0 });
+
+        let mut workspace = build_hutchinson_workspace(&precision, &constraints).unwrap();
+        let exact = exact_latent_variances(&mut workspace, &constraints).unwrap();
+
+        let mut gmrf =
+            Gmrf::from_mean_and_precision(GmrfVector::zeros(3), precision.clone()).unwrap();
+        let decomposition = gmrf
+            .exact_constrained_variance_decomposition(&constraints)
+            .unwrap();
+
+        assert_eq!(exact.unconstrained, decomposition.unconstrained_diag);
+        assert_eq!(exact.harmonic_free, decomposition.constrained_diag);
+    }
+
+    #[test]
+    fn exact_transformed_variances_match_latent_for_identity_operator() {
+        fn assert_vectors_close(lhs: &GmrfVector, rhs: &GmrfVector) {
+            assert_eq!(lhs.len(), rhs.len());
+            for (index, (left, right)) in lhs.iter().zip(rhs.iter()).enumerate() {
+                assert!(
+                    (*left - *right).abs() <= 1.0e-14 * left.abs().max(right.abs()).max(1.0),
+                    "entry {index}: left={left:.16e}, right={right:.16e}"
+                );
+            }
+        }
+
+        let mut coo = GmrfCooMatrix::new(3, 3);
+        coo.push(0, 0, 4.0);
+        coo.push(0, 1, 1.0);
+        coo.push(1, 0, 1.0);
+        coo.push(1, 1, 3.5);
+        coo.push(1, 2, 0.5);
+        coo.push(2, 1, 0.5);
+        coo.push(2, 2, 2.5);
+        let precision = GmrfSparseMatrix::from(&coo);
+        let constraints = GmrfDenseMatrix::zeros(0, 3);
+
+        let mut latent_workspace = build_hutchinson_workspace(&precision, &constraints).unwrap();
+        let latent = exact_latent_variances(&mut latent_workspace, &constraints).unwrap();
+
+        let mut transformed_workspace =
+            build_hutchinson_workspace(&precision, &constraints).unwrap();
+        let identity = SparseRowLinearOperator::identity(3);
+        let transformed =
+            exact_transformed_variances(&mut transformed_workspace, &identity).unwrap();
+
+        assert_vectors_close(&latent.unconstrained, &transformed.unconstrained);
+        assert_vectors_close(&latent.harmonic_free, &transformed.harmonic_free);
+    }
+
+    #[test]
+    fn clip_hutchinson_estimates_caps_posterior_at_prior() {
+        let prior = HutchinsonVarianceEstimates {
+            unconstrained: GmrfVector::from_vec(vec![1.0, 2.0]),
+            harmonic_free: GmrfVector::from_vec(vec![0.5, 0.25]),
+        };
+        let posterior = HutchinsonVarianceEstimates {
+            unconstrained: GmrfVector::from_vec(vec![1.5, 1.25]),
+            harmonic_free: GmrfVector::from_vec(vec![0.75, 0.1]),
+        };
+
+        let clipped = clip_hutchinson_estimates_to_prior(&prior, &posterior);
+        assert_eq!(clipped.unconstrained, GmrfVector::from_vec(vec![1.0, 1.25]));
+        assert_eq!(clipped.harmonic_free, GmrfVector::from_vec(vec![0.5, 0.1]));
+    }
+
+    #[test]
+    fn smoothing_operator_rows_are_normalized_and_cut_off() {
+        let geometry = TorusCellGeometry {
+            major_radius: 2.0,
+            minor_radius: 0.7,
+            theta: vec![0.0, 0.0, 0.0],
+            phi: vec![0.0, 0.05, 1.0],
+        };
+        let smoothing = build_gaussian_smoothing_operator(&geometry, 0.1, 0.2).unwrap();
+
+        for row in &smoothing.rows {
+            let sum = row.iter().map(|(_, value)| *value).sum::<f64>();
+            assert!((sum - 1.0).abs() <= 1e-12);
+        }
+        assert!(
+            smoothing.rows[0].iter().all(|(col, _)| *col != 2),
+            "cutoff should exclude distant cells from the smoothing stencil"
+        );
+    }
+
+    #[test]
+    fn circulation_operator_matches_face_boundary_incidence() {
+        let topology = Complex::standard(2);
+        let operator = build_local_circulation_operator(&topology, topology.edges().len()).unwrap();
+        let boundary = topology.boundary_operator(2);
+
+        assert_eq!(operator.nrows(), topology.cells().len());
+        assert_eq!(operator.ncols, topology.edges().len());
+        assert_eq!(operator.rows[0].len(), 3);
+
+        let mut expected = BTreeMap::new();
+        for (edge_index, cell_index, value) in boundary.triplet_iter() {
+            assert_eq!(cell_index, 0);
+            expected.insert(edge_index, *value);
+        }
+        let actual = operator.rows[0]
+            .iter()
+            .copied()
+            .collect::<BTreeMap<usize, f64>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn reconstructed_component_operators_have_top_cell_rows_and_local_support() {
+        let config = Torus1FormConditioningConfig::default();
+        let mesh_bytes = fs::read(&config.mesh_path).unwrap();
+        let (topology, coords) = manifold::io::gmsh::gmsh2coord_complex(&mesh_bytes);
+        let edge_geometry = build_torus_edge_geometry(&topology, &coords).unwrap();
+        let cell_geometry = build_torus_cell_geometry(
+            &topology,
+            &coords,
+            edge_geometry.major_radius,
+            edge_geometry.minor_radius,
+        )
+        .unwrap();
+
+        let toroidal =
+            build_reconstructed_component_operator(&topology, &coords, &cell_geometry, true)
+                .unwrap();
+        let poloidal =
+            build_reconstructed_component_operator(&topology, &coords, &cell_geometry, false)
+                .unwrap();
+
+        assert_eq!(toroidal.nrows(), topology.cells().len());
+        assert_eq!(poloidal.nrows(), topology.cells().len());
+        assert_eq!(toroidal.ncols, topology.edges().len());
+        assert!(toroidal.rows.iter().all(|row| row.len() <= 3));
+        assert!(poloidal.rows.iter().all(|row| row.len() <= 3));
+        assert!(toroidal.rows.iter().any(|row| !row.is_empty()));
+        assert!(poloidal.rows.iter().any(|row| !row.is_empty()));
+    }
+
+    #[test]
+    fn embedded_component_operators_have_top_cell_rows_and_local_support() {
+        let config = Torus1FormConditioningConfig::default();
+        let mesh_bytes = fs::read(&config.mesh_path).unwrap();
+        let (topology, coords) = manifold::io::gmsh::gmsh2coord_complex(&mesh_bytes);
+
+        let x = build_embedded_component_operator(&topology, &coords, 0).unwrap();
+        let y = build_embedded_component_operator(&topology, &coords, 1).unwrap();
+        let z = build_embedded_component_operator(&topology, &coords, 2).unwrap();
+
+        assert_eq!(x.nrows(), topology.cells().len());
+        assert_eq!(y.nrows(), topology.cells().len());
+        assert_eq!(z.nrows(), topology.cells().len());
+        assert_eq!(x.ncols, topology.edges().len());
+        assert!(x.rows.iter().all(|row| row.len() <= 3));
+        assert!(y.rows.iter().all(|row| row.len() <= 3));
+        assert!(z.rows.iter().all(|row| row.len() <= 3));
+        assert!(x.rows.iter().any(|row| !row.is_empty()));
+        assert!(y.rows.iter().any(|row| !row.is_empty()));
+        assert!(z.rows.iter().any(|row| !row.is_empty()));
+    }
+
+    #[test]
+    fn ambient_field_set_trace_sums_xyz_components() {
+        let prior = Torus1FormAmbientVarianceEstimates {
+            x: HutchinsonVarianceEstimates {
+                unconstrained: GmrfVector::from_vec(vec![1.0, 2.0]),
+                harmonic_free: GmrfVector::from_vec(vec![0.5, 1.5]),
+            },
+            y: HutchinsonVarianceEstimates {
+                unconstrained: GmrfVector::from_vec(vec![0.25, 0.75]),
+                harmonic_free: GmrfVector::from_vec(vec![0.2, 0.3]),
+            },
+            z: HutchinsonVarianceEstimates {
+                unconstrained: GmrfVector::from_vec(vec![0.1, 0.4]),
+                harmonic_free: GmrfVector::from_vec(vec![0.05, 0.15]),
+            },
+        };
+        let posterior = Torus1FormAmbientVarianceEstimates {
+            x: HutchinsonVarianceEstimates {
+                unconstrained: GmrfVector::from_vec(vec![0.5, 1.0]),
+                harmonic_free: GmrfVector::from_vec(vec![0.25, 0.5]),
+            },
+            y: HutchinsonVarianceEstimates {
+                unconstrained: GmrfVector::from_vec(vec![0.125, 0.25]),
+                harmonic_free: GmrfVector::from_vec(vec![0.1, 0.2]),
+            },
+            z: HutchinsonVarianceEstimates {
+                unconstrained: GmrfVector::from_vec(vec![0.05, 0.2]),
+                harmonic_free: GmrfVector::from_vec(vec![0.025, 0.1]),
+            },
+        };
+
+        let fields = build_ambient_field_set(&prior, &posterior, false);
+        assert!((fields.trace.prior[0] - 1.35).abs() < 1e-12);
+        assert!((fields.trace.prior[1] - 3.15).abs() < 1e-12);
+        assert!((fields.trace.posterior[0] - 0.675).abs() < 1e-12);
+        assert!((fields.trace.posterior[1] - 1.45).abs() < 1e-12);
+    }
+}

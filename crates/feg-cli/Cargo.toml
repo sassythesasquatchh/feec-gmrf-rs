@@ -1,0 +1,22 @@
+[package]
+name = "feg-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Reproducible study runner for FEEC-GMRF"
+
+[[bin]]
+name = "feg-study"
+path = "src/main.rs"
+
+[features]
+default = []
+experimental = ["dep:feg-experiments"]
+
+[dependencies]
+feg-case-studies = { path = "../feg-case-studies" }
+feg-experiments = { path = "../feg-experiments", optional = true }

@@ -1,0 +1,15 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using the metadata below."
+title: "FEEC-GMRF: Gaussian Markov random fields on finite-element exterior-calculus spaces"
+type: software
+authors:
+  - family-names: Dowd
+    given-names: Patrick
+version: 0.1.0
+license: MIT
+repository-code: "https://github.com/sassythesasquatchh/feec-gmrf"
+keywords:
+  - finite element exterior calculus
+  - Gaussian Markov random fields
+  - Matérn fields
+  - uncertainty quantification

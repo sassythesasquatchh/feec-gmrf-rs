@@ -1,0 +1,51 @@
+[package]
+name = "feg-gp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Optional spectral Gaussian-process models for FEEC-GMRF"
+
+[features]
+default = []
+external-solvers = [
+  "dep:feg-core",
+  "dep:formoniq",
+  "dep:manifold",
+  "dep:exterior",
+  "dep:ddf",
+]
+
+[dependencies]
+feg-core = { path = "../feg-core", optional = true }
+faer = { workspace = true }
+thiserror = { workspace = true }
+formoniq = { path = "../../feec/crates/formoniq", optional = true }
+manifold = { path = "../../feec/crates/manifold", optional = true }
+exterior = { path = "../../feec/crates/exterior", optional = true }
+common = { path = "../../feec/crates/common" }
+ddf = { path = "../../feec/crates/ddf", optional = true }
+libm = "0.2"
+
+[dev-dependencies]
+gmrf-core = { path = "../../gmrf-rs" }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+
+[[example]]
+name = "matern_kernel_compare"
+path = "examples/matern_kernel_compare.rs"
+required-features = ["external-solvers"]
+
+[[example]]
+name = "matern_1form_torus_gp"
+path = "examples/matern_1form_torus_gp.rs"
+required-features = ["external-solvers"]
+
+[[test]]
+name = "hodge_laplace_integration"
+path = "tests/hodge_laplace_integration.rs"
+required-features = ["external-solvers"]

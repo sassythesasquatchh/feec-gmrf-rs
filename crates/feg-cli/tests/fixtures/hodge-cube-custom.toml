@@ -1,0 +1,4 @@
+schema = "feg-study-custom-v1"
+study_id = "hodge-laplacian/cube"
+base_profile = "smoke"
+resolutions = [2]

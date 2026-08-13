@@ -1,0 +1,31 @@
+name: Versioned GitHub release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  archive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+      - name: Fetch submodule tags
+        run: git submodule foreach --recursive 'git fetch --tags --force'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build recursive source and documentation archive
+        run: bash scripts/build-release-archive.sh "${GITHUB_REF_NAME}" dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: feec-gmrf-${{ github.ref_name }}
+          path: dist/*
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

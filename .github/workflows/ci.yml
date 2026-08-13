@@ -1,0 +1,83 @@
+name: Supported package
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parent:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+      - run: cargo check --release --workspace --exclude feg-experiments --all-targets
+      - run: cargo test --release --workspace --exclude feg-experiments
+      - run: cargo clippy --release --workspace --exclude feg-experiments --all-targets -- -D warnings
+      - run: bash scripts/test-external-consumer.sh
+
+  standalone:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        workspace: [feec, gmrf-rs]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --all --check
+        working-directory: ${{ matrix.workspace }}
+      - run: cargo check --release --workspace --all-targets
+        working-directory: ${{ matrix.workspace }}
+      - run: cargo test --release --workspace --all-targets
+        working-directory: ${{ matrix.workspace }}
+      - run: cargo clippy --release --workspace --all-targets -- -D warnings
+        working-directory: ${{ matrix.workspace }}
+      - run: cargo doc --release --workspace --no-deps
+        working-directory: ${{ matrix.workspace }}
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  experiments:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --release -p feg-experiments --all-targets
+      - run: cargo test --release -p feg-experiments --all-targets
+
+  documentation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo doc --release --workspace --exclude feg-experiments --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  study-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install --yes gmsh
+      - run: cargo test --release -p feg-case-studies study::tests
+      - run: cargo run --release -p feg-cli --bin feg-study -- list
+      - run: bash scripts/run-smoke-studies.sh "$RUNNER_TEMP/feec-gmrf-smoke"

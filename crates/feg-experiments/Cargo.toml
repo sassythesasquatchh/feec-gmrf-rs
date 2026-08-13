@@ -1,0 +1,16 @@
+[package]
+name = "feg-experiments"
+autoexamples = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Exploratory FEEC-GMRF workflows outside the supported publication surface"
+readme = "README.md"
+
+[dependencies]
+feec-gmrf = { path = "../.." }
+feg-case-studies = { path = "../feg-case-studies", features = ["experimental"] }

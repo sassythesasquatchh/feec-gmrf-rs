@@ -1,0 +1,6 @@
+[submodule "feec"]
+	path = feec
+	url = ../feec-release
+[submodule "gmrf-rs"]
+	path = gmrf-rs
+	url = https://github.com/sassythesasquatchh/gmrf-rs.git

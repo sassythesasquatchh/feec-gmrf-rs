@@ -1,0 +1,26 @@
+/target/
+/tmp/
+/tests/external-consumer/Cargo.lock
+/out/
+**/target/
+**/out/
+**/petsc-solver/tmp/
+**/team13_observation_cache/
+*.petsc
+
+# Python local environments/build metadata
+.venv/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*.tmp
+*.bak
+
+# OS
+.DS_Store

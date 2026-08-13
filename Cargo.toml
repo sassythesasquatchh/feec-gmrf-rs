@@ -1,0 +1,66 @@
+[package]
+name = "feec-gmrf"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Patrick Dowd"]
+description = "Finite element exterior calculus models with Gaussian Markov random field inference"
+license = "MIT"
+repository = "https://github.com/sassythesasquatchh/feec-gmrf"
+readme = "README.md"
+publish = false
+
+[workspace]
+resolver = "2"
+members = [
+  ".",
+  "crates/feg-core",
+  "crates/feg-case-studies",
+  "crates/feg-infer",
+  "crates/feg-gp",
+  "crates/feg-cli",
+  "crates/feg-experiments",
+]
+default-members = [
+  ".",
+  "crates/feg-core",
+  "crates/feg-infer",
+  "crates/feg-case-studies",
+  "crates/feg-cli",
+]
+exclude = ["feec", "gmrf-rs"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+authors = ["Patrick Dowd"]
+license = "MIT"
+repository = "https://github.com/sassythesasquatchh/feec-gmrf"
+publish = false
+
+[workspace.dependencies]
+# Match the standalone gmrf-core dependency versions used by the submodule.
+faer = "0.21"
+nalgebra = { version = "0.32", default-features = true }
+nalgebra-sparse = "0.9"
+rand = "0.8"
+rand_distr = "0.4"
+thiserror = "1.0"
+criterion = "0.5"
+
+[features]
+default = []
+spectral = ["dep:feg-gp"]
+external-solvers = ["spectral", "feg-gp/external-solvers"]
+
+[dependencies]
+feg-core = { path = "crates/feg-core" }
+feg-infer = { path = "crates/feg-infer" }
+feg-gp = { path = "crates/feg-gp", optional = true }
+formoniq = { path = "feec/crates/formoniq" }
+manifold = { path = "feec/crates/manifold" }
+common = { path = "feec/crates/common" }
+gmrf-core = { path = "gmrf-rs" }
+thiserror = { workspace = true }
+rand = { workspace = true }

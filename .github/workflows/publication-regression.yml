@@ -1,0 +1,43 @@
+name: Full publication regression
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  thesis-submitted:
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install declared native prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gmsh libopenmpi-dev libpetsc-real-dev libslepc-real-dev
+          python -m pip install ngsolve
+      - name: Verify prerequisites explicitly
+        run: bash scripts/check-publication-prerequisites.sh
+      - name: Build FEEC PETSc/SLEPc helpers
+        run: bash scripts/build-petsc-helpers.sh
+      - name: Run external-solver regression tests
+        run: |
+          cargo test --release --manifest-path feec/Cargo.toml -p formoniq \
+            --features parent-fixture-tests
+          cargo test --release -p feg-infer --features external-solver-tests
+          cargo test --release -p feg-case-studies --lib --features external-reference-tests \
+            sphere_sparse_anchor_kernel_validation::tests
+      - name: Run full publication regressions
+        run: bash scripts/run-publication-regressions.sh "$RUNNER_TEMP/feec-gmrf-publication"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: thesis-submitted-runs
+          path: ${{ runner.temp }}/feec-gmrf-publication

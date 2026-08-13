@@ -1,0 +1,60 @@
+[package]
+name = "feg-case-studies"
+autoexamples = false
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Maintained report-backed FEEC-GMRF scientific workflows"
+
+[features]
+default = []
+experimental = []
+heavy-tests = []
+external-reference-tests = ["heavy-tests"]
+publication-regression-tests = ["heavy-tests"]
+
+[dependencies]
+feec-gmrf = { path = "../.." }
+feg-core = { path = "../feg-core" }
+feg-infer = { path = "../feg-infer" }
+feg-gp = { path = "../feg-gp", features = ["external-solvers"] }
+formoniq = { path = "../../feec/crates/formoniq" }
+manifold = { path = "../../feec/crates/manifold" }
+common = { path = "../../feec/crates/common" }
+exterior = { path = "../../feec/crates/exterior" }
+ddf = { path = "../../feec/crates/ddf" }
+gmrf-core = { path = "../../gmrf-rs" }
+faer = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+libm = "0.2"
+plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf"] }
+
+[[test]]
+name = "heavy_planar_holes"
+path = "tests/heavy_planar_holes.rs"
+required-features = ["experimental", "heavy-tests"]
+
+[[test]]
+name = "heavy_team13"
+path = "tests/heavy_team13.rs"
+required-features = ["experimental", "heavy-tests"]
+
+[[test]]
+name = "heavy_toroidal"
+path = "tests/heavy_toroidal.rs"
+required-features = ["heavy-tests"]
+
+[[test]]
+name = "heavy_magnetic_uq"
+path = "tests/heavy_magnetic_uq.rs"
+required-features = ["heavy-tests"]
+
+[[test]]
+name = "external_references"
+path = "tests/external_references.rs"
+required-features = ["external-reference-tests"]
