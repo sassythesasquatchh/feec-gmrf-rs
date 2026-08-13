@@ -7,7 +7,7 @@ authors:
     given-names: Patrick
 version: 0.1.0
 license: MIT
-repository-code: "https://github.com/sassythesasquatchh/feec-gmrf"
+repository-code: "https://github.com/sassythesasquatchh/feec-gmrf-rs"
 keywords:
   - finite element exterior calculus
   - Gaussian Markov random fields

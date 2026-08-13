@@ -6,7 +6,7 @@ rust-version = "1.80"
 authors = ["Patrick Dowd"]
 description = "Finite element exterior calculus models with Gaussian Markov random field inference"
 license = "MIT"
-repository = "https://github.com/sassythesasquatchh/feec-gmrf"
+repository = "https://github.com/sassythesasquatchh/feec-gmrf-rs"
 readme = "README.md"
 publish = false
 
@@ -36,7 +36,7 @@ edition = "2021"
 rust-version = "1.80"
 authors = ["Patrick Dowd"]
 license = "MIT"
-repository = "https://github.com/sassythesasquatchh/feec-gmrf"
+repository = "https://github.com/sassythesasquatchh/feec-gmrf-rs"
 publish = false
 
 [workspace.dependencies]

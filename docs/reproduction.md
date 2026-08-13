@@ -12,8 +12,8 @@ Use a recursive checkout so the exact FEEC and GMRF commits pinned by the parent
 are present:
 
 ```text
-git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf
-cd feec-gmrf
+git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf-rs
+cd feec-gmrf-rs
 ```
 
 Build the three manifests separately in release mode. The parent declares the

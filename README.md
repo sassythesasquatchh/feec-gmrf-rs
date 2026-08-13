@@ -31,8 +31,8 @@ Clone the complete repository and run the two introductory workflows in release
 mode:
 
 ```text
-git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf
-cd feec-gmrf
+git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf-rs
+cd feec-gmrf-rs
 cargo run --release --example minimal_0form
 cargo run --release --example em_1form_uq
 ```
@@ -49,7 +49,7 @@ Add a released tag or pinned commit to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-feec-gmrf = { git = "https://github.com/sassythesasquatchh/feec-gmrf", tag = "v0.1.0" }
+feec-gmrf = { git = "https://github.com/sassythesasquatchh/feec-gmrf-rs", tag = "v0.1.0" }
 ```
 
 Once a prior and its output maps have been assembled, ordinary conditioning uses

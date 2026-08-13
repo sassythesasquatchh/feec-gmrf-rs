@@ -14,8 +14,8 @@ Clone recursively so the exact FEEC and GMRF commits pinned by the parent are
 checked out:
 
 ```text
-git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf.git
-cd feec-gmrf
+git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf-rs.git
+cd feec-gmrf-rs
 git submodule status
 ```
 
