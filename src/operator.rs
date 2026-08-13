@@ -28,6 +28,49 @@ impl LinearMap {
         }
     }
 
+    /// Select coefficients from an input vector in the requested output order.
+    ///
+    /// Repeated indices represent repeated measurements.
+    pub fn selector(input_dimension: usize, indices: &[usize]) -> Result<Self> {
+        let rows = indices
+            .iter()
+            .map(|&index| vec![(index, 1.0)])
+            .collect::<Vec<_>>();
+        Self::weighted_rows(input_dimension, &rows)
+    }
+
+    /// Construct a single sparse weighted row.
+    pub fn weighted_row(input_dimension: usize, entries: &[(usize, f64)]) -> Result<Self> {
+        Self::weighted_rows(input_dimension, &[entries.to_vec()])
+    }
+
+    /// Construct sparse weighted rows, merging duplicate columns in each row.
+    pub fn weighted_rows(input_dimension: usize, rows: &[Vec<(usize, f64)>]) -> Result<Self> {
+        let mut matrix = SparseMat::new(rows.len(), input_dimension);
+        for (row_index, row) in rows.iter().enumerate() {
+            let mut merged = BTreeMap::<usize, f64>::new();
+            for &(column, value) in row {
+                if column >= input_dimension {
+                    return Err(FeecGmrfError::Dimension(format!(
+                        "weighted row column {column} lies outside input dimension {input_dimension}"
+                    )));
+                }
+                if !value.is_finite() {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "weighted-row entries must be finite".to_string(),
+                    ));
+                }
+                *merged.entry(column).or_default() += value;
+            }
+            for (column, value) in merged {
+                if value != 0.0 {
+                    matrix.push(row_index, column, value);
+                }
+            }
+        }
+        Self::new(matrix)
+    }
+
     /// Borrow the sparse matrix representation.
     pub fn matrix(&self) -> &SparseMat {
         &self.matrix
@@ -185,7 +228,7 @@ impl BoundaryLayout {
         })
     }
 
-    /// Identity layout for a form space without eliminated coefficients.
+    /// Identity layout with every coefficient active.
     pub fn identity(dimension: usize) -> Self {
         Self {
             full_dimension: dimension,
@@ -421,5 +464,21 @@ mod tests {
             stacked.apply(&[1.0, 3.0]).unwrap(),
             vec![2.0, 6.0, 2.0, 6.0]
         );
+    }
+
+    #[test]
+    fn selector_preserves_order_and_repeated_indices() {
+        let selector = LinearMap::selector(3, &[2, 0, 2]).unwrap();
+        assert_eq!(selector.apply(&[1.0, 2.0, 3.0]).unwrap(), [3.0, 1.0, 3.0]);
+        assert!(LinearMap::selector(3, &[3]).is_err());
+    }
+
+    #[test]
+    fn weighted_rows_merge_duplicate_columns() {
+        let map =
+            LinearMap::weighted_rows(3, &[vec![(0, 1.0), (0, 2.0), (2, -1.0)], vec![(1, 4.0)]])
+                .unwrap();
+        assert_eq!(map.apply(&[2.0, 3.0, 5.0]).unwrap(), [1.0, 12.0]);
+        assert!(LinearMap::weighted_row(2, &[(0, f64::NAN)]).is_err());
     }
 }

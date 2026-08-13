@@ -27,6 +27,135 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::time::Instant;
 
+/// Observation noise for the root state-only PDE builder.
+#[derive(Debug, Clone)]
+pub enum StateOnlyLinearObservationNoise {
+    ScalarVariance(f64),
+    Precision(SparseTripletMatrix),
+}
+
+/// Active-coordinate affine observation used by the state-only PDE adapter.
+#[derive(Debug, Clone)]
+pub struct StateOnlyLinearObservationSpec {
+    pub operator: SparseTripletMatrix,
+    pub observations: Vec<f64>,
+    pub bias: Vec<f64>,
+    pub noise: StateOnlyLinearObservationNoise,
+}
+
+/// Factored state-only posterior in physical state coordinates.
+pub struct StateOnlyLinearPdePosterior {
+    pub posterior: Gmrf,
+    pub precision: GmrfSparseMatrix,
+}
+
+/// Condition a proper state prior on affine scalar- or precision-weighted observations.
+///
+/// The reduced PDE assembly supplies the state/layout contract; weak PDE residuals
+/// are represented by callers as ordinary affine observations of its operator.
+pub fn build_state_only_linear_pde_posterior(
+    state_prior: &GaussianPriorSpec,
+    system: &ReducedLinearPdeAssembly,
+    observations: &[StateOnlyLinearObservationSpec],
+) -> Result<StateOnlyLinearPdePosterior, String> {
+    state_prior.validate()?;
+    if state_prior.dimension() != system.state_dimension() {
+        return Err(format!(
+            "state prior dimension {} does not match reduced PDE dimension {}",
+            state_prior.dimension(),
+            system.state_dimension()
+        ));
+    }
+    if system.layout.reduced_dimension() != system.state_dimension() {
+        return Err("reduced PDE layout does not match its state dimension".to_string());
+    }
+
+    let prior_precision = feec_csr_to_gmrf(&core_triplet_to_feec_csr(&state_prior.precision));
+    let prior_mean = GmrfVector::from_vec(state_prior.mean.clone());
+    let matrices = observations
+        .iter()
+        .map(|observation| {
+            if observation.operator.nrows() != observation.observations.len()
+                || observation.bias.len() != observation.observations.len()
+                || observation.operator.ncols() != state_prior.dimension()
+            {
+                return Err("state-only observation dimensions do not align".to_string());
+            }
+            Ok(feec_csr_to_gmrf(&core_triplet_to_feec_csr(
+                &observation.operator,
+            )))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let centered = observations
+        .iter()
+        .zip(&matrices)
+        .map(|(observation, operator)| {
+            let prior_output = operator.mul_vec(&prior_mean);
+            GmrfVector::from_iterator(
+                observation.observations.len(),
+                observation
+                    .observations
+                    .iter()
+                    .zip(&observation.bias)
+                    .zip(prior_output.iter())
+                    .map(|((value, bias), prior)| value - bias - prior),
+            )
+        })
+        .collect::<Vec<_>>();
+    let precision_matrices = observations
+        .iter()
+        .map(|observation| match &observation.noise {
+            StateOnlyLinearObservationNoise::ScalarVariance(_) => None,
+            StateOnlyLinearObservationNoise::Precision(precision) => {
+                Some(feec_csr_to_gmrf(&core_triplet_to_feec_csr(precision)))
+            }
+        })
+        .collect::<Vec<_>>();
+    let terms = observations
+        .iter()
+        .enumerate()
+        .map(|(index, observation)| match observation.noise {
+            StateOnlyLinearObservationNoise::ScalarVariance(variance) => {
+                LinearObservationTerm::scalar_variance(
+                    &matrices[index],
+                    &centered[index],
+                    None,
+                    variance,
+                )
+            }
+            StateOnlyLinearObservationNoise::Precision(_) => LinearObservationTerm::precision(
+                &matrices[index],
+                &centered[index],
+                None,
+                precision_matrices[index]
+                    .as_ref()
+                    .expect("precision observation was converted above"),
+            ),
+        })
+        .collect::<Vec<_>>();
+    let factored = gmrf_core::condition_linear_gaussian_with_factor(&prior_precision, &terms)
+        .map_err(|error| error.to_string())?;
+    let mean = GmrfVector::from_iterator(
+        state_prior.dimension(),
+        state_prior
+            .mean
+            .iter()
+            .zip(factored.posterior_mean.iter())
+            .map(|(prior, delta)| prior + delta),
+    );
+    let information = factored.posterior_precision.mul_vec(&mean);
+    let posterior = Gmrf::from_information_and_precision_with_sqrt(
+        information,
+        factored.posterior_precision.clone(),
+        factored.posterior_factor,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(StateOnlyLinearPdePosterior {
+        posterior,
+        precision: factored.posterior_precision,
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinearPdeVarianceMode {
     Exact,

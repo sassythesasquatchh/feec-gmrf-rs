@@ -1,9 +1,11 @@
+use common::linalg::nalgebra::{CooMatrix as FeecCoo, CsrMatrix as FeecCsr, Vector as FeecVector};
 use feec_gmrf::prelude::*;
 use feec_gmrf::prior::matern_recurrence;
 use feg_infer::prior::matern::generic::{
     build_hodge_laplacian_form, build_matern_system_matrix_form,
     build_projected_or_top_degree_mass_inverse,
 };
+use formoniq::{problems::reduced_linear::ReducedLinearPdeAssembly, reduction::DofLayout};
 use manifold::gen::cartesian::CartesianMeshInfo;
 use rand::{rngs::StdRng, SeedableRng};
 
@@ -109,6 +111,108 @@ fn downstream_user_can_build_condition_and_push_forward_a_form_prior() {
 }
 
 #[test]
+fn exact_and_mc_variance_apis_cover_named_and_ad_hoc_outputs() {
+    let prior = GaussianPrior::new(
+        vec![0.0, 0.0],
+        SparseMat::from_rows(2, &[vec![(0, 2.0)], vec![(1, 4.0)]]).unwrap(),
+    )
+    .unwrap();
+    let map = LinearMap::weighted_row(2, &[(0, 1.0), (1, 2.0)]).unwrap();
+    let mut posterior = LinearGaussianModelBuilder::new(prior)
+        .derive(DerivedQuantity::new("q", map.clone()).unwrap())
+        .unwrap()
+        .condition()
+        .unwrap();
+    let exact = posterior
+        .derived_variance_estimate("q", VarianceMethod::Exact)
+        .unwrap();
+    let ad_hoc = posterior
+        .pushforward_variance_estimate(&map, VarianceMethod::Exact)
+        .unwrap();
+    assert_vector_close(&exact.values, &[1.5], 1e-12);
+    assert_eq!(exact.values, ad_hoc.values);
+
+    let mc = posterior
+        .derived_variance_estimate(
+            "q",
+            VarianceMethod::MonteCarlo(MonteCarloVarianceConfig::new(4096, 8, 19).unwrap()),
+        )
+        .unwrap();
+    assert!((mc.values[0] - 1.5).abs() < 0.1);
+    assert_eq!(mc.sample_count, 4096);
+    assert_eq!(mc.batch_sizes, vec![512; 8]);
+    assert!(mc.batch_standard_error.unwrap()[0] > 0.0);
+}
+
+#[test]
+fn observation_and_variance_conveniences_reject_invalid_inputs() {
+    assert!(GaussianNoise::standard_deviation(0.0).is_err());
+    assert!(GaussianNoise::standard_deviation(f64::NAN).is_err());
+    assert!(LinearObservation::at_indices(
+        2,
+        &[0, 1],
+        vec![1.0],
+        GaussianNoise::variance(1.0).unwrap(),
+    )
+    .is_err());
+    assert!(MonteCarloVarianceConfig::new(0, 1, 0).is_err());
+    assert!(MonteCarloVarianceConfig::new(4, 5, 0).is_err());
+}
+
+#[test]
+fn state_only_pde_facade_supports_scalar_and_precision_sensor_noise() {
+    let system = identity_pde_system()
+        .with_right_hand_side(&[0.0, 0.0])
+        .unwrap();
+    let scalar =
+        LinearObservation::at_indices(2, &[0], vec![2.0], GaussianNoise::variance(0.5).unwrap())
+            .unwrap();
+    let precision = LinearObservation::at_indices(
+        2,
+        &[0],
+        vec![2.0],
+        GaussianNoise::precision(SparseMat::diagonal(1, 2.0)).unwrap(),
+    )
+    .unwrap();
+    let mut scalar_posterior =
+        LinearPdeModelBuilder::new(system.diagonal_prior(1.0).unwrap(), &system)
+            .unwrap()
+            .observe(scalar)
+            .unwrap()
+            .condition()
+            .unwrap();
+    let precision_posterior =
+        LinearPdeModelBuilder::new(system.diagonal_prior(1.0).unwrap(), &system)
+            .unwrap()
+            .observe(precision)
+            .unwrap()
+            .condition()
+            .unwrap();
+    assert_vector_close(scalar_posterior.mean(), &[4.0 / 3.0, 0.0], 1e-12);
+    assert_vector_close(scalar_posterior.mean(), precision_posterior.mean(), 1e-12);
+    assert!(scalar_posterior.latent_variances().unwrap()[0] < 1.0);
+}
+
+#[test]
+fn mass_weighted_weak_residual_establishes_source_driven_mean() {
+    let system = identity_pde_system()
+        .with_right_hand_side(&[2.0, -1.0])
+        .unwrap();
+    let prior = system.diagonal_prior(1.0).unwrap();
+    let posterior = LinearPdeModelBuilder::new(prior, &system)
+        .unwrap()
+        .observe_weak_residual(PdeResidualNoise::mass_weighted_l2_standard_deviation(0.1).unwrap())
+        .unwrap()
+        .derive(system.residual_quantity("residual").unwrap())
+        .unwrap()
+        .condition()
+        .unwrap();
+    assert_vector_close(posterior.mean(), &[200.0 / 101.0, -100.0 / 101.0], 1e-12);
+    let residual = posterior.derived_mean("residual").unwrap();
+    assert!(residual[0].abs() < 0.02 && residual[1].abs() < 0.01);
+}
+
+#[test]
 fn practical_range_parameters_record_the_conversion_convention() {
     let parameters = MaternParameters::from_practical_range(MaternAlpha::Two, 0.4, 2, 1.5)
         .expect("valid practical-range parameters");
@@ -207,6 +311,31 @@ fn prescribed_essential_values_propagate_through_linear_uq() {
     for _ in 0..4 {
         assert_eq!(posterior.sample_cochain(&mut rng).unwrap()[1], 2.0);
     }
+    let estimate = posterior
+        .cochain_variance_estimate(VarianceMethod::MonteCarlo(
+            MonteCarloVarianceConfig::new(1024, 8, 7).unwrap(),
+        ))
+        .unwrap();
+    assert_eq!(estimate.values[1], 0.0);
+    assert_eq!(estimate.batch_standard_error.unwrap()[1], 0.0);
+    assert_eq!(estimate.relative_standard_error.unwrap()[1], 0.0);
+}
+
+fn identity_pde_system() -> LinearPdeSystem {
+    let mut coo = FeecCoo::new(2, 2);
+    coo.push(0, 0, 1.0);
+    coo.push(1, 1, 1.0);
+    let identity = FeecCsr::from(&coo);
+    LinearPdeSystem::from_reduced_assembly(ReducedLinearPdeAssembly {
+        operator: identity.clone(),
+        residual_bias: FeecVector::zeros(2),
+        state_mass: identity.clone(),
+        state_mass_inverse: Some(identity.clone()),
+        layout: DofLayout::identity(2),
+        forcing_operator: identity.clone(),
+        neumann_operator: identity,
+    })
+    .unwrap()
 }
 
 #[test]

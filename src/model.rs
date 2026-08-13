@@ -25,6 +25,16 @@ impl GaussianNoise {
         Ok(Self::ScalarVariance(variance))
     }
 
+    /// Construct independent Gaussian noise from a common standard deviation.
+    pub fn standard_deviation(standard_deviation: f64) -> Result<Self> {
+        if !standard_deviation.is_finite() || standard_deviation <= 0.0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "Gaussian noise standard deviation must be finite and positive".to_string(),
+            ));
+        }
+        Self::variance(standard_deviation * standard_deviation)
+    }
+
     /// Construct a correlated noise model from an observation precision.
     pub fn precision(precision: crate::operator::SparseMat) -> Result<Self> {
         if precision.nrows() != precision.ncols() {
@@ -51,6 +61,20 @@ impl LinearObservation {
     pub fn new(operator: LinearMap, values: Vec<f64>, noise: GaussianNoise) -> Result<Self> {
         let bias = vec![0.0; values.len()];
         Self::with_bias(operator, values, bias, noise)
+    }
+
+    /// Observe selected coefficients by index.
+    pub fn at_indices(
+        input_dimension: usize,
+        indices: &[usize],
+        values: Vec<f64>,
+        noise: GaussianNoise,
+    ) -> Result<Self> {
+        Self::new(
+            LinearMap::selector(input_dimension, indices)?,
+            values,
+            noise,
+        )
     }
 
     /// Construct a linear observation with an explicit affine bias.
@@ -267,6 +291,11 @@ impl LinearGaussianModelBuilder {
         Ok(self)
     }
 
+    /// Add a named physical pushforward.
+    pub fn derive_physical(self, physical: crate::physical::PhysicalMap) -> Result<Self> {
+        self.derive(physical.into_derived_quantity()?)
+    }
+
     /// Factor and condition the model.
     pub fn condition(self) -> Result<crate::infer::Posterior> {
         crate::infer::condition_linear_model(self)
@@ -286,7 +315,7 @@ pub mod nonlinear {
     };
     use rand::Rng;
 
-    /// Root-facade nonlinear Laplace result with full-cochain reconstruction.
+    /// Nonlinear Laplace result with full-cochain reconstruction.
     pub struct NonlinearPosterior {
         inner: NonlinearLaplaceResult,
         cochain_map: Vec<f64>,
@@ -321,7 +350,7 @@ pub mod nonlinear {
             &self.inner
         }
 
-        /// Consume the facade result and return the lower-level result.
+        /// Return the lower-level inference result.
         pub fn into_inner(self) -> NonlinearLaplaceResult {
             self.inner
         }

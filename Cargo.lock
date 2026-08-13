@@ -575,6 +575,8 @@ name = "feec-gmrf"
 version = "0.1.0"
 dependencies = [
  "common",
+ "ddf",
+ "exterior",
  "feg-core",
  "feg-gp",
  "feg-infer",

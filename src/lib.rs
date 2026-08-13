@@ -1,15 +1,14 @@
 //! Reusable finite element exterior calculus (FEEC) and Gaussian Markov
 //! random field (GMRF) model construction.
 //!
-//! This crate is the supported entry point for downstream applications.  It
-//! presents FEEC assembly, Gaussian model composition, and inference through
-//! geometry-independent operators. The thesis case studies use the same
-//! canonical FEEC, GMRF, and integration implementations but are not part of
-//! this downstream stability boundary.
+//! The root crate provides the downstream API for FEEC assembly, Gaussian model
+//! composition, and inference through geometry-independent operators. Thesis
+//! applications live in the case-study crates and use the same implementations.
 
 pub mod boundary;
 pub mod error;
 pub mod infer;
+pub mod linear_pde;
 pub mod model;
 pub mod operator;
 pub mod physical;

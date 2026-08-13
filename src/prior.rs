@@ -7,6 +7,7 @@ use crate::operator::{add_sparse, FormDegree, FormOperators, LinearMap, SparseMa
 use crate::{FeecGmrfError, Result};
 pub use feg_core::MaternAlpha;
 use feg_core::SparseTriplet;
+use gmrf_core::types::DenseMatrix;
 use gmrf_core::{Gmrf, Vector};
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 
@@ -22,7 +23,7 @@ pub enum MaternParameterConvention {
     },
 }
 
-/// Canonical Matérn parameters used by the discrete precision recurrence.
+/// Matérn parameters used by the discrete precision recurrence.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MaternParameters {
     /// Lindgren/Whittle recurrence exponent.
@@ -31,7 +32,7 @@ pub struct MaternParameters {
     pub kappa: f64,
     /// Precision amplitude; the final precision is scaled by `tau^2`.
     pub tau: f64,
-    /// Convention used to obtain the canonical parameters.
+    /// Convention used to obtain these parameters.
     pub convention: MaternParameterConvention,
 }
 
@@ -103,9 +104,9 @@ impl Default for MaternParameters {
 pub enum MassInversePolicy {
     /// Invert the row-sum lumped mass diagonal.
     RowSumLumped,
-    /// Invert only the assembled diagonal. Appropriate for diagonal top-degree masses.
+    /// Invert the assembled diagonal entries. Appropriate for diagonal top-degree masses.
     Diagonal,
-    /// Use the canonical Whitney projected/top-degree inverse supplied by FEEC.
+    /// Use the Whitney projected/top-degree inverse supplied by FEEC.
     #[default]
     Projected,
     /// Use an explicitly supplied inverse.
@@ -129,6 +130,15 @@ pub struct GaussianPrior {
     precision: SparseMat,
     form_degree: Option<FormDegree>,
     boundary_elimination: Option<EssentialBoundaryElimination>,
+}
+
+/// Report from scaling a prior so one reference state has a requested
+/// Mahalanobis distance from the prior mean.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PriorMahalanobisCalibration {
+    pub uncalibrated_distance: f64,
+    pub target_distance: f64,
+    pub precision_scale: f64,
 }
 
 impl GaussianPrior {
@@ -216,14 +226,98 @@ impl GaussianPrior {
         self.boundary_elimination.as_ref()
     }
 
-    /// Condition an arbitrary full-space Gaussian prior on prescribed
+    /// Compute exact marginal variances for an active- or full-cochain map.
+    ///
+    /// Prescribed essential-boundary coefficients contribute zero variance.
+    /// The calculation uses the covariance and the linear part of the map.
+    pub fn pushforward_variances(&self, map: &LinearMap) -> Result<Vec<f64>> {
+        let eliminated = self.eliminate_map(map, &vec![0.0; map.output_dimension()])?;
+        let mut gmrf = Gmrf::from_mean_and_precision(
+            Vector::zeros(self.dimension()),
+            crate::infer::gmrf_sparse(self.precision()),
+        )?;
+        let operator = crate::infer::sparse_row_operator(eliminated.reduced())?;
+        let variances = gmrf
+            .exact_transformed_variance_decomposition(
+                &operator,
+                &DenseMatrix::zeros(0, self.dimension()),
+            )?
+            .unconstrained_diag;
+        Ok(variances.iter().copied().collect())
+    }
+
+    /// Mahalanobis distance from the prior mean in active coordinates.
+    pub fn mahalanobis_distance(&self, state: &[f64]) -> Result<f64> {
+        if state.len() != self.dimension() {
+            return Err(FeecGmrfError::Dimension(format!(
+                "state length {} does not match prior dimension {}",
+                state.len(),
+                self.dimension()
+            )));
+        }
+        if state.iter().any(|value| !value.is_finite()) {
+            return Err(FeecGmrfError::InvalidParameter(
+                "Mahalanobis state must contain only finite values".to_string(),
+            ));
+        }
+        let centered = state
+            .iter()
+            .zip(&self.mean)
+            .map(|(state, mean)| state - mean)
+            .collect::<Vec<_>>();
+        let weighted = self
+            .precision
+            .apply_checked(&centered)
+            .map_err(FeecGmrfError::Dimension)?;
+        let squared = centered
+            .iter()
+            .zip(weighted)
+            .map(|(left, right)| left * right)
+            .sum::<f64>();
+        if !squared.is_finite() || squared < -1.0e-10 {
+            return Err(FeecGmrfError::Inference(
+                "prior precision produced a negative or non-finite Mahalanobis norm".to_string(),
+            ));
+        }
+        Ok(squared.max(0.0).sqrt())
+    }
+
+    /// Scale the precision so `state` has the requested Mahalanobis distance
+    /// from the unchanged prior mean.
+    pub fn calibrate_to_mahalanobis_distance(
+        &self,
+        state: &[f64],
+        target_distance: f64,
+    ) -> Result<(Self, PriorMahalanobisCalibration)> {
+        if !target_distance.is_finite() || target_distance <= 0.0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "target Mahalanobis distance must be finite and positive".to_string(),
+            ));
+        }
+        let uncalibrated_distance = self.mahalanobis_distance(state)?;
+        if !uncalibrated_distance.is_finite() || uncalibrated_distance <= 0.0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "reference state must differ from the prior mean in the precision metric"
+                    .to_string(),
+            ));
+        }
+        let precision_scale = (target_distance / uncalibrated_distance).powi(2);
+        Ok((
+            self.with_precision_scale(precision_scale)?,
+            PriorMahalanobisCalibration {
+                uncalibrated_distance,
+                target_distance,
+                precision_scale,
+            },
+        ))
+    }
+
+    /// Condition an assembled full-space Gaussian prior on prescribed
     /// essential-boundary coefficients.
     ///
-    /// Matérn users should normally prefer
-    /// [`MaternPriorBuilder::essential_boundary_conditions`], which reduces
-    /// the FEEC form space before applying the mass-inverse recurrence. This
-    /// method instead computes the exact conditional distribution associated
-    /// with an already assembled full precision.
+    /// [`MaternPriorBuilder::essential_boundary_conditions`] performs boundary
+    /// reduction before the Matérn recurrence. This method applies exact
+    /// Gaussian conditioning to an existing full precision.
     pub fn condition_on_essential_boundary(
         &self,
         conditions: EssentialBoundaryConditions,
@@ -353,7 +447,7 @@ impl<'a> MaternPriorBuilder<'a> {
         })
     }
 
-    /// Set canonical Matérn parameters.
+    /// Set Matérn parameters.
     pub fn parameters(mut self, parameters: MaternParameters) -> Self {
         self.parameters = parameters;
         self
@@ -389,7 +483,7 @@ impl<'a> MaternPriorBuilder<'a> {
         self
     }
 
-    /// Assemble the prior precision through the canonical grade-independent recurrence.
+    /// Assemble the prior precision through the grade-independent recurrence.
     pub fn build(self) -> Result<GaussianPrior> {
         let (mut operators, mut projected_inverse) = match self.source {
             MaternSource::Operators(operators) => (*operators, None),
@@ -542,7 +636,7 @@ fn resolve_reduced_mean(
     elimination.reduce_state(&mean)
 }
 
-/// Apply the canonical Matérn precision recurrence to an assembled system and mass inverse.
+/// Apply the Matérn precision recurrence to an assembled system and mass inverse.
 pub fn matern_recurrence(
     system: &SparseMat,
     mass_inverse: &SparseMat,
@@ -640,6 +734,34 @@ fn apply_normalization(precision: &mut SparseMat, normalization: PriorNormalizat
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_pushforward_variances_support_non_diagonal_precision() {
+        let precision =
+            SparseMat::from_rows(2, &[vec![(0, 2.0), (1, 1.0)], vec![(0, 1.0), (1, 2.0)]]).unwrap();
+        let prior = GaussianPrior::new(vec![3.0, -2.0], precision).unwrap();
+        let map =
+            LinearMap::weighted_rows(2, &[vec![(0, 1.0), (1, 1.0)], vec![(0, 1.0), (1, -1.0)]])
+                .unwrap();
+
+        let variances = prior.pushforward_variances(&map).unwrap();
+        assert!((variances[0] - 2.0 / 3.0).abs() < 1.0e-12);
+        assert!((variances[1] - 2.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn mahalanobis_distance_is_mean_relative() {
+        let prior = GaussianPrior::new(vec![1.0, -1.0], SparseMat::diagonal(2, 4.0)).unwrap();
+        assert!((prior.mahalanobis_distance(&[2.0, 1.0]).unwrap() - 20.0_f64.sqrt()).abs() < 1e-12);
+        assert!(prior.mahalanobis_distance(&[1.0]).is_err());
+
+        let (calibrated, report) = prior
+            .calibrate_to_mahalanobis_distance(&[2.0, 1.0], 1.0)
+            .unwrap();
+        assert!((calibrated.mahalanobis_distance(&[2.0, 1.0]).unwrap() - 1.0).abs() < 1e-12);
+        assert!((report.precision_scale - 0.05).abs() < 1e-12);
+        assert_eq!(calibrated.mean(), prior.mean());
+    }
 
     #[test]
     fn recurrence_is_independent_of_form_degree() {

@@ -15,6 +15,7 @@ use common::linalg::nalgebra::CsrMatrix as FeecCsr;
 use ddf::whitney::lsf::WhitneyLsf;
 use ddf::ManifoldComplexExt;
 use exterior::field::ExteriorField;
+use formoniq::assemble::boundary_orientation_sign;
 use formoniq::reduction::DofLayout;
 use gmrf_core::SparseRowOperator;
 use manifold::{
@@ -44,6 +45,24 @@ pub struct MagneticFluxDensityComponentOperators3d {
 pub struct MagneticFluxDensityComponentOperators2d {
     pub x: SparseRowOperator,
     pub y: SparseRowOperator,
+}
+
+/// Cellwise vector-RMS weights and volume-averaged component maps for a 3D mesh.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MagneticFluxDensityAverages3d {
+    pub x: SparseRowOperator,
+    pub y: SparseRowOperator,
+    pub z: SparseRowOperator,
+    /// Cell-major weights aligned with `[Bx0, By0, Bz0, Bx1, ...]`.
+    pub vector_rms_weights: Vec<f64>,
+    pub domain_volume: f64,
+}
+
+/// Normalized lumped P1 mass weights for a scalar field's domain RMS.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScalarFieldRmsWeights {
+    pub vertex_weights: Vec<f64>,
+    pub domain_volume: f64,
 }
 
 /// FEEC exterior derivative `D0: C^0 -> C^1` as a sparse row operator.
@@ -177,6 +196,125 @@ pub fn build_full_magnetic_flux_density_component_operators_3d(
         x: build_full_magnetic_flux_density_component_operator_3d(topology, coords, 0)?,
         y: build_full_magnetic_flux_density_component_operator_3d(topology, coords, 1)?,
         z: build_full_magnetic_flux_density_component_operator_3d(topology, coords, 2)?,
+    })
+}
+
+/// Outward magnetic flux through selected boundary faces, composed with `D1`.
+///
+/// `face_indices` use the global 2-simplex ordering. The result has one row,
+/// with each selected face oriented outward from its unique adjacent cell.
+pub fn build_outward_boundary_flux_operator_3d(
+    topology: &Complex,
+    coords: &MeshCoords,
+    face_indices: &[usize],
+) -> Result<SparseRowOperator, String> {
+    if topology.dim() != 3 || coords.dim() != 3 {
+        return Err("outward magnetic flux requires a 3D topology and coordinates".to_string());
+    }
+    let mut selected = face_indices.to_vec();
+    selected.sort_unstable();
+    if selected.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("outward magnetic flux face indices must be unique".to_string());
+    }
+    let mut face_row = Vec::with_capacity(selected.len());
+    for face_index in selected {
+        if face_index >= topology.nsimplices(2) {
+            return Err(format!(
+                "boundary face index {face_index} exceeds face count {}",
+                topology.nsimplices(2)
+            ));
+        }
+        let face = topology.facets().handle_by_kidx(face_index);
+        if face.cocells().count() != 1 {
+            return Err(format!("face {face_index} is not a boundary face"));
+        }
+        face_row.push((face_index, boundary_orientation_sign(face, coords)));
+    }
+    let face_functional = SparseRowOperator::new(topology.nsimplices(2), vec![face_row])
+        .map_err(|error| error.to_string())?;
+    SparseRowOperator::compose(
+        &face_functional,
+        &build_exterior_derivative_1_operator(topology)?,
+    )
+    .map_err(|error| error.to_string())
+}
+
+/// Assemble normalized scalar-field RMS weights from the row sums of the P1
+/// mass matrix, equivalently distributing each cell volume equally among its
+/// vertices.
+pub fn build_scalar_field_rms_weights(
+    topology: &Complex,
+    coords: &MeshCoords,
+) -> Result<ScalarFieldRmsWeights, String> {
+    if topology.dim() == 0 {
+        return Err("scalar-field RMS weights require positive mesh dimension".to_string());
+    }
+    let mut vertex_weights = vec![0.0; topology.nsimplices(0)];
+    let mut domain_volume = 0.0;
+    for cell in topology.cells().handle_iter() {
+        let volume = cell.coord_simplex(coords).vol();
+        if !volume.is_finite() || volume <= 0.0 {
+            return Err("mesh contains a non-positive or non-finite cell volume".to_string());
+        }
+        domain_volume += volume;
+        let contribution = volume / (topology.dim() + 1) as f64;
+        for vertex in cell.mesh_subsimps(0) {
+            vertex_weights[vertex.kidx()] += contribution;
+        }
+    }
+    if !domain_volume.is_finite() || domain_volume <= 0.0 {
+        return Err("mesh has non-positive or non-finite volume".to_string());
+    }
+    for weight in &mut vertex_weights {
+        *weight /= domain_volume;
+    }
+    Ok(ScalarFieldRmsWeights {
+        vertex_weights,
+        domain_volume,
+    })
+}
+
+/// Volume-averaged B-component maps and vector-magnitude RMS weights.
+pub fn build_magnetic_flux_density_averages_3d(
+    topology: &Complex,
+    coords: &MeshCoords,
+) -> Result<MagneticFluxDensityAverages3d, String> {
+    if topology.dim() != 3 || coords.dim() != 3 {
+        return Err("magnetic volume averages require a 3D topology and coordinates".to_string());
+    }
+    let cell_volumes = topology
+        .cells()
+        .handle_iter()
+        .map(|cell| cell.coord_simplex(coords).vol())
+        .collect::<Vec<_>>();
+    let domain_volume = cell_volumes.iter().sum::<f64>();
+    if !domain_volume.is_finite() || domain_volume <= 0.0 {
+        return Err("mesh has non-positive or non-finite volume".to_string());
+    }
+    let normalized = cell_volumes
+        .iter()
+        .map(|volume| volume / domain_volume)
+        .collect::<Vec<_>>();
+    let component_functional = SparseRowOperator::new(
+        normalized.len(),
+        vec![normalized.iter().copied().enumerate().collect()],
+    )
+    .map_err(|error| error.to_string())?;
+    let components = build_full_magnetic_flux_density_component_operators_3d(topology, coords)?;
+    let average = |component: &SparseRowOperator| {
+        SparseRowOperator::compose(&component_functional, component)
+            .map_err(|error| error.to_string())
+    };
+    let mut vector_rms_weights = Vec::with_capacity(3 * normalized.len());
+    for weight in normalized {
+        vector_rms_weights.extend([weight, weight, weight]);
+    }
+    Ok(MagneticFluxDensityAverages3d {
+        x: average(&components.x)?,
+        y: average(&components.y)?,
+        z: average(&components.z)?,
+        vector_rms_weights,
+        domain_volume,
     })
 }
 
@@ -470,6 +608,105 @@ mod tests {
         assert_eq!(proxy.ncols, topology.nsimplices(2));
         assert_eq!(proxy.nrows(), 3 * topology.nsimplices(3));
         assert_eq!(composed, manual);
+    }
+
+    #[test]
+    fn boundary_flux_orientation_and_volume_averages_match_constant_field() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 1, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let field = exterior::field::DiffFormClosure::one_form(
+            |p| common::linalg::nalgebra::Vector::from_column_slice(&[0.0, 0.0, p[1]]),
+            3,
+        );
+        let a = ddf::cochain::cochain_projection(&field, &topology, &coords, None);
+        let x1_faces =
+            formoniq::assemble::boundary_simplices_where_barycenter(&topology, &coords, 2, |p| {
+                (p[0] - 1.0).abs() < 1.0e-12
+            });
+        let flux = build_outward_boundary_flux_operator_3d(&topology, &coords, &x1_faces).unwrap();
+        let value = flux
+            .apply(&GmrfVector::from_iterator(
+                a.coeffs.len(),
+                a.coeffs.iter().copied(),
+            ))
+            .unwrap();
+        assert!((value[0] - 1.0).abs() < 1.0e-10);
+
+        let averages = build_magnetic_flux_density_averages_3d(&topology, &coords).unwrap();
+        assert!((averages.vector_rms_weights.iter().sum::<f64>() - 3.0).abs() < 1e-12);
+        assert!(
+            (averages
+                .x
+                .apply(&GmrfVector::from_iterator(
+                    a.coeffs.len(),
+                    a.coeffs.iter().copied()
+                ))
+                .unwrap()[0]
+                - 1.0)
+                .abs()
+                < 1e-10
+        );
+    }
+
+    #[test]
+    fn scalar_rms_weights_integrate_constant_and_linear_fields() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(2, 2, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let weights = build_scalar_field_rms_weights(&topology, &coords).unwrap();
+        assert!((weights.domain_volume - 1.0).abs() < 1.0e-12);
+        assert!((weights.vertex_weights.iter().sum::<f64>() - 1.0).abs() < 1.0e-12);
+        let mean_x = weights
+            .vertex_weights
+            .iter()
+            .enumerate()
+            .map(|(vertex, weight)| weight * coords.coord(vertex)[0])
+            .sum::<f64>();
+        assert!((mean_x - 0.5).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn manufactured_em_fluxes_and_volume_averages_have_physical_orientation() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 4, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let c = 0.50 * (45.0_f64 / 29.0).sqrt();
+        let field = exterior::field::DiffFormClosure::one_form(
+            move |p| {
+                common::linalg::nalgebra::Vector::from_column_slice(&[
+                    0.0,
+                    0.0,
+                    c * p[0] * p[1] * p[1],
+                ])
+            },
+            3,
+        );
+        let a = ddf::cochain::cochain_projection(&field, &topology, &coords, None);
+        let a = GmrfVector::from_iterator(a.coeffs.len(), a.coeffs.iter().copied());
+        let x1_faces =
+            formoniq::assemble::boundary_simplices_where_barycenter(&topology, &coords, 2, |p| {
+                (p[0] - 1.0).abs() < 1.0e-12
+            });
+        let y1_faces =
+            formoniq::assemble::boundary_simplices_where_barycenter(&topology, &coords, 2, |p| {
+                (p[1] - 1.0).abs() < 1.0e-12
+            });
+        let flux_x = build_outward_boundary_flux_operator_3d(&topology, &coords, &x1_faces)
+            .unwrap()
+            .apply(&a)
+            .unwrap()[0];
+        let flux_y = build_outward_boundary_flux_operator_3d(&topology, &coords, &y1_faces)
+            .unwrap()
+            .apply(&a)
+            .unwrap()[0];
+        assert!((flux_x - c).abs() < 1.0e-10);
+        assert!((flux_y + c).abs() < 1.0e-10);
+
+        let averages = build_magnetic_flux_density_averages_3d(&topology, &coords).unwrap();
+        let bx = averages.x.apply(&a).unwrap()[0];
+        let by = averages.y.apply(&a).unwrap()[0];
+        let bz = averages.z.apply(&a).unwrap()[0];
+        assert!((bx - c / 2.0).abs() < 1.0e-2);
+        assert!((by + c / 3.0).abs() < 1.0e-2);
+        assert!(bz.abs() < 1.0e-2, "projected mean Bz was {bz}");
     }
 
     #[test]
