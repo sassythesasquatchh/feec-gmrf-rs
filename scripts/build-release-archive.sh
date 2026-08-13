@@ -68,6 +68,12 @@ for relative_path in "${forbidden_paths[@]}"; do
   fi
 done
 
+if find "$archive_root" -name AGENTS.md -print | grep -q .; then
+  echo "release archive contains agent-only maintenance instructions" >&2
+  find "$archive_root" -name AGENTS.md -print >&2
+  exit 1
+fi
+
 workstation_user="patrick"
 tool_cache_name="codex"
 if grep -R -I -n -E "(/Users/${workstation_user}|\\.cache/${tool_cache_name})" "$archive_root"; then
