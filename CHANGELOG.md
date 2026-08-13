@@ -7,6 +7,11 @@ tolerances or reference data.
 ## 0.1.0 — unreleased
 
 - Added the reusable `feec_gmrf` root façade.
+- Added the state-only linear FEEC--GMRF UQ façade, including canonical
+  zero-form and electromagnetic one-form conditioning examples.
+- Added constrained Monte Carlo uncertainty estimates in `gmrf-core` and
+  exposed the FEEC boundary-orientation sign needed by physical weak-form
+  assembly.
 - Added grade-independent Matérn recurrence construction for alpha 1, 2, and 3.
 - Added validated sparse maps, boundary layouts, linear observations,
   constraints, physical pushforwards, posterior uncertainty, and spatiotemporal

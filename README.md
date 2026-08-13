@@ -84,7 +84,8 @@ and posterior uncertainty queries in context.
 
 The default feature set uses explicit sparse matrices. Enable `spectral` for
 low-rank and spectral GP APIs, and `external-solvers` for study workflows that
-invoke PETSc or SLEPc tools.
+invoke PETSc or SLEPc tools. PETSc must include MUMPS support; the release
+scripts validate the selected native configuration before compiling helpers.
 
 ## Further documentation
 
