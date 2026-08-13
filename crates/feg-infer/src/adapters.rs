@@ -5,8 +5,8 @@ use formoniq::problems::residual::{ResidualEvaluation, ResidualModel};
 
 use crate::sparse::feec_csr_to_core_triplet;
 
-/// Adapt a native FEEC residual/Jacobian assembler to the integration-facing
-/// nonlinear inference contract without coupling FEEC to the parent package.
+/// Adapt a native FEEC residual/Jacobian assembler to the shared nonlinear
+/// inference contract.
 #[derive(Debug, Clone, Copy)]
 pub struct FeecResidualAdapter<'a, M: ?Sized> {
     model: &'a M,

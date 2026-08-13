@@ -1,7 +1,8 @@
 //! TEAM 13 benchmark geometry and constitutive laws.
 //!
 //! These laws encode the benchmark's iron geometry, B-H table, and calibration
-//! coordinates. They deliberately live outside the deterministic FEEC library.
+//! coordinates. The case-study layer owns this benchmark-specific material
+//! model.
 
 use formoniq::problems::nonlinear_magnetostatic::SpatialReluctivity;
 

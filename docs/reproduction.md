@@ -1,5 +1,9 @@
 # Reproduction guide
 
+This guide is for readers reproducing the thesis studies. It covers the pinned
+checkout, study profiles, provenance records, and external prerequisites used by
+the `feg-study` workflow.
+
 For operating-system prerequisites, a source build of PETSc with MUMPS, helper
 compilation, and a first verified run, begin with
 [`getting-started.md`](getting-started.md).
@@ -25,18 +29,18 @@ cargo test --release --workspace --manifest-path gmrf-rs/Cargo.toml
 ## Profiles
 
 - `smoke` is a cheap deterministic configuration for CI and installation
-  checks. It is not a thesis reproduction.
+  checks.
 - `thesis-submitted` is immutable and matches the submitted report settings.
   Magnetic calibration uses levels 2–8 and 512 Hutchinson probes; the sphere
   observable study includes refinement level 6.
 - future publication profiles are immutable and publication-named.
-- custom research configurations are recorded separately and cannot verify as
-  an immutable publication profile.
+- custom research configurations are recorded with a `custom` verification
+  status.
 
-Run a strict custom research configuration with `--config` instead of
-`--profile`. The file must identify both the study and the immutable profile
-whose defaults it overrides; `feg-study describe <study-id>` lists the accepted
-study-specific keys. Unknown keys and mismatched study IDs are errors.
+Use `--config` for a strict custom research configuration. The file identifies
+the study and the immutable profile whose defaults it overrides;
+`feg-study describe <study-id>` lists the accepted study-specific keys. Unknown
+keys and mismatched study IDs are errors.
 
 ```toml
 schema = "feg-study-custom-v1"

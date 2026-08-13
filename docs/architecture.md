@@ -1,5 +1,9 @@
 # Architecture and mathematical ownership
 
+This document is a design reference for maintainers and advanced contributors.
+It records dependency direction, mathematical ownership, and the operator
+constructions that must remain consistent across crates.
+
 The package follows the direction
 
 ```text
@@ -9,11 +13,12 @@ FEEC assembly  --->  feec-gmrf composition  --->  GMRF algebra/solvers
                    case-study workflows
 ```
 
-Neither standalone submodule depends on the integration workspace.
-The GMRF sister repository is mounted at `gmrf-rs/`; its public Rust package
+Dependencies flow from the integration workspace to the two standalone
+submodules; neither submodule depends on the integration workspace. The GMRF
+sister repository is mounted at `gmrf-rs/`, while its public Rust package
 remains named `gmrf-core`.
 
-## Canonical ownership
+## Ownership
 
 | Mathematical object or operation | Owner |
 |---|---|
@@ -22,31 +27,25 @@ remains named `gmrf-core`.
 | Matérn recurrence, Hodge branch composition, model construction, time discretisation, Gauss–Newton/Laplace orchestration, physical operator chains | `feec-gmrf` / `feg-infer` |
 | geometry, material constants, measurement selection, metrics, artifact selection | `feg-case-studies` |
 
-The public root crate is the supported downstream boundary. `feg-core` contains
-only integration-owned transport and statistical-model contracts. FEEC-owned
-deterministic contracts, including `DofLayout`, live directly in `formoniq` and
-are consumed through explicit adapters rather than duplicated.
+Applications build models through the public root crate. `feg-core` contains
+integration-owned transport and statistical-model contracts. FEEC-owned
+deterministic contracts, including `DofLayout`, live in `formoniq` and enter the
+integration layer through explicit adapters.
 
-## Dependency edges versus the supported API
+## API and implementation crates
 
-`gmrf-core` is the root package of the standalone `gmrf-rs` repository and is a normal,
-intentional dependency of the root package. `feg-infer` is an implementation
-crate in this repository and is likewise a normal dependency of the root
-package. The facade delegates to these crates instead of reproducing their
-algorithms.
+`gmrf-core` is the root package of the standalone `gmrf-rs` repository, and
+`feg-infer` is an implementation crate in this repository. The root package
+delegates Gaussian algebra to `gmrf-core` and FEEC-specific inference adapters
+to `feg-infer`.
 
-The supported API statement is about what downstream users can rely on, not
-about forbidding dependencies between internal workspace crates. Maintained
-case studies may call public `gmrf-core` or `feg-infer` APIs for specialist
-diagnostics and workflow orchestration. They must not copy the algorithms those
-crates own, and any generally reusable operation first discovered in a study
-must be moved to its canonical lower layer. The root facade exposes the stable,
-geometry-independent construction path; lower-level implementation APIs are
-not automatically part of that stability promise.
+The root API carries the downstream stability guarantee. Maintained case
+studies use public `gmrf-core` and `feg-infer` APIs for specialist diagnostics
+and workflow orchestration. Reusable operations discovered in a study move to
+the lower layer that owns the corresponding mathematics.
 
-The CLI has a stricter boundary because it owns no scientific logic: it depends
-on the case-study registry and optionally the experiments registry, and does
-not depend directly on FEEC, GMRF, or inference crates.
+The CLI depends on the case-study registry and, when enabled, the experiments
+registry. Scientific work is carried out by the registered workflow.
 
 ## Matérn construction
 
@@ -60,8 +59,8 @@ Q_2 = tau^2 A_k M_k^-1 A_k
 Q_3 = tau^2 A_k M_k^-1 A_k M_k^-1 A_k.
 ```
 
-Only FEEC assembly and the selected mass-inverse policy depend on form degree.
-The recurrence is implemented once by `prior::matern_recurrence`.
+FEEC assembly and the selected mass-inverse policy carry the form-degree
+dependence. `prior::matern_recurrence` implements the shared recurrence.
 
 ## Physical quantities
 
@@ -72,14 +71,14 @@ density is always constructed as
 A  --D1-->  magnetic 2-cochain  --Hodge/reconstruction-->  physical B.
 ```
 
-Direct cell-curl conveniences are not substitutes for this chain in
-calibration, normalization, observation uncertainty, or reporting.
+Calibration, normalization, observation uncertainty, and reporting all use
+this operator chain.
 
 Physical-RMS calibration is performed by
 `calibrate_prior_to_physical_rms(prior, map, target)`. It evaluates the generic
-GMRF transformed covariance for the supplied composed `LinearMap` and rescales
-the precision once; case studies do not implement their own covariance or
-calibration recurrence.
+GMRF transformed covariance for the supplied composed `LinearMap`, then
+rescales the precision. The covariance and calibration recurrence are shared by
+all case studies.
 
 ## Essential-boundary elimination
 
@@ -105,12 +104,10 @@ r(x)     ->  r(P z + g), with Jacobian J(P z + g) P.
 Posterior computation remains in active coordinates. `cochain_mean`,
 `cochain_variances`, and `sample_cochain` lift results to the complete FEEC
 ordering; prescribed coefficients have their requested values and exactly zero
-variance. GMRF algorithms therefore remain independent of FEEC boundary
-semantics.
+variance. The GMRF layer receives the resulting active-coordinate problem.
 
-For an already assembled arbitrary Gaussian precision,
-`GaussianPrior::condition_on_essential_boundary` computes its exact conditional
-distribution. For a Matérn model, prefer
-`MaternPriorBuilder::essential_boundary_conditions`, because reducing a full
-alpha-2 or alpha-3 precision after the recurrence is not generally equivalent
-to applying the recurrence on the boundary-reduced FEEC space.
+`GaussianPrior::condition_on_essential_boundary` computes the exact conditional
+distribution of an assembled Gaussian precision. Matérn models use
+`MaternPriorBuilder::essential_boundary_conditions`, which reduces the FEEC
+space before applying the recurrence. Conditioning a full alpha-2 or alpha-3
+precision generally produces a different reduced precision.

@@ -1,8 +1,7 @@
 //! Registry of maintained, report-backed scientific workflows.
 //!
-//! The registry is deliberately data-driven.  The CLI only knows how to list,
-//! describe, and invoke descriptors; scientific configuration and execution
-//! remain in this crate.
+//! Data-driven descriptors provide listing, documentation, configuration, and
+//! execution to the CLI.
 
 use std::{collections::BTreeMap, path::Path};
 

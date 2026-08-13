@@ -1,8 +1,7 @@
 //! Report-backed scalar Matérn prior validation.
 //!
 //! The submitted diagnostic evaluates the covariance between one central
-//! vertex and vertices at integer coordinate-axis lags. It deliberately does
-//! not form a dense covariance over every interior vertex.
+//! vertex and vertices at integer coordinate-axis lags.
 
 use feec_gmrf::prelude::{
     DerivedQuantity, LinearGaussianModelBuilder, LinearMap, MassInversePolicy, MaternAlpha,

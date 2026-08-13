@@ -2,8 +2,8 @@
 //!
 //! Homogeneous and prescribed essential values use the same resolved
 //! elimination. Internally, a full cochain is represented as `x = P z + g`,
-//! where `z` contains the active coefficients, but callers do not need a
-//! separate non-homogeneous boundary type.
+//! where `z` contains the active coefficients. Both boundary cases use
+//! `EssentialBoundaryConditions`.
 
 use crate::operator::{BoundaryLayout, LinearMap, SparseMat};
 use crate::{FeecGmrfError, Result};
@@ -57,7 +57,7 @@ impl EssentialBoundaryConditions {
         Self::homogeneous(Self::topological_boundary_dofs(topology, degree)?)
     }
 
-    /// Prescribe values, in canonical boundary-DOF order, on every
+    /// Prescribe values, in topological boundary order, on every
     /// degree-`degree` simplex in the topological boundary.
     pub fn prescribed_on_boundary(
         topology: &Complex,

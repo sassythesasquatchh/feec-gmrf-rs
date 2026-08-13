@@ -17,8 +17,8 @@ pub fn feec_csr_to_gmrf(mat: &FeecCsr) -> GmrfSparse {
 
 /// Convert the integration sparse contract to the GMRF backend.
 ///
-/// This adapter deliberately lives in the integration crate so `gmrf-core`
-/// remains independent of FEEC and `feg-core`.
+/// The integration crate owns this conversion between `feg-core` and
+/// `gmrf-core` matrix types.
 pub fn core_triplet_to_gmrf(matrix: &SparseTripletMatrix) -> GmrfSparse {
     feec_csr_to_gmrf(&core_triplet_to_feec_csr(matrix))
 }

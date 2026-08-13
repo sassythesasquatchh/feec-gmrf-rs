@@ -1,8 +1,8 @@
 //! Reusable FEEC de Rham helpers for explicit sparse Gaussian models.
 //!
-//! This module deliberately stays geometry-agnostic: it builds Whitney-form
-//! Matérn precisions, exterior derivative/codifferential diagnostics, approximate
-//! sparse Hodge projections, and linear integral observation operators.
+//! The helpers are geometry-agnostic and build Whitney-form Matérn precisions,
+//! exterior derivative/codifferential diagnostics, approximate sparse Hodge
+//! projections, and linear integral observation operators.
 
 use common::linalg::nalgebra::{
     bilinear_form_sparse, CooMatrix as FeecCoo, CsrMatrix as FeecCsr, Matrix as FeecMatrix,

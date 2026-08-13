@@ -1,15 +1,13 @@
 # FEG Case Studies
 
-This crate contains maintained thesis case-study workflows. For publication
-and report reproducibility, treat
-`feg_case_studies::publication` as the supported API surface.
+This crate contains the maintained thesis workflows used for publication and
+report reproducibility. They are available through
+`feg_case_studies::publication`.
 
-Runnable report workflows are invoked through the registry-driven `feg-study`
-CLI. Exploratory and historical entrypoints live in `feg-experiments`; this
-crate does not use Cargo examples as an alternate scientific implementation
-surface.
+The registry-driven `feg-study` CLI runs the report workflows. Research
+prototypes and earlier entrypoints live in `feg-experiments`.
 
-## Publication-supported workflows
+## Publication workflows
 
 - Chapter 7 validation: cube mass-inverse variance, Matérn trace
   normalization, Matérn functional convergence, sphere branch observables, and
@@ -17,21 +15,19 @@ surface.
 - Chapter 8 electromagnetic UQ: magnetic physical calibration, magnetic prior
   UQ comparison, annular H-formulation, and exact toroidal B/source workflows.
 
-Reusable FEEC/GMRF logic should live in `feg-infer`, `feg-gp`, or `gmrf-core`.
-These case-study modules should only orchestrate geometry, configuration,
-reporting, and thesis-specific artifact generation.
+`feg-infer`, `feg-gp`, and `gmrf-core` provide the reusable FEEC/GMRF
+operations. The case-study modules handle geometry, configuration, reporting,
+and thesis-specific artifact generation.
 
-Direct use of public `feg-infer` and `gmrf-core` APIs is intentional when a
-study needs specialist diagnostics or lower-level control. The root
-`feec-gmrf` crate remains the supported API for external users; the ownership
-rule here is that studies call canonical lower-layer implementations rather
-than reproducing them locally.
+Studies may use public `feg-infer` and `gmrf-core` APIs for specialist
+diagnostics or lower-level control. External applications should use the root
+`feec-gmrf` API. Shared operations belong in their lower-layer implementation.
 
 ## Experimental workflows
 
 Root-level modules gated by the `experimental` feature are historical or
-exploratory and are re-exported through `feg-experiments`. They are not part of
-the publication guarantee.
+exploratory and are re-exported through `feg-experiments`. The publication
+guarantee covers the workflows listed above.
 
 ## Test Tiers
 
@@ -61,7 +57,7 @@ rtk cargo test -p feg-case-studies --release --features external-reference-tests
 ```
 
 Most heavy assertions remain as feature-gated unit tests beside the workflow
-code so they can reuse private setup helpers without duplicating case-study
-logic. New workflow-scale tests should use `#[cfg(feature = "heavy-tests")]`;
+code, where they reuse the private setup helpers. New workflow-scale tests
+should use `#[cfg(feature = "heavy-tests")]`;
 tests requiring PETSc, NGSolve exports, or other external reference artifacts
 should use `#[cfg(feature = "external-reference-tests")]`.

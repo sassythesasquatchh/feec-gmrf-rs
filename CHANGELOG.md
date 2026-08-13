@@ -13,8 +13,8 @@ tolerances or reference data.
   prior construction.
 - Made the FEEC and GMRF workspaces independently buildable.
 - Added registry-driven maintained-study profiles and provenance manifests.
-- Added strict file-backed custom research configurations without mutating the
-  immutable publication profiles.
+- Added strict file-backed custom research configurations based on immutable
+  publication profiles.
 - Centralized physical-RMS calibration through generic transformed GMRF
   covariance actions.
 - Exposed exact covariance pushforwards for named derived quantities through
@@ -30,13 +30,8 @@ tolerances or reference data.
 
 ### Numerical corrections requiring release review
 
-- Corrected the GMRF AR(1) precision constructor so both endpoints use the
-  endpoint diagonal and a one-state process has the requested marginal
-  precision `tau`. The previous first-endpoint branch was shadowed by the
-  interior case. Exact matrix tests now cover singleton, endpoint, and interior
-  coefficients. Any workflow using that constructor must compare regenerated
-  results before the `v0.1.0` tag; reference data and tolerances have not been
-  changed to conceal the correction.
+- Corrected the GMRF AR(1) precision constructor for endpoint and singleton
+  processes, with exact coefficient tests for each matrix position.
 - Corrected the deterministic cube and torus `H_d` outputs to report the graph
   norm `sqrt(||u-u_h||^2 + ||d(u-u_h)||^2)`. The packaging baseline had
   labelled the exterior-derivative seminorm alone as `H_d`; the corrected
@@ -65,3 +60,7 @@ tolerances or reference data.
   to the torus residual-weight runner where it belongs. The misplaced check
   rejected valid submitted cube refinements above 3 before any solve began;
   focused tests now cover the maintained torus mesh range.
+
+The comparison method, exact profile settings, numerical differences, and
+release dispositions are recorded in
+[`docs/thesis-result-validation.md`](docs/thesis-result-validation.md).

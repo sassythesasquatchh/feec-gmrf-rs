@@ -131,9 +131,8 @@ impl MagneticPhysicalCalibrationConfig {
 
     /// Immutable configuration used by the submitted thesis.
     ///
-    /// In particular, this is deliberately not [`Default`]: the lightweight
-    /// interactive defaults use three levels and 128 probes, whereas the
-    /// submitted calibration used levels 2--8 and 512 probes.
+    /// The submitted calibration uses levels 2--8 and 512 probes. [`Default`]
+    /// provides the three-level, 128-probe interactive profile.
     pub fn thesis_submitted() -> Self {
         Self {
             levels: (2..=8).collect(),

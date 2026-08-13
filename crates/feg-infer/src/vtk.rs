@@ -7,8 +7,6 @@ use std::path::Path;
 pub use formoniq::io::{write_polyline_vtk_fields, write_polyline_vtu_fields};
 
 /// Write multiple 0-cochain scalar fields into a single VTK file.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_0cochain_vtk_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -19,8 +17,6 @@ pub fn write_0cochain_vtk_fields(
 }
 
 /// Write multiple 0-cochain scalar fields into a single VTU file.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_0cochain_vtu_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -31,8 +27,6 @@ pub fn write_0cochain_vtu_fields(
 }
 
 /// Write multiple 1-cochain scalar fields into a single VTK file.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_1cochain_vtk_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -43,8 +37,6 @@ pub fn write_1cochain_vtk_fields(
 }
 
 /// Write multiple 1-cochain scalar fields into a single VTU file.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_1cochain_vtu_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -55,8 +47,6 @@ pub fn write_1cochain_vtu_fields(
 }
 
 /// Write a 1-form vector proxy plus additional 1-cochain scalar fields.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_1form_vector_proxy_vtk_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -76,8 +66,6 @@ pub fn write_1form_vector_proxy_vtk_fields(
 }
 
 /// Write a 1-form vector proxy plus additional 1-cochain scalar fields to VTU.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_1form_vector_proxy_vtu_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -97,8 +85,6 @@ pub fn write_1form_vector_proxy_vtu_fields(
 }
 
 /// Write multiple scalar fields defined on top-dimensional cells.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_top_cell_scalar_vtk_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -109,8 +95,6 @@ pub fn write_top_cell_scalar_vtk_fields(
 }
 
 /// Write multiple scalar fields defined on top-dimensional cells to VTU.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_top_cell_scalar_vtu_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -121,8 +105,6 @@ pub fn write_top_cell_scalar_vtu_fields(
 }
 
 /// Write a vector field plus scalar fields defined on top-dimensional cells.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_top_cell_vector_vtk_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,
@@ -141,8 +123,6 @@ pub fn write_top_cell_vector_vtk_fields(
 }
 
 /// Write a vector field plus scalar fields defined on top-dimensional cells to VTU.
-///
-/// This compatibility wrapper delegates to the canonical FEEC writer.
 pub fn write_top_cell_vector_vtu_fields(
     path: impl AsRef<Path>,
     coords: &MeshCoords,

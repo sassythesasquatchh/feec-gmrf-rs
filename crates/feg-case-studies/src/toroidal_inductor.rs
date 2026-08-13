@@ -2790,8 +2790,8 @@ fn build_weiland_success_row(
     })
 }
 
-// Failure rows deliberately mirror the successful provenance schema so failed
-// publication runs remain auditable.
+// Failure and success rows share a provenance schema, keeping every publication
+// run auditable.
 #[allow(clippy::too_many_arguments)]
 fn build_weiland_failure_row(
     reference_kappa: f64,

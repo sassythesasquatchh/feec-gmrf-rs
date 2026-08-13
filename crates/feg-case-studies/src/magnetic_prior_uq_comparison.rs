@@ -1174,8 +1174,8 @@ fn evaluate_replicate(
     Ok(())
 }
 
-// Prediction rows intentionally carry every seed, split, and physical parameter
-// needed to reproduce a held-out datum. The magnetic prior-mismatch smoke profile
+// Each prediction row records the seeds, split, and physical parameters needed
+// to reproduce its held-out datum. The magnetic prior-mismatch smoke profile
 // covers this artifact path.
 #[allow(clippy::too_many_arguments)]
 fn prediction_rows_for_bin(
