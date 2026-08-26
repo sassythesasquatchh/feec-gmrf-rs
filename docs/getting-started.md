@@ -151,6 +151,7 @@ cd "$PETSC_DIR"
   --with-fc="$FC" \
   --with-debugging=0 \
   --with-scalar-type=real \
+  --download-bison \
   --download-fblaslapack \
   --download-metis \
   --download-mumps \
@@ -241,6 +242,8 @@ Run the native integration gates:
 ```text
 cargo test --release --manifest-path feec/Cargo.toml -p formoniq \
   --features parent-fixture-tests
+cargo test --release -p feg-gp --features external-solvers \
+  --test hodge_laplace_integration
 cargo test --release -p feg-infer --features external-solver-tests
 cargo test --release -p feg-case-studies --lib --features external-reference-tests \
   sphere_sparse_anchor_kernel_validation::tests
