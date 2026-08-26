@@ -47,7 +47,7 @@ Install the system compiler and build prerequisites:
 ```text
 sudo apt-get update
 sudo apt-get install --yes \
-  build-essential gfortran git curl ca-certificates python3 cmake pkg-config gmsh
+  build-essential gfortran flex git curl ca-certificates python3 cmake pkg-config gmsh
 ```
 
 Install Rust with Rustup:
@@ -213,9 +213,10 @@ Successful output ends with:
 PETSc/SLEPc helpers are ready in .../feec/petsc-solver
 ```
 
-NGSolve is intentionally not part of this installation. The separate
-`check-publication-prerequisites.sh` command adds NGSolve only for optional
-external-reference reproduction.
+NGSolve is optional and may already be installed, but no core installation,
+build, test, introductory example, or smoke study depends on it. The separate
+`check-publication-prerequisites.sh` command additionally requires NGSolve for
+optional external-reference reproduction.
 
 ## 5. Build and test every Rust workspace
 
@@ -319,6 +320,13 @@ bash scripts/check-native-prerequisites.sh
 The check reads the exact `petscconf.h` it prints and requires
 `PETSC_HAVE_MUMPS 1`. Do not substitute a Homebrew or distribution PETSc that
 fails this check; build the pinned local configuration in section 3.
+
+### PETSc cannot build Bison
+
+The pinned `--download-bison` configuration still needs `flex` (or `lex`) on
+`PATH`. On Ubuntu, install the documented `flex` package and rerun PETSc
+configuration. On macOS, `flex` is supplied by the Xcode command-line tools;
+rerun `xcode-select --install` if the native diagnostic reports it missing.
 
 ### A compiler was upgraded
 

@@ -5,7 +5,7 @@ repository_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$repository_root/scripts/petsc-environment.sh"
 
 missing=0
-required_commands=(git make cmake pkg-config gmsh python3)
+required_commands=(git make cmake pkg-config gmsh python3 flex)
 case "$(uname -s)" in
   Darwin)
     required_commands+=(clang clang++ gfortran)
