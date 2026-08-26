@@ -12,6 +12,14 @@ case "$(uname -s)" in
     ;;
   Linux)
     required_commands+=(gcc g++ gfortran)
+    if ! pkg-config --exists zlib; then
+      echo "missing required native package: zlib development files (install zlib1g-dev on Ubuntu)" >&2
+      missing=1
+    fi
+    if ! pkg-config --exists fontconfig; then
+      echo "missing required native package: Fontconfig development files (install libfontconfig1-dev on Ubuntu)" >&2
+      missing=1
+    fi
     ;;
   *)
     echo "unsupported native-install platform: $(uname -s)" >&2

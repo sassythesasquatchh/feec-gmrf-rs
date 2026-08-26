@@ -47,7 +47,8 @@ Install the system compiler and build prerequisites:
 ```text
 sudo apt-get update
 sudo apt-get install --yes \
-  build-essential gfortran flex git curl ca-certificates python3 cmake pkg-config gmsh
+  build-essential gfortran flex git curl ca-certificates python3 cmake pkg-config \
+  zlib1g-dev libfontconfig1-dev gmsh
 ```
 
 Install Rust with Rustup:
@@ -327,6 +328,21 @@ The pinned `--download-bison` configuration still needs `flex` (or `lex`) on
 `PATH`. On Ubuntu, install the documented `flex` package and rerun PETSc
 configuration. On macOS, `flex` is supplied by the Xcode command-line tools;
 rerun `xcode-select --install` if the native diagnostic reports it missing.
+
+### PETSc checks print a PMIx compression warning
+
+The downloaded OpenMPI build needs the zlib development headers when it is
+configured. On Ubuntu, install the documented `zlib1g-dev` package. If PETSc
+was already configured without it, rebuild the local PETSc arch from a clean
+`.native/petsc/arch-feec-mumps-opt`; merely installing the package afterward
+does not add compression support to the existing OpenMPI build.
+
+### Cargo cannot find `fontconfig.pc`
+
+The plotting dependency used by the Rust workspaces links to Fontconfig on
+Linux. Install the documented Ubuntu `libfontconfig1-dev` package, rerun the
+native diagnostic, and resume the release Cargo command. Cargo will reuse the
+dependencies it already compiled.
 
 ### A compiler was upgraded
 

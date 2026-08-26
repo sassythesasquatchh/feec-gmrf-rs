@@ -21,7 +21,7 @@ jobs:
       - name: Install declared native prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install --yes flex gmsh libopenmpi-dev libpetsc-real-dev libslepc-real-dev
+          sudo apt-get install --yes flex zlib1g-dev libfontconfig1-dev gmsh libopenmpi-dev libpetsc-real-dev libslepc-real-dev
           python -m pip install ngsolve
       - name: Verify prerequisites explicitly
         run: bash scripts/check-publication-prerequisites.sh

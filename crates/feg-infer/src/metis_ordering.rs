@@ -1,5 +1,6 @@
 use gmrf_core::{Permutation, SparseMatrix};
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fs::{create_dir_all, read_to_string, remove_dir_all};
 use std::path::PathBuf;
 use std::process::Command;
@@ -8,6 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn metis_nested_dissection_ordering(
     precision: &SparseMatrix,
 ) -> Result<Option<Permutation>, String> {
+    if !command_exists_on_path("ndmetis") {
+        return Ok(None);
+    }
+
     let graph = metis_graph_text(precision)?;
     let workdir = unique_metis_workdir()?;
     create_dir_all(&workdir).map_err(|err| err.to_string())?;
@@ -41,6 +46,16 @@ pub fn metis_nested_dissection_ordering(
     let permutation = parse_metis_iperm(&iperm, precision.nrows())?;
     drop(cleanup);
     Ok(Some(permutation))
+}
+
+fn command_exists_on_path(command: &str) -> bool {
+    std::env::var_os("PATH")
+        .as_deref()
+        .is_some_and(|path| command_exists_in_path_value(command, path))
+}
+
+fn command_exists_in_path_value(command: &str, path: &OsStr) -> bool {
+    std::env::split_paths(path).any(|directory| directory.join(command).is_file())
 }
 
 struct MetisTempDir {
@@ -152,8 +167,28 @@ mod tests {
     }
 
     #[test]
+    fn command_path_preflight_distinguishes_present_and_absent_tools() {
+        let directory = unique_metis_workdir().unwrap();
+        create_dir_all(&directory).unwrap();
+        let cleanup = MetisTempDir {
+            path: directory.clone(),
+        };
+        std::fs::write(directory.join("ndmetis"), "").unwrap();
+
+        assert!(command_exists_in_path_value(
+            "ndmetis",
+            directory.as_os_str()
+        ));
+        assert!(!command_exists_in_path_value(
+            "missing-ndmetis",
+            directory.as_os_str()
+        ));
+        drop(cleanup);
+    }
+
+    #[test]
     fn ndmetis_ordering_runs_when_available() {
-        if Command::new("ndmetis").arg("-help").output().is_err() {
+        if !command_exists_on_path("ndmetis") {
             return;
         }
 
