@@ -3,6 +3,8 @@ use manifold::{geometry::coord::mesh::MeshCoords, topology::complex::Complex};
 use std::io;
 use std::path::{Path, PathBuf};
 
+pub use feec_gmrf::report::{CochainVtuBuilder, TopCellVtuBuilder, VectorLayout3};
+
 /// Return the canonical VTU path for a visual artifact.
 ///
 /// Callers may still pass legacy `.vtk` stems while thesis visual outputs
@@ -20,7 +22,13 @@ pub fn write_cochain(
     cochain: &Cochain,
     name: &str,
 ) -> io::Result<()> {
-    formoniq::io::write_cochain_vtu(vtu_path(path), coords, topology, cochain, name)
+    let mut builder = CochainVtuBuilder::new(cochain.dim());
+    builder
+        .add_cochain(name, cochain.clone())
+        .map_err(report_io)?;
+    builder
+        .write(vtu_path(path), coords, topology)
+        .map_err(report_io)
 }
 
 pub fn write_0cochain_fields(
@@ -29,7 +37,7 @@ pub fn write_0cochain_fields(
     topology: &Complex,
     fields: &[(&str, &Cochain)],
 ) -> io::Result<()> {
-    feg_infer::vtk::write_0cochain_vtu_fields(vtu_path(path), coords, topology, fields)
+    write_cochain_fields(path, coords, topology, 0, fields)
 }
 
 pub fn write_1cochain_fields(
@@ -38,7 +46,7 @@ pub fn write_1cochain_fields(
     topology: &Complex,
     fields: &[(&str, &Cochain)],
 ) -> io::Result<()> {
-    feg_infer::vtk::write_1cochain_vtu_fields(vtu_path(path), coords, topology, fields)
+    write_cochain_fields(path, coords, topology, 1, fields)
 }
 
 pub fn write_1form_vector_field(
@@ -85,7 +93,15 @@ pub fn write_top_cell_scalar_fields(
     topology: &Complex,
     fields: &[(&str, &[f64])],
 ) -> io::Result<()> {
-    feg_infer::vtk::write_top_cell_scalar_vtu_fields(vtu_path(path), coords, topology, fields)
+    let mut builder = TopCellVtuBuilder::new();
+    for (name, values) in fields {
+        builder
+            .add_scalar(*name, values.to_vec())
+            .map_err(report_io)?;
+    }
+    builder
+        .write(vtu_path(path), coords, topology)
+        .map_err(report_io)
 }
 
 pub fn write_top_cell_vector_fields(
@@ -96,14 +112,18 @@ pub fn write_top_cell_vector_fields(
     vectors: &[[f64; 3]],
     scalar_fields: &[(&str, &[f64])],
 ) -> io::Result<()> {
-    feg_infer::vtk::write_top_cell_vector_vtu_fields(
-        vtu_path(path),
-        coords,
-        topology,
-        vector_name,
-        vectors,
-        scalar_fields,
-    )
+    let mut builder = TopCellVtuBuilder::new();
+    builder
+        .add_vector(vector_name, vectors.to_vec())
+        .map_err(report_io)?;
+    for (name, values) in scalar_fields {
+        builder
+            .add_scalar(*name, values.to_vec())
+            .map_err(report_io)?;
+    }
+    builder
+        .write(vtu_path(path), coords, topology)
+        .map_err(report_io)
 }
 
 pub fn write_top_cell_fields(
@@ -113,13 +133,45 @@ pub fn write_top_cell_fields(
     vector_fields: &[(&str, &[[f64; 3]])],
     scalar_fields: &[(&str, &[f64])],
 ) -> io::Result<()> {
-    formoniq::io::write_top_cell_vtu_fields(
-        vtu_path(path),
-        coords,
-        topology,
-        vector_fields,
-        scalar_fields,
-    )
+    let mut builder = TopCellVtuBuilder::new();
+    for (name, values) in vector_fields {
+        builder
+            .add_vector(*name, values.to_vec())
+            .map_err(report_io)?;
+    }
+    for (name, values) in scalar_fields {
+        builder
+            .add_scalar(*name, values.to_vec())
+            .map_err(report_io)?;
+    }
+    builder
+        .write(vtu_path(path), coords, topology)
+        .map_err(report_io)
+}
+
+fn write_cochain_fields(
+    path: impl AsRef<Path>,
+    coords: &MeshCoords,
+    topology: &Complex,
+    degree: usize,
+    fields: &[(&str, &Cochain)],
+) -> io::Result<()> {
+    let mut builder = CochainVtuBuilder::new(degree);
+    for (name, cochain) in fields {
+        builder
+            .add_cochain(*name, (*cochain).clone())
+            .map_err(report_io)?;
+    }
+    builder
+        .write(vtu_path(path), coords, topology)
+        .map_err(report_io)
+}
+
+fn report_io(error: feec_gmrf::FeecGmrfError) -> io::Error {
+    match error {
+        feec_gmrf::FeecGmrfError::Io(error) => error,
+        error => io::Error::other(error),
+    }
 }
 
 pub fn write_polyline_fields(

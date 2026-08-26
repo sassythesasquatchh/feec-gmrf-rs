@@ -55,7 +55,6 @@ use formoniq::{
         self, assemble_boundary_integral_term, assemble_galvec,
         assemble_whitney_projected_sparse_inverse_galmat,
     },
-    io::{write_cochain_vtu_fields, write_top_cell_vtu_fields},
     operators::SourceElVec,
     problems::{
         hodge_laplace::MixedGalmats,
@@ -474,93 +473,135 @@ fn report_and_write(
     let deterministic = &context.problem.deterministic;
     let deterministic_qois = &context.reference.deterministic_qois;
     let deterministic_b = &context.reference.deterministic_b;
-    // Full-field marginal variances use reproducible batched Monte Carlo. The
-    // scalar QoI covariance queried below remains exact.
-    let mc = VarianceMethod::MonteCarlo(MonteCarloVarianceConfig::new(1024, 8, 42)?);
-    let a_variance = posterior.cochain_variance_estimate(mc)?;
-    let d1_variance = posterior.derived_variance_estimate("d1a_flux_cochain", mc)?;
-    let b_variance = posterior.derived_variance_estimate("magnetic_field", mc)?;
-    let d1_mean = posterior.derived_mean("d1a_flux_cochain")?;
-    let b_mean = posterior.derived_mean("magnetic_field")?;
+    // Scientific residual norms remain local; generic posterior extraction,
+    // covariance validation, standard deviations, and artifacts use the root
+    // reporting API.
     let residual = posterior.derived_mean("weak_pde_residual")?;
-    let qoi_mean = posterior.derived_mean("engineering_qois")?;
-    let qoi_covariance = posterior.derived_covariance("engineering_qois")?;
-    let posterior_b_rms = magnetic.vector_rms_standard_deviation(&b_variance.values)?;
+    let latent_mean = posterior.mean().to_vec();
+    let full_d1 = feg_infer::physical::build_exterior_derivative_1_operator(topology)?;
+    let truth_d1_values = full_d1.apply(&gmrf_core::Vector::from_iterator(
+        truth_a.coeffs.len(),
+        truth_a.coeffs.iter().copied(),
+    ))?;
+    let truth_d1 = truth_d1_values.iter().copied().collect::<Vec<_>>();
+    let truth_b = topology
+        .cells()
+        .handle_iter()
+        .map(|cell| {
+            let point = cell.coord_simplex(coords).barycenter();
+            [2.0 * c * point[0] * point[1], -c * point[1] * point[1], 0.0]
+        })
+        .collect::<Vec<_>>();
+    let truth_b_flat = VectorLayout3::Interleaved.from_vectors(&truth_b)?;
+    let mc = VarianceMethod::MonteCarlo(MonteCarloVarianceConfig::new(1024, 8, 42)?);
+    let qoi_labels = QOI_NAMES.iter().map(|name| (*name).to_string()).collect();
+    let qoi_units = ["Wb", "Wb", "T", "T", "T"].map(str::to_string).to_vec();
+    let mut report = PosteriorReportBuilder::new(&mut posterior)
+        .field(
+            FieldRequest::cochain("a", "Vector potential A")
+                .variance_method(mc)
+                .truth(truth_a.coeffs.iter().copied().collect())
+                .reference(deterministic.cochain().to_vec()),
+        )
+        .field(
+            FieldRequest::derived("d1a", "Magnetic flux cochain D1A", "d1a_flux_cochain")
+                .variance_method(mc)
+                .truth(truth_d1),
+        )
+        .field(
+            FieldRequest::derived("b", "Reconstructed magnetic field B", "magnetic_field")
+                .unit("T")
+                .variance_method(mc)
+                .truth(truth_b_flat)
+                .reference(deterministic_b.clone()),
+        )
+        .qoi(
+            QoiRequest::derived(
+                "engineering_qois",
+                "Engineering quantities of interest",
+                "engineering_qois",
+                qoi_labels,
+            )
+            .units(qoi_units)
+            .truth(truth_qois.to_vec())
+            .reference(deterministic_qois.clone()),
+        )
+        .prediction(
+            PredictionRequest::mapped(
+                "flux_sensor",
+                "x=1 held-out flux sensor",
+                context.outputs.flux_x1.clone(),
+                vec!["flux_x1".to_string()],
+                vec![c],
+                vec![SENSOR_STANDARD_DEVIATION_WB.powi(2)],
+            )
+            .units(vec!["Wb".to_string()]),
+        )
+        .include_factorization_diagnostics(true)
+        .build()?;
+
+    let a = report.field("a").expect("requested A field").clone();
+    let d1a = report.field("d1a").expect("requested D1A field").clone();
+    let b = report.field("b").expect("requested B field").clone();
+    let qois = report
+        .qoi("engineering_qois")
+        .expect("requested QoI block")
+        .clone();
+    let posterior_b_rms = magnetic.vector_rms_standard_deviation(&b.variance.values)?;
     let state_deterministic_gap =
-        system.relative_state_l2_error(posterior.mean(), deterministic.active())?;
-    let b_deterministic_gap = magnetic.relative_vector_rms_error(&b_mean, deterministic_b)?;
+        system.relative_state_l2_error(&latent_mean, deterministic.active())?;
+    let b_deterministic_gap = magnetic.relative_vector_rms_error(&b.mean, deterministic_b)?;
 
     let residual_dual_norm = residual_dual_norm(system, &residual)?;
+    let sensor_residual = ((qois.mean[0] - c) / SENSOR_STANDARD_DEVIATION_WB).abs();
+    let variance_reduction = 1.0 - qois.covariance[0][0] / pre_sensor_flux_std.powi(2);
+    let max_truth_z = qois
+        .z_scores
+        .as_ref()
+        .expect("truth supplied")
+        .iter()
+        .flatten()
+        .map(|value| value.abs())
+        .fold(0.0, f64::max);
+    report.push_metric(ReportMetric::new(
+        "weak_residual_dual_norm",
+        "Mass-weighted weak residual dual norm",
+        residual_dual_norm,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "state_deterministic_gap",
+        "Relative state M1-L2 gap",
+        state_deterministic_gap,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "b_deterministic_gap",
+        "Relative reconstructed-B RMS gap",
+        b_deterministic_gap,
+    ))?;
+    report.push_metric(
+        ReportMetric::new(
+            "posterior_b_rms_std",
+            "Posterior volume-weighted B RMS standard deviation",
+            posterior_b_rms,
+        )
+        .unit("T"),
+    )?;
+    report.push_metric(ReportMetric::new(
+        "flux_variance_reduction",
+        "x=1 flux variance reduction",
+        variance_reduction,
+    ))?;
 
     println!("\n  {model_name}");
-    println!(
-        "    mass-weighted weak residual diagnostic dual norm: {:.6e}",
-        residual_dual_norm,
-    );
-    println!("    posterior mean vs deterministic FEEC solution:");
-    println!(
-        "      relative state M1-L2 gap: {:.6e}",
-        state_deterministic_gap,
-    );
-    println!(
-        "      relative reconstructed-B RMS gap: {:.6e}",
-        b_deterministic_gap,
-    );
-    println!(
-        "    x=1 sensor mismatch: {:+.3} declared noise standard deviations",
-        (qoi_mean[0] - c) / SENSOR_STANDARD_DEVIATION_WB,
-    );
-    println!(
-        "    x=1 uncertainty: pre-sensor std={:.6} Wb, posterior std={:.6} Wb, variance reduction={:.1}%",
-        pre_sensor_flux_std,
-        qoi_covariance[0][0].max(0.0).sqrt(),
-        100.0 * (1.0 - qoi_covariance[0][0] / pre_sensor_flux_std.powi(2)),
-    );
-    println!(
-        "    posterior volume-weighted B RMS std (MC): {:.6} T",
-        posterior_b_rms,
-    );
-    println!("    engineering QoIs:");
-    for (index, name) in QOI_NAMES.iter().enumerate() {
-        let standard_deviation = qoi_covariance[index][index].max(0.0).sqrt();
-        println!(
-            "      {:>8}: truth={:+.6} deterministic={:+.6} mean={:+.6} std={:.6} truth_z={:+.3} deterministic_z={:+.3}",
-            name,
-            truth_qois[index],
-            deterministic_qois[index],
-            qoi_mean[index],
-            standard_deviation,
-            (qoi_mean[index] - truth_qois[index]) / standard_deviation,
-            (qoi_mean[index] - deterministic_qois[index]) / standard_deviation,
-        );
-    }
-    println!("    posterior QoI correlation (order {:?}):", QOI_NAMES);
-    for row in 0..QOI_NAMES.len() {
-        for column in 0..QOI_NAMES.len() {
-            let denominator = (qoi_covariance[row][row] * qoi_covariance[column][column]).sqrt();
-            let correlation = if denominator > 0.0 {
-                qoi_covariance[row][column] / denominator
-            } else {
-                0.0
-            };
-            print!(" {correlation:+.4}");
-        }
-        println!();
-    }
-    println!(
-        "    MC max relative SE: A={:.3}, D1A={:.3}, B={:.3}",
-        max_relative_se(&a_variance),
-        max_relative_se(&d1_variance),
-        max_relative_se(&b_variance),
-    );
-    let sensor_residual = ((qoi_mean[0] - c) / SENSOR_STANDARD_DEVIATION_WB).abs();
-    let variance_reduction = 1.0 - qoi_covariance[0][0] / pre_sensor_flux_std.powi(2);
-    let max_truth_z = (0..QOI_NAMES.len())
-        .map(|index| {
-            ((qoi_mean[index] - truth_qois[index]) / qoi_covariance[index][index].max(0.0).sqrt())
-                .abs()
-        })
-        .fold(0.0, f64::max);
+    write_console_report(
+        &mut std::io::stdout(),
+        &report,
+        &ConsoleReportOptions {
+            max_rows: 8,
+            include_correlation: true,
+            ..Default::default()
+        },
+    )?;
     validate_conditioned_exemplar(
         sensor_residual,
         variance_reduction,
@@ -574,89 +615,42 @@ fn report_and_write(
 
     let output_dir = context.output_root.join(model_name);
     fs::create_dir_all(&output_dir)?;
-    let a_mean = Cochain::new(1, FeecVector::from_column_slice(posterior.cochain_mean()));
-    let a_var = Cochain::new(1, FeecVector::from_column_slice(&a_variance.values));
-    let a_std = Cochain::new(
-        1,
-        FeecVector::from_iterator(
-            a_variance.values.len(),
-            a_variance.values.iter().map(|value| value.max(0.0).sqrt()),
-        ),
-    );
-    write_cochain_vtu_fields(
-        output_dir.join("a_1form.vtu"),
-        coords,
-        topology,
-        1,
-        &[
-            ("truth_projection", truth_a),
-            ("posterior_mean", &a_mean),
-            ("posterior_variance_mc", &a_var),
-            ("posterior_std_mc", &a_std),
-        ],
-    )?;
+    write_csv_directory(&output_dir, &report.tables()?)?;
+    let mut a_vtu = CochainVtuBuilder::new(1);
+    a_vtu
+        .add_values("truth_projection", a.truth.clone().unwrap())?
+        .add_values("posterior_mean", a.mean.clone())?
+        .add_values("posterior_variance_mc", a.variance.values.clone())?
+        .add_values("posterior_std_mc", a.standard_deviations.clone())?;
+    a_vtu.write(output_dir.join("a_1form.vtu"), coords, topology)?;
 
-    let full_d1 = feg_infer::physical::build_exterior_derivative_1_operator(topology)?;
-    let truth_d1_values = full_d1.apply(&gmrf_core::Vector::from_iterator(
-        truth_a.coeffs.len(),
-        truth_a.coeffs.iter().copied(),
-    ))?;
-    let truth_d1 = Cochain::new(
-        2,
-        FeecVector::from_iterator(truth_d1_values.len(), truth_d1_values.iter().copied()),
-    );
-    let d1_mean = Cochain::new(2, FeecVector::from_column_slice(&d1_mean));
-    let d1_var = Cochain::new(2, FeecVector::from_column_slice(&d1_variance.values));
-    let d1_std = Cochain::new(
-        2,
-        FeecVector::from_iterator(
-            d1_variance.values.len(),
-            d1_variance.values.iter().map(|value| value.max(0.0).sqrt()),
-        ),
-    );
-    write_cochain_vtu_fields(
-        output_dir.join("d1a_2form.vtu"),
-        coords,
-        topology,
-        2,
-        &[
-            ("truth", &truth_d1),
-            ("posterior_mean", &d1_mean),
-            ("posterior_variance_mc", &d1_var),
-            ("posterior_std_mc", &d1_std),
-        ],
-    )?;
+    let mut d1_vtu = CochainVtuBuilder::new(2);
+    d1_vtu
+        .add_values("truth", d1a.truth.clone().unwrap())?
+        .add_values("posterior_mean", d1a.mean.clone())?
+        .add_values("posterior_variance_mc", d1a.variance.values.clone())?
+        .add_values("posterior_std_mc", d1a.standard_deviations.clone())?;
+    d1_vtu.write(output_dir.join("d1a_2form.vtu"), coords, topology)?;
 
-    let truth_b = topology
-        .cells()
-        .handle_iter()
-        .map(|cell| {
-            let point = cell.coord_simplex(coords).barycenter();
-            [2.0 * c * point[0] * point[1], -c * point[1] * point[1], 0.0]
-        })
-        .collect::<Vec<_>>();
-    let posterior_b = interleaved_vectors(&b_mean);
-    let component_variances = split_interleaved_components(&b_variance.values);
-    let component_stds = component_variances.clone().map(|values| {
-        values
-            .iter()
-            .map(|value| value.max(0.0).sqrt())
-            .collect::<Vec<_>>()
-    });
-    write_top_cell_vtu_fields(
-        output_dir.join("b_cellwise.vtu"),
-        coords,
-        topology,
-        &[("truth", &truth_b), ("posterior_mean", &posterior_b)],
-        &[
-            ("variance_bx_mc", &component_variances[0]),
-            ("variance_by_mc", &component_variances[1]),
-            ("variance_bz_mc", &component_variances[2]),
-            ("std_bx_mc", &component_stds[0]),
-            ("std_by_mc", &component_stds[1]),
-            ("std_bz_mc", &component_stds[2]),
-        ],
+    let component_variances = VectorLayout3::Interleaved.to_components(&b.variance.values)?;
+    let component_stds = VectorLayout3::Interleaved.to_components(&b.standard_deviations)?;
+    let mut b_vtu = TopCellVtuBuilder::new();
+    b_vtu.add_vector("truth", truth_b)?.add_flat_vector(
+        "posterior_mean",
+        &b.mean,
+        VectorLayout3::Interleaved,
     )?;
+    for (name, values) in [
+        ("variance_bx_mc", component_variances[0].clone()),
+        ("variance_by_mc", component_variances[1].clone()),
+        ("variance_bz_mc", component_variances[2].clone()),
+        ("std_bx_mc", component_stds[0].clone()),
+        ("std_by_mc", component_stds[1].clone()),
+        ("std_bz_mc", component_stds[2].clone()),
+    ] {
+        b_vtu.add_scalar(name, values)?;
+    }
+    b_vtu.write(output_dir.join("b_cellwise.vtu"), coords, topology)?;
     Ok(())
 }
 
@@ -670,35 +664,68 @@ fn report_physics_only(
     let deterministic_qois = &context.reference.deterministic_qois;
     let deterministic_b = &context.reference.deterministic_b;
     let truth_qois = &context.reference.truth_qois;
-    let qoi_mean = posterior.derived_mean("engineering_qois")?;
-    let covariance = posterior.derived_covariance("engineering_qois")?;
     let residual = posterior.derived_mean("weak_pde_residual")?;
     let b_mean = posterior.derived_mean("magnetic_field")?;
-    let flux_std = covariance[0][0].max(0.0).sqrt();
-    let predictive_std = (covariance[0][0] + SENSOR_STANDARD_DEVIATION_WB.powi(2)).sqrt();
+    let latent_mean = posterior.mean().to_vec();
+    let mut report = PosteriorReportBuilder::new(&mut posterior)
+        .qoi(
+            QoiRequest::derived(
+                "physics_qois",
+                "Physics-only engineering quantities",
+                "engineering_qois",
+                QOI_NAMES.iter().map(|name| (*name).to_string()).collect(),
+            )
+            .units(["Wb", "Wb", "T", "T", "T"].map(str::to_string).to_vec())
+            .truth(truth_qois.to_vec())
+            .reference(deterministic_qois.clone()),
+        )
+        .prediction(
+            PredictionRequest::mapped(
+                "physics_flux_prediction",
+                "Physics-only x=1 flux prediction",
+                context.outputs.flux_x1.clone(),
+                vec!["flux_x1".to_string()],
+                vec![truth_qois[0]],
+                vec![SENSOR_STANDARD_DEVIATION_WB.powi(2)],
+            )
+            .units(vec!["Wb".to_string()]),
+        )
+        .build()?;
+    let qois = report.qoi("physics_qois").unwrap().clone();
+    let prediction = report
+        .prediction("physics_flux_prediction")
+        .unwrap()
+        .clone();
+    let flux_std = qois.standard_deviations[0];
     let state_deterministic_gap =
-        system.relative_state_l2_error(posterior.mean(), deterministic.active())?;
+        system.relative_state_l2_error(&latent_mean, deterministic.active())?;
     let b_deterministic_gap = magnetic.relative_vector_rms_error(&b_mean, deterministic_b)?;
-    println!("\n  l2_white_pde physics-only checkpoint");
-    println!(
-        "    mass-weighted weak residual diagnostic dual norm: {:.6e}",
-        residual_dual_norm(system, &residual)?,
-    );
-    println!(
-        "    mean vs deterministic FEEC: relative state M1-L2 gap={:.6e}, relative B-RMS gap={:.6e}",
+    let residual_norm = residual_dual_norm(system, &residual)?;
+    report.push_metric(ReportMetric::new(
+        "physics_weak_residual_dual_norm",
+        "Mass-weighted weak residual dual norm",
+        residual_norm,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "physics_state_deterministic_gap",
+        "Relative state M1-L2 gap",
         state_deterministic_gap,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "physics_b_deterministic_gap",
+        "Relative reconstructed-B RMS gap",
         b_deterministic_gap,
-    );
-    println!(
-        "    x=1 prediction: deterministic={:+.6}, analytic sensor={:+.6}, mean={:+.6}, latent std={:.6}, analytic error={:+.3} sensor SD, predictive z={:+.3}",
-        deterministic_qois[0],
-        truth_qois[0],
-        qoi_mean[0],
-        flux_std,
-        (qoi_mean[0] - truth_qois[0]) / SENSOR_STANDARD_DEVIATION_WB,
-        (qoi_mean[0] - truth_qois[0]) / predictive_std,
-    );
-    let predictive_z = ((qoi_mean[0] - truth_qois[0]) / predictive_std).abs();
+    ))?;
+    println!("\n  l2_white_pde physics-only checkpoint");
+    write_console_report(
+        &mut std::io::stdout(),
+        &report,
+        &ConsoleReportOptions {
+            max_rows: 8,
+            ..Default::default()
+        },
+    )?;
+    let predictive_z = prediction.diagnostics.standardized_residuals[0].abs();
     validate_physics_only_exemplar(predictive_z, state_deterministic_gap, b_deterministic_gap)?;
     println!("    exemplar checks: PASS (sensor consistency and deterministic-solution recovery)");
     Ok(flux_std)
@@ -766,31 +793,6 @@ fn boundary_faces_on(
     predicate: impl Fn(CoordRef) -> bool + Sync,
 ) -> Vec<usize> {
     assemble::boundary_simplices_where_barycenter(topology, coords, 2, predicate)
-}
-
-fn interleaved_vectors(values: &[f64]) -> Vec<[f64; 3]> {
-    values
-        .chunks_exact(3)
-        .map(|chunk| [chunk[0], chunk[1], chunk[2]])
-        .collect()
-}
-
-fn split_interleaved_components(values: &[f64]) -> [Vec<f64>; 3] {
-    let mut components = [Vec::new(), Vec::new(), Vec::new()];
-    for chunk in values.chunks_exact(3) {
-        for component in 0..3 {
-            components[component].push(chunk[component]);
-        }
-    }
-    components
-}
-
-fn max_relative_se(estimate: &VarianceEstimate) -> f64 {
-    estimate
-        .relative_standard_error
-        .as_ref()
-        .map(|values| values.iter().copied().fold(0.0, f64::max))
-        .unwrap_or(0.0)
 }
 
 #[cfg(test)]

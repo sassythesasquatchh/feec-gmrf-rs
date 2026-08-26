@@ -7,7 +7,6 @@ use crate::operator::{add_sparse, FormDegree, FormOperators, LinearMap, SparseMa
 use crate::{FeecGmrfError, Result};
 pub use feg_core::MaternAlpha;
 use feg_core::SparseTriplet;
-use gmrf_core::types::DenseMatrix;
 use gmrf_core::{Gmrf, Vector};
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 
@@ -226,24 +225,47 @@ impl GaussianPrior {
         self.boundary_elimination.as_ref()
     }
 
+    /// Factor the prior once for repeated variance, covariance, and sampling queries.
+    pub fn factor(&self) -> Result<crate::infer::FactoredGaussianPrior> {
+        crate::infer::FactoredGaussianPrior::new(self.clone())
+    }
+
+    /// Estimate active-coordinate marginal variances.
+    pub fn latent_variance_estimate(
+        &self,
+        method: crate::infer::VarianceMethod,
+    ) -> Result<crate::infer::VarianceEstimate> {
+        self.factor()?.latent_variance_estimate(method)
+    }
+
+    /// Estimate variances for an active- or full-cochain pushforward.
+    pub fn pushforward_variance_estimate(
+        &self,
+        map: &LinearMap,
+        method: crate::infer::VarianceMethod,
+    ) -> Result<crate::infer::VarianceEstimate> {
+        self.factor()?.pushforward_variance_estimate(map, method)
+    }
+
+    /// Estimate mapped variances and their weighted covariance trace.
+    pub fn pushforward_weighted_variance_estimate(
+        &self,
+        map: &LinearMap,
+        output_weights: &[f64],
+        method: crate::infer::VarianceMethod,
+    ) -> Result<crate::infer::WeightedVarianceEstimate> {
+        self.factor()?
+            .pushforward_weighted_variance_estimate(map, output_weights, method)
+    }
+
     /// Compute exact marginal variances for an active- or full-cochain map.
     ///
     /// Prescribed essential-boundary coefficients contribute zero variance.
     /// The calculation uses the covariance and the linear part of the map.
     pub fn pushforward_variances(&self, map: &LinearMap) -> Result<Vec<f64>> {
-        let eliminated = self.eliminate_map(map, &vec![0.0; map.output_dimension()])?;
-        let mut gmrf = Gmrf::from_mean_and_precision(
-            Vector::zeros(self.dimension()),
-            crate::infer::gmrf_sparse(self.precision()),
-        )?;
-        let operator = crate::infer::sparse_row_operator(eliminated.reduced())?;
-        let variances = gmrf
-            .exact_transformed_variance_decomposition(
-                &operator,
-                &DenseMatrix::zeros(0, self.dimension()),
-            )?
-            .unconstrained_diag;
-        Ok(variances.iter().copied().collect())
+        Ok(self
+            .pushforward_variance_estimate(map, crate::infer::VarianceMethod::Exact)?
+            .values)
     }
 
     /// Mahalanobis distance from the prior mean in active coordinates.

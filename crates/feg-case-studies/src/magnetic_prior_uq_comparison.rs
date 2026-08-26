@@ -1,5 +1,10 @@
 use common::linalg::nalgebra::CsrMatrix as FeecCsr;
-use feg_infer::sparse::core_triplet_to_gmrf as sparse_from_core;
+use feec_gmrf::prelude::{
+    gaussian_predictive_diagnostics_95, sparse_mat_from_feec_csr, FactoredGaussianPrior,
+    GaussianNoise, GaussianPrior, HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearMap,
+    LinearObservation, Posterior, PreparedLinearGaussianModel, ProbeDistribution,
+    VarianceEstimator, VarianceMethod, WeightedVarianceEstimate,
+};
 use feg_infer::{
     physical::build_reduced_magnetic_flux_density_operator_3d,
     prior::{
@@ -15,8 +20,7 @@ use feg_infer::{
         trace_normalization::trace_normalization_from_target_trace,
     },
     sparse::{
-        add_feec_diagonal_shift, feec_csr_to_gmrf, restrict_square_with_layout, scale_matrix,
-        sparse_rows_to_triplet, symmetrize_feec_csr,
+        add_feec_diagonal_shift, restrict_square_with_layout, scale_matrix, symmetrize_feec_csr,
     },
 };
 use formoniq::problems::nonlinear_magnetostatic::{
@@ -24,14 +28,6 @@ use formoniq::problems::nonlinear_magnetostatic::{
     NonlinearReluctivityLaw, ReducedVectorPotentialMagnetostatic3d,
 };
 use formoniq::reduction::EssentialBoundarySpec;
-use gmrf_core::{
-    apply_gaussian_observations, estimate_factored_transformed_variances,
-    estimate_hutchinson_transformed_variance_weighted_trace,
-    exact_transformed_variance_weighted_trace, Gmrf, ProbeBatchConfig, ProbeDistribution,
-    SparseCholeskyFactor, SparseMatrix as GmrfSparse, SparseRowOperator, TransformedVarianceMode,
-    TransformedVarianceWeightedTraceEstimate, VarianceFloor, Vector as GmrfVector,
-    WeightedTraceEstimate,
-};
 use manifold::{
     gen::cartesian::CartesianMeshInfo,
     geometry::coord::{mesh::MeshCoords, simplex::SimplexHandleExt},
@@ -414,13 +410,13 @@ struct CubeWorkspace {
     model: ReducedVectorPotentialMagnetostatic3d,
     cell_volumes: Vec<f64>,
     domain_volume: f64,
-    b_operator: SparseRowOperator,
+    b_operator: LinearMap,
 }
 
 struct PriorBuild {
-    prior_q: GmrfSparse,
-    raw_factor: SparseCholeskyFactor,
-    raw_trace: WeightedTraceEstimate,
+    prior: GaussianPrior,
+    raw_factored: FactoredGaussianPrior,
+    raw_trace: PriorTraceEstimate,
     tau_normalizer: f64,
     precision_scale: f64,
     prior_factor_seconds: f64,
@@ -439,7 +435,7 @@ struct ModelRun {
 }
 
 struct TransformedVarianceSolve {
-    values: GmrfVector,
+    values: Vec<f64>,
     qoi_rhs: usize,
     elapsed_seconds: f64,
     estimator: &'static str,
@@ -448,10 +444,9 @@ struct TransformedVarianceSolve {
 struct PosteriorPlan {
     conditioning_rows: Vec<usize>,
     eval_rows: Vec<usize>,
-    conditioning_operator: SparseRowOperator,
-    eval_operator: SparseRowOperator,
-    factor: SparseCholeskyFactor,
-    variance: GmrfVector,
+    prepared: PreparedLinearGaussianModel,
+    eval_operator: LinearMap,
+    variance: Vec<f64>,
     factor_seconds: f64,
     variance_seconds: f64,
     qoi_rhs: usize,
@@ -459,8 +454,25 @@ struct PosteriorPlan {
 
 struct PosteriorEvaluation {
     eval_rows: Vec<usize>,
-    mean: GmrfVector,
-    variance: GmrfVector,
+    mean: Vec<f64>,
+    variance: Vec<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PriorTraceEstimate {
+    value: f64,
+    estimator: VarianceEstimator,
+    relative_standard_error: Option<f64>,
+}
+
+impl From<&WeightedVarianceEstimate> for PriorTraceEstimate {
+    fn from(estimate: &WeightedVarianceEstimate) -> Self {
+        Self {
+            value: estimate.weighted_trace,
+            estimator: estimate.variances.estimator,
+            relative_standard_error: estimate.weighted_trace_relative_standard_error,
+        }
+    }
 }
 
 struct SensorBin {
@@ -523,7 +535,7 @@ pub fn compute_magnetic_prior_uq_comparison_report(
         MagneticPriorModelKind::OrdinaryPotential,
         MagneticPriorModelKind::SpectrumMatchedPotential,
     ] {
-        let prior = build_prior(&config, &workspace, model, practical_range_m, kappa)?;
+        let mut prior = build_prior(&config, &workspace, model, practical_range_m, kappa)?;
         let validation_plan = build_posterior_plan(
             &config,
             &workspace.b_operator,
@@ -546,8 +558,14 @@ pub fn compute_magnetic_prior_uq_comparison_report(
                 .wrapping_add(1_501)
                 .wrapping_add(model_seed_offset(model)),
         )?;
-        let roughness =
-            compute_prior_roughness(&config, &workspace, model, practical_range_m, kappa, &prior)?;
+        let roughness = compute_prior_roughness(
+            &config,
+            &workspace,
+            model,
+            practical_range_m,
+            kappa,
+            &mut prior,
+        )?;
 
         for scenario in [
             MagneticTruthSource::SmoothManufactured,
@@ -570,8 +588,8 @@ pub fn compute_magnetic_prior_uq_comparison_report(
             model,
             practical_range_m,
             kappa,
-            dofs: prior.prior_q.nrows(),
-            b_rows: workspace.b_operator.nrows(),
+            dofs: prior.prior.dimension(),
+            b_rows: workspace.b_operator.output_dimension(),
             precision_nnz: prior.precision_nnz,
             precision_density: prior.precision_density,
             trace_estimator: if prior.raw_trace.estimator.is_exact() {
@@ -600,9 +618,9 @@ pub fn compute_magnetic_prior_uq_comparison_report(
         });
     }
 
-    let corrected_prior = model_runs
+    let corrected_prior_index = model_runs
         .iter()
-        .find(|run| run.model == MagneticPriorModelKind::SpectrumMatchedPotential)
+        .position(|run| run.model == MagneticPriorModelKind::SpectrumMatchedPotential)
         .ok_or_else(|| "spectrum-matched prior was not built".to_string())?;
     let mut truth_diagnostic_rows = Vec::new();
     let mut observation_rows = Vec::new();
@@ -662,7 +680,10 @@ pub fn compute_magnetic_prior_uq_comparison_report(
             MagneticTruthSource::SpectrumMatchedPriorSample,
             truth_replicate,
         );
-        let truth = sample_normalized_prior_truth(&corrected_prior.prior, truth_seed)?;
+        let truth = sample_normalized_prior_truth(
+            &mut model_runs[corrected_prior_index].prior,
+            truth_seed,
+        )?;
         let truth_b = workspace
             .b_operator
             .apply(&truth)
@@ -789,42 +810,44 @@ fn build_prior(
     };
     let raw_precision = restrict_square_with_layout(&raw_full_precision, workspace.model.layout())?;
     let raw_precision = symmetrize_feec_csr(&raw_precision);
-    let (raw_precision, raw_q, raw_factor, diagonal_shift, prior_factor_seconds) =
+    let (raw_precision, _raw_prior, mut raw_factored, diagonal_shift, prior_factor_seconds) =
         factorize_raw_precision(raw_precision, model)?;
 
     let weights = cell_major_b_weights(&workspace.cell_volumes);
     let trace_start = Instant::now();
-    let raw_variance_trace = if raw_q.nrows() <= config.exact_max_dofs {
-        exact_transformed_variance_weighted_trace(&raw_factor, &workspace.b_operator, &weights)
-            .map_err(|err| err.to_string())?
+    let method = if raw_precision.nrows() <= config.exact_max_dofs {
+        VarianceMethod::Exact
     } else {
-        estimate_hutchinson_transformed_variance_weighted_trace(
-            &raw_factor,
-            &workspace.b_operator,
-            &weights,
-            probe_config(
-                config,
-                prior_seed(config.rng_seed, model, practical_range_m),
-            ),
-            VarianceFloor::Zero,
-            ProbeDistribution::Rademacher,
-        )
-        .map_err(|err| err.to_string())?
+        hutchinson_method(
+            config,
+            prior_seed(config.rng_seed, model, practical_range_m),
+        )?
     };
+    let raw_variance_trace = raw_factored
+        .pushforward_weighted_variance_estimate(&workspace.b_operator, &weights, method)
+        .map_err(|err| err.to_string())?;
     let prior_trace_seconds = trace_start.elapsed().as_secs_f64();
-    let raw_trace = raw_variance_trace.weighted_trace.clone();
+    let raw_trace = PriorTraceEstimate::from(&raw_variance_trace);
     let target_trace =
         config.target_b_rms_tesla * config.target_b_rms_tesla * workspace.domain_volume;
     let normalization = trace_normalization_from_target_trace(raw_trace.value, target_trace)?;
     let precision_scale = normalization.precision_scale;
     let prior_precision = scale_matrix(&raw_precision, precision_scale);
-    let prior_q = feec_csr_to_gmrf(&prior_precision);
-    let prior_qoi_rhs = qoi_rhs_count(&raw_variance_trace, workspace.b_operator.nrows());
-    let n = prior_q.nrows();
+    let prior = GaussianPrior::new(
+        vec![0.0; prior_precision.nrows()],
+        sparse_mat_from_feec_csr(&prior_precision),
+    )
+    .map_err(|err| err.to_string())?;
+    let prior_qoi_rhs = if raw_variance_trace.variances.estimator.is_exact() {
+        workspace.b_operator.output_dimension()
+    } else {
+        raw_variance_trace.variances.sample_count
+    };
+    let n = prior.dimension();
     let precision_nnz = prior_precision.nnz();
     Ok(PriorBuild {
-        prior_q,
-        raw_factor,
+        prior,
+        raw_factored,
         raw_trace,
         tau_normalizer: normalization.tau_multiplier,
         precision_scale,
@@ -839,51 +862,40 @@ fn build_prior(
 
 fn build_posterior_plan(
     config: &MagneticPriorUqComparisonConfig,
-    b_operator: &SparseRowOperator,
+    b_operator: &LinearMap,
     prior: &PriorBuild,
     conditioning_rows: &[usize],
     eval_rows: &[usize],
     seed: u64,
 ) -> Result<PosteriorPlan, String> {
     let training_operator = b_operator
-        .select_rows(conditioning_rows)
+        .select_outputs(conditioning_rows)
         .map_err(|err| err.to_string())?;
-    let training_matrix = sparse_from_core(&sparse_rows_to_triplet(
-        training_operator.nrows(),
-        training_operator.ncols,
-        &training_operator.rows,
-    ));
-    let y = GmrfVector::zeros(conditioning_rows.len());
-    let (posterior_q, information) = apply_gaussian_observations(
-        &prior.prior_q,
-        &training_matrix,
-        &y,
-        None,
-        config.observation_std_tesla * config.observation_std_tesla,
-    );
-
     let factor_start = Instant::now();
-    let posterior_factor = posterior_q
-        .cholesky_sqrt_lower()
+    let prepared = LinearGaussianModelBuilder::new(prior.prior.clone())
+        .observe(
+            LinearObservation::new(
+                training_operator,
+                vec![0.0; conditioning_rows.len()],
+                GaussianNoise::standard_deviation(config.observation_std_tesla)
+                    .map_err(|err| err.to_string())?,
+            )
+            .map_err(|err| err.to_string())?,
+        )
+        .map_err(|err| err.to_string())?
+        .prepare()
         .map_err(|err| format!("posterior precision factorization failed: {err}"))?;
     let posterior_factor_seconds = factor_start.elapsed().as_secs_f64();
-    debug_assert!(information.iter().all(|value| *value == 0.0));
     let eval_operator = b_operator
-        .select_rows(eval_rows)
+        .select_outputs(eval_rows)
         .map_err(|err| err.to_string())?;
-    let variance_solve = transformed_variances(
-        &posterior_factor,
-        &eval_operator,
-        posterior_q.nrows() <= config.exact_max_dofs,
-        config,
-        seed,
-    )?;
+    let mut zero_posterior = prepared.condition().map_err(|err| err.to_string())?;
+    let variance_solve = transformed_variances(&mut zero_posterior, &eval_operator, config, seed)?;
     Ok(PosteriorPlan {
         conditioning_rows: conditioning_rows.to_vec(),
         eval_rows: eval_rows.to_vec(),
-        conditioning_operator: training_operator,
+        prepared,
         eval_operator,
-        factor: posterior_factor,
         variance: variance_solve.values,
         factor_seconds: posterior_factor_seconds,
         variance_seconds: variance_solve.elapsed_seconds,
@@ -892,33 +904,28 @@ fn build_posterior_plan(
 }
 
 fn evaluate_with_posterior_plan(
-    config: &MagneticPriorUqComparisonConfig,
+    _config: &MagneticPriorUqComparisonConfig,
     plan: &PosteriorPlan,
     observations: &[ObservationRow],
 ) -> Result<PosteriorEvaluation, String> {
     let observation_lookup = observation_lookup(observations);
-    let y = GmrfVector::from_iterator(
-        plan.conditioning_rows.len(),
-        plan.conditioning_rows.iter().map(|row| {
+    let y = plan
+        .conditioning_rows
+        .iter()
+        .map(|row| {
             observation_lookup
                 .get(row)
                 .map(|obs| obs.observation_tesla)
                 .unwrap_or(f64::NAN)
-        }),
-    );
+        })
+        .collect::<Vec<_>>();
     if y.iter().any(|value| !value.is_finite()) {
         return Err("conditioning rows include a row without an observation".to_string());
     }
-    let inverse_variance = 1.0 / (config.observation_std_tesla * config.observation_std_tesla);
-    let weighted_y = scale_vector(&y, inverse_variance);
-    let information = plan
-        .conditioning_operator
-        .apply_transpose(&weighted_y)
-        .map_err(|err| err.to_string())?;
     let posterior_mean = plan
-        .factor
-        .solve(&information)
-        .map_err(|err| format!("posterior mean solve failed: {err}"))?;
+        .prepared
+        .latent_mean_with_observation_values(&[y])
+        .map_err(|err| err.to_string())?;
     let mean = plan
         .eval_operator
         .apply(&posterior_mean)
@@ -933,11 +940,23 @@ fn evaluate_with_posterior_plan(
 fn factorize_raw_precision(
     precision: FeecCsr,
     model: MagneticPriorModelKind,
-) -> Result<(FeecCsr, GmrfSparse, SparseCholeskyFactor, f64, f64), String> {
+) -> Result<(FeecCsr, GaussianPrior, FactoredGaussianPrior, f64, f64), String> {
     let started = Instant::now();
-    let q = feec_csr_to_gmrf(&precision);
-    match q.cholesky_sqrt_lower() {
-        Ok(factor) => return Ok((precision, q, factor, 0.0, started.elapsed().as_secs_f64())),
+    let prior = GaussianPrior::new(
+        vec![0.0; precision.nrows()],
+        sparse_mat_from_feec_csr(&precision),
+    )
+    .map_err(|err| err.to_string())?;
+    match prior.factor() {
+        Ok(factored) => {
+            return Ok((
+                precision,
+                prior,
+                factored,
+                0.0,
+                started.elapsed().as_secs_f64(),
+            ))
+        }
         Err(err) if model != MagneticPriorModelKind::SpectrumMatchedPotential => {
             return Err(format!(
                 "{model} raw prior precision factorization failed: {err}"
@@ -951,10 +970,20 @@ fn factorize_raw_precision(
     let mut last_error = String::new();
     for _ in 0..8 {
         let shifted = add_feec_diagonal_shift(&precision, shift)?;
-        let q = feec_csr_to_gmrf(&shifted);
-        match q.cholesky_sqrt_lower() {
-            Ok(factor) => {
-                return Ok((shifted, q, factor, shift, started.elapsed().as_secs_f64()));
+        let prior = GaussianPrior::new(
+            vec![0.0; shifted.nrows()],
+            sparse_mat_from_feec_csr(&shifted),
+        )
+        .map_err(|err| err.to_string())?;
+        match prior.factor() {
+            Ok(factored) => {
+                return Ok((
+                    shifted,
+                    prior,
+                    factored,
+                    shift,
+                    started.elapsed().as_secs_f64(),
+                ));
             }
             Err(err) => {
                 last_error = err.to_string();
@@ -986,14 +1015,13 @@ fn compute_prior_roughness(
     model: MagneticPriorModelKind,
     practical_range_m: f64,
     kappa: f64,
-    prior: &PriorBuild,
+    prior: &mut PriorBuild,
 ) -> Result<PriorRoughnessRow, String> {
     let adjacent_pairs = adjacent_cell_pairs(&workspace.topology);
     let jump_operator = adjacent_b_jump_operator(&workspace.b_operator, &adjacent_pairs)?;
-    let solve = transformed_variances(
-        &prior.raw_factor,
+    let solve = factored_transformed_variances(
+        &mut prior.raw_factored,
         &jump_operator,
-        prior.prior_q.nrows() <= config.exact_max_dofs,
         config,
         config
             .rng_seed
@@ -1009,7 +1037,7 @@ fn compute_prior_roughness(
         practical_range_m,
         kappa,
         adjacent_cell_pairs: adjacent_pairs.len(),
-        jump_rows: jump_operator.nrows(),
+        jump_rows: jump_operator.output_dimension(),
         mean_adjacent_b_jump2: mean_jump2,
         rms_adjacent_b_jump: mean_jump2.max(0.0).sqrt(),
         estimator: solve.estimator.to_string(),
@@ -1027,9 +1055,9 @@ fn metrics_for_rows(
     let eval_lookup = posterior_eval_lookup(posterior);
     let observation_lookup = observation_lookup(observations);
     let mut truth_sq = 0.0;
-    let mut nlpd = 0.0;
-    let mut standardized_sq = 0.0;
-    let mut covered = 0usize;
+    let mut observed = Vec::with_capacity(row_indices.len());
+    let mut predicted = Vec::with_capacity(row_indices.len());
+    let mut latent_variances = Vec::with_capacity(row_indices.len());
     for row in row_indices {
         let eval = *eval_lookup
             .get(row)
@@ -1039,34 +1067,34 @@ fn metrics_for_rows(
             .ok_or_else(|| format!("missing observation for row {row}"))?;
         let mean = posterior.mean[eval];
         let variance = posterior.variance[eval].max(0.0);
-        let predictive_variance = variance + sigma * sigma;
-        if !predictive_variance.is_finite() || predictive_variance <= 0.0 {
-            return Err(format!(
-                "non-positive predictive variance {predictive_variance} for row {row}"
-            ));
-        }
-        let predictive_sd = predictive_variance.sqrt();
-        let observed_residual = mean - obs.observation_tesla;
         let truth_residual = mean - obs.truth_tesla;
-        let standardized = observed_residual / predictive_sd;
         truth_sq += truth_residual * truth_residual;
-        standardized_sq += standardized * standardized;
-        nlpd += 0.5
-            * ((2.0 * PI * predictive_variance).ln()
-                + observed_residual * observed_residual / predictive_variance);
-        if standardized.abs() <= 1.96 {
-            covered += 1;
-        }
+        observed.push(obs.observation_tesla);
+        predicted.push(mean);
+        latent_variances.push(variance);
     }
     let count = row_indices.len();
     if count == 0 {
         return Err("prediction metrics require at least one row".to_string());
     }
+    let diagnostics = gaussian_predictive_diagnostics_95(
+        &observed,
+        &predicted,
+        &latent_variances,
+        &vec![sigma * sigma; count],
+    )
+    .map_err(|err| err.to_string())?;
     Ok(PredictionMetrics {
         rmse_tesla: (truth_sq / count as f64).sqrt(),
-        nlpd: nlpd / count as f64,
-        standardized_rms: (standardized_sq / count as f64).sqrt(),
-        coverage_95: covered as f64 / count as f64,
+        nlpd: diagnostics.mean_negative_log_predictive_density,
+        standardized_rms: (diagnostics
+            .standardized_residuals
+            .iter()
+            .map(|value| value * value)
+            .sum::<f64>()
+            / count as f64)
+            .sqrt(),
+        coverage_95: diagnostics.empirical_coverage,
     })
 }
 
@@ -1258,7 +1286,7 @@ fn prior_calibration_row(
         model,
         practical_range_m,
         kappa,
-        dofs: prior.prior_q.nrows(),
+        dofs: prior.prior.dimension(),
         cells: workspace.cell_volumes.len(),
         domain_volume: workspace.domain_volume,
         target_b_rms_tesla: config.target_b_rms_tesla,
@@ -1293,6 +1321,8 @@ fn build_cube_workspace(level: usize) -> Result<CubeWorkspace, String> {
     let domain_volume = cell_volumes.iter().sum::<f64>();
     let b_operator =
         build_reduced_magnetic_flux_density_operator_3d(&topology, &coords, model.layout())?;
+    let b_operator = LinearMap::weighted_rows(b_operator.ncols, &b_operator.rows)
+        .map_err(|err| err.to_string())?;
     Ok(CubeWorkspace {
         topology,
         coords,
@@ -1306,7 +1336,7 @@ fn build_cube_workspace(level: usize) -> Result<CubeWorkspace, String> {
 fn build_smooth_truth(
     config: &MagneticPriorUqComparisonConfig,
     workspace: &CubeWorkspace,
-) -> Result<GmrfVector, String> {
+) -> Result<Vec<f64>, String> {
     let mut truth = smooth_edge_truth_3d(
         &workspace.model,
         &workspace.topology,
@@ -1315,25 +1345,21 @@ fn build_smooth_truth(
     );
     let b_values = workspace
         .b_operator
-        .apply(&GmrfVector::from_vec(truth.clone()))
+        .apply(&truth)
         .map_err(|err| err.to_string())?;
     let rms = volume_weighted_b_rms(&b_values, &workspace.cell_volumes)?;
     let scale = config.truth_b_rms_tesla / rms;
     for value in &mut truth {
         *value *= scale;
     }
-    Ok(GmrfVector::from_vec(truth))
+    Ok(truth)
 }
 
-fn sample_normalized_prior_truth(prior: &PriorBuild, seed: u64) -> Result<GmrfVector, String> {
-    let gmrf = Gmrf::from_mean_and_precision(
-        GmrfVector::zeros(prior.prior_q.nrows()),
-        prior.prior_q.clone(),
-    )
-    .map_err(|err| err.to_string())?;
+fn sample_normalized_prior_truth(prior: &mut PriorBuild, seed: u64) -> Result<Vec<f64>, String> {
     let mut rng = StdRng::seed_from_u64(seed);
-    let raw = gmrf
-        .sample_with_precision_sqrt(&prior.raw_factor, &mut rng)
+    let raw = prior
+        .raw_factored
+        .sample_cochain(&mut rng)
         .map_err(|err| err.to_string())?;
     Ok(scale_vector(&raw, prior.precision_scale.sqrt().recip()))
 }
@@ -1343,7 +1369,7 @@ fn truth_diagnostic_row(
     truth_replicate: usize,
     truth_seed: u64,
     workspace: &CubeWorkspace,
-    truth_b: &GmrfVector,
+    truth_b: &[f64],
 ) -> Result<TruthDiagnosticRow, String> {
     let realized_b_rms_tesla = volume_weighted_b_rms(truth_b, &workspace.cell_volumes)?;
     let adjacent_pairs = adjacent_cell_pairs(&workspace.topology);
@@ -1359,7 +1385,7 @@ fn truth_diagnostic_row(
 }
 
 fn realized_adjacent_b_jump2(
-    b_values: &GmrfVector,
+    b_values: &[f64],
     adjacent_pairs: &[(usize, usize)],
 ) -> Result<f64, String> {
     if adjacent_pairs.is_empty() {
@@ -1455,7 +1481,7 @@ fn build_observations(
     noise_replicate: usize,
     truth_seed: u64,
     noise_seed: u64,
-    truth_b: &GmrfVector,
+    truth_b: &[f64],
     design: &SensorDesign,
 ) -> Result<Vec<ObservationRow>, String> {
     let capacity = design.training_rows.len()
@@ -1532,7 +1558,7 @@ fn push_observation_rows(
     bin: &str,
     cells: &[usize],
     operator_rows: &[usize],
-    truth_b: &GmrfVector,
+    truth_b: &[f64],
     rng: &mut StdRng,
 ) -> Result<(), String> {
     for (cell, &row) in cells
@@ -1569,33 +1595,54 @@ fn push_observation_rows(
 }
 
 fn transformed_variances(
-    factor: &SparseCholeskyFactor,
-    operator: &SparseRowOperator,
-    use_exact: bool,
+    posterior: &mut Posterior,
+    operator: &LinearMap,
     config: &MagneticPriorUqComparisonConfig,
     seed: u64,
 ) -> Result<TransformedVarianceSolve, String> {
     let start = Instant::now();
-    let mode = if use_exact {
-        TransformedVarianceMode::Exact
-    } else {
-        TransformedVarianceMode::Hutchinson {
-            config: probe_config(config, seed),
-            floor: VarianceFloor::Zero,
-            distribution: ProbeDistribution::Rademacher,
-        }
-    };
-    let estimate = estimate_factored_transformed_variances(factor, operator, mode)
+    let estimate = posterior
+        .pushforward_variance_estimate(operator, variance_method(config, seed)?)
         .map_err(|err| err.to_string())?;
     Ok(TransformedVarianceSolve {
         values: estimate.values,
-        qoi_rhs: if use_exact {
-            operator.nrows()
+        qoi_rhs: if estimate.estimator.is_exact() {
+            operator.output_dimension()
         } else {
-            config.hutchinson_probes
+            estimate.sample_count
         },
         elapsed_seconds: start.elapsed().as_secs_f64(),
-        estimator: if use_exact { "exact" } else { "hutchinson" },
+        estimator: if estimate.estimator.is_exact() {
+            "exact"
+        } else {
+            "hutchinson"
+        },
+    })
+}
+
+fn factored_transformed_variances(
+    prior: &mut FactoredGaussianPrior,
+    operator: &LinearMap,
+    config: &MagneticPriorUqComparisonConfig,
+    seed: u64,
+) -> Result<TransformedVarianceSolve, String> {
+    let start = Instant::now();
+    let estimate = prior
+        .pushforward_variance_estimate(operator, variance_method(config, seed)?)
+        .map_err(|err| err.to_string())?;
+    Ok(TransformedVarianceSolve {
+        values: estimate.values,
+        qoi_rhs: if estimate.estimator.is_exact() {
+            operator.output_dimension()
+        } else {
+            estimate.sample_count
+        },
+        elapsed_seconds: start.elapsed().as_secs_f64(),
+        estimator: if estimate.estimator.is_exact() {
+            "exact"
+        } else {
+            "hutchinson"
+        },
     })
 }
 
@@ -1613,46 +1660,21 @@ fn adjacent_cell_pairs(topology: &Complex) -> Vec<(usize, usize)> {
 }
 
 fn adjacent_b_jump_operator(
-    b_operator: &SparseRowOperator,
+    b_operator: &LinearMap,
     adjacent_pairs: &[(usize, usize)],
-) -> Result<SparseRowOperator, String> {
+) -> Result<LinearMap, String> {
     let mut rows = Vec::with_capacity(3 * adjacent_pairs.len());
     for &(lhs_cell, rhs_cell) in adjacent_pairs {
         for component in 0..3 {
-            rows.push(difference_row(
-                b_operator,
-                3 * lhs_cell + component,
-                3 * rhs_cell + component,
-            )?);
+            rows.push(vec![
+                (3 * lhs_cell + component, 1.0),
+                (3 * rhs_cell + component, -1.0),
+            ]);
         }
     }
-    SparseRowOperator::new(b_operator.ncols, rows).map_err(|err| err.to_string())
-}
-
-fn difference_row(
-    operator: &SparseRowOperator,
-    lhs_row: usize,
-    rhs_row: usize,
-) -> Result<Vec<(usize, f64)>, String> {
-    let lhs = operator
-        .rows
-        .get(lhs_row)
-        .ok_or_else(|| format!("operator row {lhs_row} is out of bounds"))?;
-    let rhs = operator
-        .rows
-        .get(rhs_row)
-        .ok_or_else(|| format!("operator row {rhs_row} is out of bounds"))?;
-    let mut values = BTreeMap::<usize, f64>::new();
-    for (col, value) in lhs {
-        *values.entry(*col).or_insert(0.0) += *value;
-    }
-    for (col, value) in rhs {
-        *values.entry(*col).or_insert(0.0) -= *value;
-    }
-    Ok(values
-        .into_iter()
-        .filter_map(|(col, value)| (value != 0.0).then_some((col, value)))
-        .collect())
+    LinearMap::weighted_rows(b_operator.output_dimension(), &rows)
+        .and_then(|difference| difference.compose(b_operator))
+        .map_err(|err| err.to_string())
 }
 
 fn observation_lookup(observations: &[ObservationRow]) -> BTreeMap<usize, &ObservationRow> {
@@ -1902,7 +1924,7 @@ fn cell_volumes(topology: &Complex, coords: &MeshCoords) -> Result<Vec<f64>, Str
     Ok(volumes)
 }
 
-fn volume_weighted_b_rms(b_values: &GmrfVector, cell_volumes: &[f64]) -> Result<f64, String> {
+fn volume_weighted_b_rms(b_values: &[f64], cell_volumes: &[f64]) -> Result<f64, String> {
     if b_values.len() != 3 * cell_volumes.len() {
         return Err(format!(
             "B value length {} does not match 3 * cell count {}",
@@ -1930,36 +1952,47 @@ fn volume_weighted_b_rms(b_values: &GmrfVector, cell_volumes: &[f64]) -> Result<
     Ok((sum / volume).sqrt())
 }
 
-fn cell_major_b_weights(cell_volumes: &[f64]) -> GmrfVector {
-    GmrfVector::from_iterator(
-        3 * cell_volumes.len(),
-        cell_volumes
-            .iter()
-            .flat_map(|volume| [*volume, *volume, *volume]),
+fn cell_major_b_weights(cell_volumes: &[f64]) -> Vec<f64> {
+    cell_volumes
+        .iter()
+        .flat_map(|volume| [*volume, *volume, *volume])
+        .collect()
+}
+
+fn scale_vector(values: &[f64], scale: f64) -> Vec<f64> {
+    values.iter().map(|value| *value * scale).collect()
+}
+
+fn hutchinson_method(
+    config: &MagneticPriorUqComparisonConfig,
+    rng_seed: u64,
+) -> Result<VarianceMethod, String> {
+    Ok(VarianceMethod::Hutchinson(
+        HutchinsonVarianceConfig::new(
+            config.hutchinson_probes,
+            config.hutchinson_batches,
+            rng_seed,
+        )
+        .map_err(|err| err.to_string())?
+        .distribution(ProbeDistribution::Rademacher),
+    ))
+}
+
+fn variance_method(
+    config: &MagneticPriorUqComparisonConfig,
+    rng_seed: u64,
+) -> Result<VarianceMethod, String> {
+    VarianceMethod::auto(
+        config.exact_max_dofs,
+        HutchinsonVarianceConfig::new(
+            config.hutchinson_probes,
+            config.hutchinson_batches,
+            rng_seed,
+        )
+        .map_err(|err| err.to_string())?
+        .distribution(ProbeDistribution::Rademacher),
     )
-}
-
-fn scale_vector(values: &GmrfVector, scale: f64) -> GmrfVector {
-    GmrfVector::from_iterator(values.len(), values.iter().map(|value| *value * scale))
-}
-
-fn qoi_rhs_count(
-    estimate: &TransformedVarianceWeightedTraceEstimate,
-    exact_output_rows: usize,
-) -> usize {
-    if estimate.weighted_trace.estimator.is_exact() {
-        exact_output_rows
-    } else {
-        estimate.weighted_trace.sample_count
-    }
-}
-
-fn probe_config(config: &MagneticPriorUqComparisonConfig, rng_seed: u64) -> ProbeBatchConfig {
-    ProbeBatchConfig {
-        num_probes: config.hutchinson_probes,
-        batch_count: config.hutchinson_batches,
-        rng_seed,
-    }
+    .map_err(|err| err.to_string())
 }
 
 fn kappa_from_practical_range(range: f64) -> f64 {

@@ -43,6 +43,12 @@ conditioning, named and ad hoc outputs, and exact and Monte Carlo variance.
 electromagnetic problem with physical pushforwards, a weak PDE residual, and
 engineering quantities of interest.
 
+For the complete native installation, including the required MUMPS-enabled
+PETSc configuration, SLEPc, MPI, Gmsh, helper executables, and all 15 smoke
+workflows, follow [Clean installation and first run](docs/getting-started.md).
+That path builds pinned solver releases under the ignored `.native/` directory;
+it does not rely on a Homebrew PETSc and does not require NGSolve.
+
 ## Use as a dependency
 
 Add a released tag or pinned commit to your `Cargo.toml`:
@@ -78,7 +84,10 @@ fn condition(
 ```
 
 The example source files show FEEC assembly, boundary treatment, physical maps,
-and posterior uncertainty queries in context.
+and posterior uncertainty queries in context. Both examples continue through
+the public `feec_gmrf::report` API to bounded console summaries, validated CSV
+tables, and VTU bundles. See the [reporting guide](docs/reporting.md) for the
+request types, canonical schemas, and artifact builders.
 
 ## Features
 
@@ -95,6 +104,10 @@ scripts validate the selected native configuration before compiling helpers.
 - Generate public API documentation with `cargo doc --release --open`.
 - [Architecture and mathematical ownership](docs/architecture.md) describes
   dependency direction and shared mathematical invariants.
+- [Posterior reporting and artifacts](docs/reporting.md) documents report
+  construction, console/CSV schemas, and FEEC VTU bundles.
+- [Root API migration plan and status](docs/api-migration.md) records migrated
+  workflows, deliberate exclusions, and remaining reusable API gaps.
 - [Reproduction guide](docs/reproduction.md) explains study profiles, provenance,
   and the `feg-study` command.
 - [Scientific input inventory](docs/assets.md) records retained geometries,

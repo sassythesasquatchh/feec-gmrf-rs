@@ -2,36 +2,27 @@
 
 #[cfg(test)]
 use common::linalg::nalgebra::Vector as FeecVector;
-use feg_infer::{
-    prior::matern::{
-        one_form::{
-            build_hodge_laplacian_1form, build_matern_precision_1form_for_alpha,
-            build_matern_precision_1form_for_alpha_with_coords, MaternConfig as Matern1FormConfig,
-            MaternMassInverse as Matern1FormMassInverse,
-        },
-        three_form::{
-            build_hodge_laplacian_3form,
-            build_hodge_laplacian_3form_with_lower_mass_inverse_coords,
-            build_matern_precision_3form_for_alpha, MaternConfig as Matern3FormConfig,
-        },
-        two_form::{
-            build_hodge_laplacian_2form,
-            build_hodge_laplacian_2form_with_lower_mass_inverse_coords,
-            build_matern_precision_2form_for_alpha,
-            build_matern_precision_2form_for_alpha_with_coords, MaternConfig as Matern2FormConfig,
-            MaternMassInverse as Matern2FormMassInverse,
-        },
-        zero_form::{
-            build_laplace_beltrami_0form, build_matern_precision_0form_for_alpha,
-            MaternConfig as Matern0FormConfig, MaternMassInverse as Matern0FormMassInverse,
-        },
-        MaternAlpha,
+use feec_gmrf::prelude::{sparse_mat_from_feec_csr, GaussianPrior, LinearMap};
+use feg_infer::prior::matern::{
+    one_form::{
+        build_hodge_laplacian_1form, build_matern_precision_1form_for_alpha,
+        build_matern_precision_1form_for_alpha_with_coords, MaternConfig as Matern1FormConfig,
+        MaternMassInverse as Matern1FormMassInverse,
     },
-    sparse::feec_csr_to_gmrf,
-};
-use gmrf_core::{
-    types::{DenseMatrix as GmrfDenseMatrix, Vector as GmrfVector},
-    Gmrf, SparseRowOperator,
+    three_form::{
+        build_hodge_laplacian_3form, build_hodge_laplacian_3form_with_lower_mass_inverse_coords,
+        build_matern_precision_3form_for_alpha, MaternConfig as Matern3FormConfig,
+    },
+    two_form::{
+        build_hodge_laplacian_2form, build_hodge_laplacian_2form_with_lower_mass_inverse_coords,
+        build_matern_precision_2form_for_alpha, build_matern_precision_2form_for_alpha_with_coords,
+        MaternConfig as Matern2FormConfig, MaternMassInverse as Matern2FormMassInverse,
+    },
+    zero_form::{
+        build_laplace_beltrami_0form, build_matern_precision_0form_for_alpha,
+        MaternConfig as Matern0FormConfig, MaternMassInverse as Matern0FormMassInverse,
+    },
+    MaternAlpha,
 };
 use manifold::{
     gen::cartesian::CartesianMeshInfo,
@@ -349,28 +340,19 @@ fn exact_observable_variances(
     dimension: usize,
     observables: &[FixedObservable],
 ) -> Result<Vec<f64>, String> {
-    let precision_gmrf = feec_csr_to_gmrf(precision);
-    let factor = precision_gmrf
-        .cholesky_sqrt_lower()
-        .map_err(|err| format!("failed to factor prior precision: {err}"))?;
-    let mut gmrf = Gmrf::from_mean_and_precision(GmrfVector::zeros(dimension), precision_gmrf)
-        .map_err(|err| format!("failed to build prior GMRF: {err}"))?
-        .with_precision_sqrt(factor);
-    let operator = SparseRowOperator::new(
+    let prior = GaussianPrior::new(vec![0.0; dimension], sparse_mat_from_feec_csr(precision))
+        .map_err(|err| format!("failed to build prior: {err}"))?;
+    let operator = LinearMap::weighted_rows(
         dimension,
-        observables
+        &observables
             .iter()
             .map(|observable| observable.row.clone())
-            .collect(),
+            .collect::<Vec<_>>(),
     )
     .map_err(|err| format!("failed to build observable operator: {err}"))?;
-    let constraints = GmrfDenseMatrix::zeros(0, dimension);
-    let variance = gmrf
-        .exact_transformed_variance_decomposition(&operator, &constraints)
-        .map_err(|err| format!("failed to compute transformed variance: {err}"))?;
-    Ok((0..observables.len())
-        .map(|index| variance.unconstrained_diag[index])
-        .collect())
+    prior
+        .pushforward_variances(&operator)
+        .map_err(|err| format!("failed to compute transformed variance: {err}"))
 }
 
 pub fn fixed_simplex_observable(

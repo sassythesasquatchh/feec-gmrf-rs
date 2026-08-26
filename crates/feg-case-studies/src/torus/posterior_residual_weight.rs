@@ -7,15 +7,16 @@
 
 use common::linalg::nalgebra::{CsrMatrix as FeecCsr, Vector as FeecVector};
 use ddf::cochain::{cochain_projection, Cochain};
+use feec_gmrf::prelude::{
+    sparse_mat_from_feec_csr, GaussianNoise, GaussianPrior, LinearGaussianModelBuilder, LinearMap,
+    LinearObservation,
+};
 use feg_infer::prior::matern::one_form::{
     build_hodge_laplacian_1form, build_matern_precision_1form, build_matern_system_matrix_1form,
-    feec_csr_to_gmrf, HodgeLaplacian1Form, MaternConfig, MaternMassInverse,
+    HodgeLaplacian1Form, MaternConfig, MaternMassInverse,
 };
-use feg_infer::sparse::gmrf_vec_to_feec;
 use formoniq::fe::{fe_l2_error, l2_norm};
 use formoniq::torus_convergence::build_torus_reference_fields;
-use gmrf_core::observation::apply_gaussian_observations;
-use gmrf_core::Gmrf;
 use manifold::{
     geometry::{coord::mesh::MeshCoords, metric::mesh::MeshLengths},
     topology::complex::Complex,
@@ -173,9 +174,12 @@ pub fn run_torus_1form_pde_posterior_mean_weight_sweep(
                 mass_inverse: MaternMassInverse::Nc1ProjectedSparseInverse,
             },
         );
-        let q_prior = feec_csr_to_gmrf(&prior_precision);
-        let observation_operator = feec_csr_to_gmrf(&prepared.system_matrix);
-        let observations = feg_infer::prior::matern::one_form::feec_vec_to_gmrf(&prepared.rhs);
+        let prior = GaussianPrior::new(
+            vec![0.0; prior_precision.nrows()],
+            sparse_mat_from_feec_csr(&prior_precision),
+        )?;
+        let observation_operator = LinearMap::from_feec_csr(&prepared.system_matrix)?;
+        let observations = prepared.rhs.iter().copied().collect::<Vec<_>>();
         let edge_dofs = prepared.truth.len();
         let h = prepared.metric.mesh_width_max();
         let rhs_norm = prepared.rhs.norm().max(EPS);
@@ -183,20 +187,14 @@ pub fn run_torus_1form_pde_posterior_mean_weight_sweep(
         for &weight in &weights {
             let row_start = Instant::now();
             let noise_variance = 1.0 / weight;
-            let (posterior_precision, information) = apply_gaussian_observations(
-                &q_prior,
-                &observation_operator,
-                &observations,
-                None,
-                noise_variance,
-            );
-            let posterior_factor = posterior_precision.cholesky_sqrt_lower()?;
-            let posterior = Gmrf::from_information_and_precision_with_sqrt(
-                information,
-                posterior_precision,
-                posterior_factor,
-            )?;
-            let posterior_mean = gmrf_vec_to_feec(posterior.mean());
+            let posterior = LinearGaussianModelBuilder::new(prior.clone())
+                .observe(LinearObservation::new(
+                    observation_operator.clone(),
+                    observations.clone(),
+                    GaussianNoise::variance(noise_variance)?,
+                )?)?
+                .condition()?;
+            let posterior_mean = FeecVector::from_vec(posterior.mean().to_vec());
             let posterior_mean_cochain = Cochain::new(1, posterior_mean.clone());
             let deterministic_solution = Cochain::new(1, prepared.truth.clone());
             let posterior_deterministic_l2_error = l2_norm(

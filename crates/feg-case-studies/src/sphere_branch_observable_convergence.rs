@@ -5,23 +5,17 @@
 //! It computes only transformed marginal variances, not full covariance matrices.
 
 use crate::sphere_sparse_anchor_kernel_validation::analytic_branch_covariance;
-use common::linalg::nalgebra::{CsrMatrix as FeecCsr, Vector as FeecVector};
+use common::linalg::nalgebra::Vector as FeecVector;
 use exterior::field::DiffFormClosure;
-use feg_core::HodgeBranchKind;
-use feg_infer::{
-    prior::{
-        matern::{one_form::build_reconstructed_barycenter_field_operator, MaternAlpha},
-        sparse_anchor_hodge::{
-            build_ordinary_potential_hodge_1form_prior_with_coords,
-            build_sparse_anchor_hodge_1form_prior_with_coords,
-            OrdinaryPotentialHodge1FormPriorConfig, SparseAnchorBranchConfig,
-            SparseAnchorHodge1FormPriorConfig,
-        },
-    },
-    sparse::{feec_csr_to_gmrf, sparse_row_operator_from_feec_csr},
+use feec_gmrf::prelude::{
+    HodgeBranchKind, HodgeOneFormPrior, HodgeOneFormPriorBuilder, LinearMap,
+    OrdinaryPotentialHodge1FormPriorConfig, SparseAnchorBranchConfig,
+    SparseAnchorHodge1FormPriorConfig, VarianceMethod,
+};
+use feg_infer::prior::matern::{
+    one_form::build_reconstructed_barycenter_field_operator, MaternAlpha,
 };
 use formoniq::{assemble::assemble_galvec, operators::SourceElVec};
-use gmrf_core::{exact_solve_transformed_diag, SparseRowOperator};
 use manifold::{
     dim3::mesh_sphere_surface,
     geometry::{
@@ -245,12 +239,6 @@ struct MeshData {
     metric: MeshLengths,
 }
 
-struct BuiltPrior {
-    latent_dofs: usize,
-    precision: FeecCsr,
-    latent_to_ambient: FeecCsr,
-}
-
 struct PriorVarianceReport {
     latent_dofs: usize,
     precision_nnz: usize,
@@ -263,12 +251,12 @@ struct PriorVarianceReport {
 }
 
 struct ObservableOperator {
-    operator: SparseRowOperator,
+    operator: LinearMap,
     row_nnz: Vec<usize>,
 }
 
 struct PointwiseOperator {
-    operator: SparseRowOperator,
+    operator: LinearMap,
     row_nnz: Vec<usize>,
     observations: Vec<PointwiseObservation>,
 }
@@ -466,7 +454,7 @@ fn observable_operator(
         .collect::<Vec<_>>();
     let row_nnz = rows.iter().map(Vec::len).collect::<Vec<_>>();
     Ok(ObservableOperator {
-        operator: SparseRowOperator::new(mesh.topology.edges().len(), rows)
+        operator: LinearMap::weighted_rows(mesh.topology.edges().len(), &rows)
             .map_err(|err| err.to_string())?,
         row_nnz,
     })
@@ -515,7 +503,7 @@ fn pointwise_operator(mesh: &MeshData) -> Result<PointwiseOperator, String> {
     }
     let row_nnz = rows.iter().map(Vec::len).collect::<Vec<_>>();
     Ok(PointwiseOperator {
-        operator: SparseRowOperator::new(mesh.topology.edges().len(), rows)
+        operator: LinearMap::weighted_rows(mesh.topology.edges().len(), &rows)
             .map_err(|err| err.to_string())?,
         row_nnz,
         observations,
@@ -616,34 +604,37 @@ fn compute_prior_variances(
     config: &SphereBranchObservableConvergenceConfig,
     model: SphereBranchObservableModel,
     prior_branch: HodgeBranchKind,
-    smooth_operator: &SparseRowOperator,
-    pointwise_operator: &SparseRowOperator,
+    smooth_operator: &LinearMap,
+    pointwise_operator: &LinearMap,
 ) -> Result<PriorVarianceReport, String> {
     let started = Instant::now();
     let prior = build_prior(mesh, config, model, prior_branch)?;
     let build_seconds = started.elapsed().as_secs_f64();
 
-    let transform_operator = sparse_row_operator_from_feec_csr(&prior.latent_to_ambient)?;
-    let smooth_latent_operator = SparseRowOperator::compose(smooth_operator, &transform_operator)
+    let smooth_latent_operator = smooth_operator
+        .compose(prior.ambient_map())
         .map_err(|err| err.to_string())?;
-    let pointwise_latent_operator =
-        SparseRowOperator::compose(pointwise_operator, &transform_operator)
-            .map_err(|err| err.to_string())?;
-    let stacked_operator =
-        SparseRowOperator::stack(&[&smooth_latent_operator, &pointwise_latent_operator])
-            .map_err(|err| err.to_string())?;
-    let gmrf_precision = feec_csr_to_gmrf(&prior.precision);
+    let pointwise_latent_operator = pointwise_operator
+        .compose(prior.ambient_map())
+        .map_err(|err| err.to_string())?;
+    let stacked_operator = LinearMap::stack(&[smooth_latent_operator, pointwise_latent_operator])
+        .map_err(|err| err.to_string())?;
     let factor_started = Instant::now();
-    let factor = gmrf_precision
-        .cholesky_sqrt_lower()
+    let mut factored = prior
+        .latent_prior()
+        .factor()
         .map_err(|err| format!("failed to factor precision: {err}"))?;
     let factor_seconds = factor_started.elapsed().as_secs_f64();
-    let factor_nnz = factor.nnz();
+    let factor_nnz = factored
+        .factorization_diagnostics()
+        .map_err(|err| err.to_string())?
+        .factor_nonzeros;
     let variance_started = Instant::now();
-    let estimate = exact_solve_transformed_diag(&factor, &stacked_operator)
+    let estimate = factored
+        .pushforward_variance_estimate(&stacked_operator, VarianceMethod::Exact)
         .map_err(|err| format!("failed to compute transformed variances: {err}"))?;
-    let smooth_count = smooth_operator.nrows();
-    let pointwise_count = pointwise_operator.nrows();
+    let smooth_count = smooth_operator.output_dimension();
+    let pointwise_count = pointwise_operator.output_dimension();
     let values = estimate.values.as_slice();
     if values.len() != smooth_count + pointwise_count {
         return Err(format!(
@@ -654,8 +645,8 @@ fn compute_prior_variances(
         ));
     }
     Ok(PriorVarianceReport {
-        latent_dofs: prior.latent_dofs,
-        precision_nnz: prior.precision.nnz(),
+        latent_dofs: prior.latent_dimension(),
+        precision_nnz: prior.latent_prior().precision().nnz(),
         factor_nnz,
         smooth_variances: values[..smooth_count].to_vec(),
         pointwise_variances: values[smooth_count..].to_vec(),
@@ -670,18 +661,17 @@ fn build_prior(
     config: &SphereBranchObservableConvergenceConfig,
     model: SphereBranchObservableModel,
     prior_branch: HodgeBranchKind,
-) -> Result<BuiltPrior, String> {
+) -> Result<HodgeOneFormPrior, String> {
     let branch_config = SparseAnchorBranchConfig {
         kappa: config.kappa,
         tau: config.tau,
         alpha: MaternAlpha::Two,
     };
     let branches = vec![prior_branch];
-    let prior = match model {
+    let builder = match model {
         SphereBranchObservableModel::OrdinaryPotential => {
-            build_ordinary_potential_hodge_1form_prior_with_coords(
+            HodgeOneFormPriorBuilder::ordinary_potential(
                 &mesh.topology,
-                &mesh.coords,
                 &mesh.metric,
                 OrdinaryPotentialHodge1FormPriorConfig {
                     branches,
@@ -692,9 +682,8 @@ fn build_prior(
             )
         }
         SphereBranchObservableModel::SpectrallyCorrected => {
-            build_sparse_anchor_hodge_1form_prior_with_coords(
+            HodgeOneFormPriorBuilder::sparse_anchor(
                 &mesh.topology,
-                &mesh.coords,
                 &mesh.metric,
                 SparseAnchorHodge1FormPriorConfig {
                     branches,
@@ -705,12 +694,11 @@ fn build_prior(
                 },
             )
         }
-    }?;
-    Ok(BuiltPrior {
-        latent_dofs: prior.latent_dimension(),
-        precision: prior.precision,
-        latent_to_ambient: prior.latent_to_ambient,
-    })
+    };
+    builder
+        .with_coords(&mesh.coords)
+        .build()
+        .map_err(|err| err.to_string())
 }
 
 // Each row records mesh, prior branch, observable support, and analytic reference
@@ -1700,16 +1688,18 @@ mod tests {
         let mesh = build_mesh(1);
         let operator = pointwise_operator(&mesh).expect("pointwise operator should build");
         let point_count = fixed_pointwise_directions().len();
-        assert_eq!(operator.operator.nrows(), 3 * point_count);
-        assert_eq!(operator.operator.ncols, mesh.topology.edges().len());
+        assert_eq!(operator.operator.output_dimension(), 3 * point_count);
+        assert_eq!(
+            operator.operator.input_dimension(),
+            mesh.topology.edges().len()
+        );
         assert_eq!(operator.row_nnz.len(), 3 * point_count);
         assert_eq!(operator.observations.len(), 3 * point_count);
         assert!(operator
             .operator
-            .rows
-            .iter()
-            .flatten()
-            .all(|(_, value)| value.is_finite()));
+            .matrix()
+            .triplet_iter()
+            .all(|(_, _, value)| value.is_finite()));
 
         let unique_cells = operator
             .observations

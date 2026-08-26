@@ -45,6 +45,82 @@ impl GaussianNoise {
         crate::operator::validate_sparse(&precision)?;
         Ok(Self::Precision(precision))
     }
+
+    /// Construct independent heteroscedastic noise from per-row variances.
+    pub fn independent_variances(variances: &[f64]) -> Result<Self> {
+        if variances
+            .iter()
+            .any(|variance| !variance.is_finite() || *variance <= 0.0)
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "independent Gaussian variances must be finite and positive".to_string(),
+            ));
+        }
+        let mut precision = crate::operator::SparseMat::new(variances.len(), variances.len());
+        for (index, variance) in variances.iter().copied().enumerate() {
+            precision.push(index, index, 1.0 / variance);
+        }
+        Self::precision(precision)
+    }
+
+    /// Construct independent heteroscedastic noise from per-row standard deviations.
+    pub fn independent_standard_deviations(standard_deviations: &[f64]) -> Result<Self> {
+        if standard_deviations
+            .iter()
+            .any(|standard_deviation| !standard_deviation.is_finite() || *standard_deviation <= 0.0)
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "independent Gaussian standard deviations must be finite and positive".to_string(),
+            ));
+        }
+        Self::independent_variances(
+            &standard_deviations
+                .iter()
+                .map(|standard_deviation| standard_deviation * standard_deviation)
+                .collect::<Vec<_>>(),
+        )
+    }
+}
+
+/// One sparse affine observation row with its own Gaussian noise variance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinearObservationRow {
+    pub entries: Vec<(usize, f64)>,
+    pub value: f64,
+    pub bias: f64,
+    pub noise_variance: f64,
+}
+
+impl LinearObservationRow {
+    /// Construct a zero-bias observation row.
+    pub fn new(entries: Vec<(usize, f64)>, value: f64, noise_variance: f64) -> Result<Self> {
+        Self::with_bias(entries, value, 0.0, noise_variance)
+    }
+
+    /// Construct an affine observation row.
+    pub fn with_bias(
+        entries: Vec<(usize, f64)>,
+        value: f64,
+        bias: f64,
+        noise_variance: f64,
+    ) -> Result<Self> {
+        if !value.is_finite()
+            || !bias.is_finite()
+            || !noise_variance.is_finite()
+            || noise_variance <= 0.0
+            || entries.iter().any(|(_, entry)| !entry.is_finite())
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "observation-row values, entries, and positive variance must be finite".to_string(),
+            ));
+        }
+        Ok(Self {
+            entries,
+            value,
+            bias,
+            noise_variance,
+        })
+    }
 }
 
 /// A linear Gaussian observation `y = Hx + b + epsilon`.
@@ -74,6 +150,29 @@ impl LinearObservation {
             LinearMap::selector(input_dimension, indices)?,
             values,
             noise,
+        )
+    }
+
+    /// Construct a heteroscedastic observation system from sparse rows.
+    pub fn from_rows(input_dimension: usize, rows: Vec<LinearObservationRow>) -> Result<Self> {
+        let operator = LinearMap::weighted_rows(
+            input_dimension,
+            &rows
+                .iter()
+                .map(|row| row.entries.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let values = rows.iter().map(|row| row.value).collect();
+        let bias = rows.iter().map(|row| row.bias).collect();
+        let variances = rows
+            .iter()
+            .map(|row| row.noise_variance)
+            .collect::<Vec<_>>();
+        Self::with_bias(
+            operator,
+            values,
+            bias,
+            GaussianNoise::independent_variances(&variances)?,
         )
     }
 
@@ -299,6 +398,11 @@ impl LinearGaussianModelBuilder {
     /// Factor and condition the model.
     pub fn condition(self) -> Result<crate::infer::Posterior> {
         crate::infer::condition_linear_model(self)
+    }
+
+    /// Prepare a fixed prior/operator/noise design for repeated observation values.
+    pub fn prepare(self) -> Result<crate::infer::PreparedLinearGaussianModel> {
+        crate::infer::prepare_linear_model(self)
     }
 }
 

@@ -1,8 +1,16 @@
 #!/usr/bin/env bash
 
-# Shared PETSc/SLEPc selection for publication checks and helper builds.
-# Explicit environment variables select an in-place or prefix installation;
-# pkg-config is used only when no explicit PETSc installation was requested.
+# Shared PETSc/SLEPc selection for native checks and helper builds.
+# Selection order is explicit environment, the canonical repository-local
+# installation, then pkg-config. A partial repository-local installation is
+# selected deliberately so validation reports it instead of silently using a
+# different system PETSc.
+
+_feg_petsc_environment_directory="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_feg_repository_root="$(cd "$_feg_petsc_environment_directory/.." && pwd)"
+source "$_feg_petsc_environment_directory/native-versions.sh"
+FEG_NATIVE_ROOT="${FEG_NATIVE_ROOT:-$_feg_repository_root/.native}"
+FEG_LOCAL_PETSC_ARCH="${FEG_LOCAL_PETSC_ARCH:-$FEG_PETSC_ARCH}"
 
 select_pkg_config_package() {
   local candidate
@@ -16,9 +24,12 @@ select_pkg_config_package() {
 }
 
 resolve_petsc_environment() {
+  local local_petsc_dir="$FEG_NATIVE_ROOT/petsc"
+  local local_slepc_dir="$FEG_NATIVE_ROOT/slepc"
   PETSC_SELECTION=""
   PETSC_PKG_CONFIG_PACKAGE=""
   SLEPC_PKG_CONFIG_PACKAGE=""
+  PETSC_CONFIGURATION_HEADER=""
 
   if [[ -n "${PETSC_DIR:-}" ]]; then
     if [[ -z "${SLEPC_DIR:-}" ]]; then
@@ -26,6 +37,11 @@ resolve_petsc_environment() {
       return 1
     fi
     PETSC_SELECTION="explicit environment"
+  elif [[ -e "$local_petsc_dir" || -e "$local_slepc_dir" ]]; then
+    PETSC_DIR="$local_petsc_dir"
+    PETSC_ARCH="$FEG_LOCAL_PETSC_ARCH"
+    SLEPC_DIR="$local_slepc_dir"
+    PETSC_SELECTION="repository-local installation"
   else
     if [[ -n "${PETSC_ARCH:-}" || -n "${SLEPC_DIR:-}" ]]; then
       echo "PETSC_ARCH and SLEPC_DIR require an explicit PETSC_DIR" >&2
@@ -48,7 +64,7 @@ resolve_petsc_environment() {
     PETSC_SELECTION="pkg-config"
   fi
 
-  export PETSC_DIR SLEPC_DIR
+  export PETSC_DIR SLEPC_DIR PETSC_SELECTION
   if [[ -n "${PETSC_ARCH:-}" ]]; then
     export PETSC_ARCH
   fi
@@ -99,6 +115,9 @@ validate_petsc_environment() {
     echo "selected PETSc configuration lacks required MUMPS support: $petsc_configuration_header" >&2
     return 1
   fi
+
+  PETSC_CONFIGURATION_HEADER="$petsc_configuration_header"
+  export PETSC_CONFIGURATION_HEADER
 }
 
 add_library_path_entry() {
@@ -143,4 +162,7 @@ print_petsc_environment() {
     echo "PETSC_ARCH=$PETSC_ARCH"
   fi
   echo "SLEPC_DIR=$SLEPC_DIR"
+  if [[ -n "${PETSC_CONFIGURATION_HEADER:-}" ]]; then
+    echo "PETSc configuration=$PETSC_CONFIGURATION_HEADER"
+  fi
 }

@@ -145,6 +145,241 @@ fn exact_and_mc_variance_apis_cover_named_and_ad_hoc_outputs() {
 }
 
 #[test]
+fn downstream_user_can_build_and_render_a_public_posterior_report() {
+    let prior = GaussianPrior::new(
+        vec![0.0, 0.0],
+        SparseMat::from_rows(2, &[vec![(0, 2.0)], vec![(1, 4.0)]]).unwrap(),
+    )
+    .unwrap();
+    let qoi = LinearMap::weighted_row(2, &[(0, 1.0), (1, 1.0)]).unwrap();
+    let mut posterior = LinearGaussianModelBuilder::new(prior)
+        .derive(DerivedQuantity::new("sum", qoi.clone()).unwrap())
+        .unwrap()
+        .condition()
+        .unwrap();
+    let report = PosteriorReportBuilder::new(&mut posterior)
+        .field(FieldRequest::latent("state", "Latent state"))
+        .qoi(QoiRequest::derived(
+            "sum_qoi",
+            "Sum QoI",
+            "sum",
+            vec!["sum".into()],
+        ))
+        .prediction(PredictionRequest::mapped(
+            "held_out",
+            "Held-out sum",
+            qoi,
+            vec!["sum".into()],
+            vec![0.0],
+            vec![0.25],
+        ))
+        .include_factorization_diagnostics(true)
+        .build()
+        .unwrap();
+
+    assert_eq!(report.field("state").unwrap().mean.len(), 2);
+    assert!((report.qoi("sum_qoi").unwrap().covariance[0][0] - 0.75).abs() < 1.0e-12);
+    assert_eq!(
+        report
+            .prediction("held_out")
+            .unwrap()
+            .diagnostics
+            .empirical_coverage,
+        1.0
+    );
+    let table_ids = report
+        .tables()
+        .unwrap()
+        .into_iter()
+        .map(|table| table.id().to_string())
+        .collect::<Vec<_>>();
+    assert!(table_ids.contains(&"sum_qoi_covariance".to_string()));
+    assert!(table_ids.contains(&"held_out_prediction".to_string()));
+    assert!(table_ids.contains(&"factorization".to_string()));
+
+    let mut console = Vec::new();
+    write_console_report(&mut console, &report, &ConsoleReportOptions::default()).unwrap();
+    let console = String::from_utf8(console).unwrap();
+    assert!(console.contains("field state (Latent state)"));
+    assert!(console.contains("prediction held_out (Held-out sum)"));
+}
+
+#[test]
+fn hutchinson_auto_and_weighted_trace_are_reproducible() {
+    let prior = GaussianPrior::new(
+        vec![0.0, 0.0],
+        SparseMat::from_rows(2, &[vec![(0, 2.0)], vec![(1, 4.0)]]).unwrap(),
+    )
+    .unwrap();
+    let map = LinearMap::identity(2);
+    let mut factored = prior.factor().unwrap();
+    let exact = factored
+        .pushforward_weighted_variance_estimate(&map, &[2.0, 4.0], VarianceMethod::Exact)
+        .unwrap();
+    assert_vector_close(&exact.variances.values, &[0.5, 0.25], 1e-12);
+    assert!((exact.weighted_trace - 2.0).abs() < 1e-12);
+
+    let config = HutchinsonVarianceConfig::new(32, 4, 91).unwrap();
+    let first = factored
+        .pushforward_variance_estimate(&map, VarianceMethod::Hutchinson(config))
+        .unwrap();
+    let second = factored
+        .pushforward_variance_estimate(&map, VarianceMethod::Hutchinson(config))
+        .unwrap();
+    assert_eq!(first, second);
+    assert_eq!(first.estimator, VarianceEstimator::Hutchinson);
+    assert_eq!(first.sample_count, 32);
+
+    let automatic = factored
+        .pushforward_variance_estimate(
+            &map,
+            VarianceMethod::auto(2, HutchinsonVarianceConfig::new(8, 2, 7).unwrap()).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(automatic.estimator, VarianceEstimator::Exact);
+    assert_vector_close(&automatic.values, &[0.5, 0.25], 1e-12);
+}
+
+#[test]
+fn heteroscedastic_rows_and_prepared_conditioning_use_the_public_model() {
+    let prior = GaussianPrior::new(vec![0.0, 0.0], SparseMat::diagonal(2, 1.0)).unwrap();
+    let heteroscedastic = LinearObservation::from_rows(
+        2,
+        vec![
+            LinearObservationRow::new(vec![(0, 1.0)], 2.0, 1.0).unwrap(),
+            LinearObservationRow::new(vec![(1, 1.0)], 4.0, 3.0).unwrap(),
+        ],
+    )
+    .unwrap();
+    let posterior = LinearGaussianModelBuilder::new(prior.clone())
+        .observe(heteroscedastic)
+        .unwrap()
+        .condition()
+        .unwrap();
+    assert_vector_close(posterior.mean(), &[1.0, 1.0], 1e-12);
+
+    let operator = LinearMap::selector(2, &[0]).unwrap();
+    let prepared = LinearGaussianModelBuilder::new(prior.clone())
+        .observe(
+            LinearObservation::new(
+                operator.clone(),
+                vec![0.0],
+                GaussianNoise::variance(0.5).unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap()
+        .prepare()
+        .unwrap();
+    assert_eq!(prepared.observation_row_counts(), [1]);
+    let prepared_mean = prepared
+        .latent_mean_with_observation_values(&[vec![2.0]])
+        .unwrap();
+    let prepared_posterior = prepared
+        .condition_with_observation_values(&[vec![2.0]])
+        .unwrap();
+    let direct_posterior = LinearGaussianModelBuilder::new(prior)
+        .observe(
+            LinearObservation::new(operator, vec![2.0], GaussianNoise::variance(0.5).unwrap())
+                .unwrap(),
+        )
+        .unwrap()
+        .condition()
+        .unwrap();
+    assert_vector_close(&prepared_mean, direct_posterior.mean(), 1e-12);
+    assert_vector_close(prepared_posterior.mean(), direct_posterior.mean(), 1e-12);
+    let diagnostics = prepared.factorization_diagnostics();
+    assert_eq!(diagnostics.dimension, 2);
+    assert_eq!(diagnostics.precision_nonzeros, 2);
+    assert_eq!(diagnostics.factor_nonzeros, 2);
+    assert!((diagnostics.fill_ratio - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn prepared_mean_only_path_respects_hard_constraints() {
+    let prior = GaussianPrior::new(vec![0.0, 0.0], SparseMat::diagonal(2, 1.0)).unwrap();
+    let observation =
+        LinearObservation::at_indices(2, &[0], vec![0.0], GaussianNoise::variance(1.0).unwrap())
+            .unwrap();
+    let constraint = LinearConstraint::new(
+        LinearMap::weighted_row(2, &[(0, 1.0), (1, 1.0)]).unwrap(),
+        vec![1.0],
+    )
+    .unwrap();
+    let prepared = LinearGaussianModelBuilder::new(prior)
+        .observe(observation)
+        .unwrap()
+        .constrain(constraint)
+        .unwrap()
+        .prepare()
+        .unwrap();
+    let mean = prepared
+        .latent_mean_with_observation_values(&[vec![2.0]])
+        .unwrap();
+    let full = prepared
+        .condition_with_observation_values(&[vec![2.0]])
+        .unwrap();
+    assert_vector_close(&mean, full.mean(), 1e-12);
+    assert!((mean.iter().sum::<f64>() - 1.0).abs() < 1e-12);
+}
+
+#[test]
+fn state_only_pde_facade_supports_hard_constraints() {
+    let system = identity_pde_system();
+    let constraint = LinearConstraint::new(
+        LinearMap::weighted_row(2, &[(0, 1.0), (1, 1.0)]).unwrap(),
+        vec![1.0],
+    )
+    .unwrap();
+    let posterior = LinearPdeModelBuilder::new(system.diagonal_prior(1.0).unwrap(), &system)
+        .unwrap()
+        .constrain(constraint)
+        .unwrap()
+        .condition()
+        .unwrap();
+    assert_vector_close(posterior.mean(), &[0.5, 0.5], 1e-12);
+}
+
+#[test]
+fn root_hodge_facade_builds_and_reports_branch_outputs() {
+    let mesh = CartesianMeshInfo::new_unit_scaled(2, 1, 1.0);
+    let (topology, coords) = mesh.compute_coord_complex();
+    let metric = coords.to_edge_lengths(&topology);
+    let prior = HodgeOneFormPriorBuilder::decomposed(
+        &topology,
+        &metric,
+        Hodge1FormPriorConfig::branch(1.0, 1.0, HodgeBranchKind::Exact, 0),
+    )
+    .with_coords(&coords)
+    .build()
+    .unwrap();
+    assert_eq!(prior.ambient_dimension(), topology.nsimplices(1));
+    assert!(prior.branch_map(HodgeBranchKind::Exact).is_some());
+    let ambient_dimension = prior.ambient_dimension();
+    let observation = LinearObservation::new(
+        LinearMap::selector(ambient_dimension, &[0]).unwrap(),
+        vec![0.1],
+        GaussianNoise::variance(0.25).unwrap(),
+    )
+    .unwrap();
+    let mut posterior = prior
+        .model_builder()
+        .observe_ambient(observation)
+        .unwrap()
+        .condition()
+        .unwrap();
+    assert_eq!(posterior.ambient_mean().unwrap().len(), ambient_dimension);
+    assert_eq!(
+        posterior
+            .branch_variance_estimate(HodgeBranchKind::Exact, VarianceMethod::Exact)
+            .unwrap()
+            .values
+            .len(),
+        ambient_dimension
+    );
+}
+
+#[test]
 fn observation_and_variance_conveniences_reject_invalid_inputs() {
     assert!(GaussianNoise::standard_deviation(0.0).is_err());
     assert!(GaussianNoise::standard_deviation(f64::NAN).is_err());

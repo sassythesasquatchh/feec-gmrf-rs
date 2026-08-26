@@ -40,9 +40,13 @@ delegates Gaussian algebra to `gmrf-core` and FEEC-specific inference adapters
 to `feg-infer`.
 
 The root API carries the downstream stability guarantee. Maintained case
-studies use public `gmrf-core` and `feg-infer` APIs for specialist diagnostics
-and workflow orchestration. Reusable operations discovered in a study move to
-the lower layer that owns the corresponding mathematics.
+studies use it for generic Gaussian model composition, conditioning, sampling,
+variance estimation, physical normalization, and predictive diagnostics.
+Studies may use public `gmrf-core` and `feg-infer` APIs for specialist
+diagnostics and FEEC assembly. Reusable operations discovered in a study move
+to the lower layer that owns the corresponding mathematics. The current
+migration scope and remaining gaps are recorded in
+[`api-migration.md`](api-migration.md).
 
 The CLI depends on the case-study registry and, when enabled, the experiments
 registry. Scientific work is carried out by the registered workflow.
@@ -75,10 +79,23 @@ Calibration, normalization, observation uncertainty, and reporting all use
 this operator chain.
 
 Physical-RMS calibration is performed by
-`calibrate_prior_to_physical_rms(prior, map, target)`. It evaluates the generic
-GMRF transformed covariance for the supplied composed `LinearMap`, then
-rescales the precision. The covariance and calibration recurrence are shared by
-all case studies.
+`calibrate_prior_to_physical_rms(prior, map, target)` or its estimator-aware and
+weighted variants. They evaluate the generic GMRF transformed covariance for
+the supplied composed `LinearMap`, then rescale the precision. Exact and
+Hutchinson trace routes share the same calibration recurrence.
+
+## Repeated designs and uncertainty
+
+`GaussianPrior::factor` caches a sparse factor for repeated prior uncertainty
+and sampling. `LinearGaussianModelBuilder::prepare` fixes a prior, observation
+operators, noise models, constraints, and derived quantities, then reuses one
+posterior factor while observation values change. Exact, Monte Carlo,
+Hutchinson, and dimension-switched automatic variance policies are exposed by
+the root `VarianceMethod` contract.
+
+Heteroscedastic independent observations use `LinearObservation::from_rows` or
+`GaussianNoise::independent_variances`. Canonical Gaussian predictive
+diagnostics live in `gmrf-core` and are re-exported by the root package.
 
 ## Essential-boundary elimination
 

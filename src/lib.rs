@@ -6,7 +6,9 @@
 //! applications live in the case-study crates and use the same implementations.
 
 pub mod boundary;
+pub mod diagnostics;
 pub mod error;
+pub mod hodge;
 pub mod infer;
 pub mod linear_pde;
 pub mod model;
@@ -14,6 +16,7 @@ pub mod operator;
 pub mod physical;
 pub mod prelude;
 pub mod prior;
+pub mod report;
 pub mod spacetime;
 
 #[cfg(feature = "spectral")]

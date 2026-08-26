@@ -61,9 +61,10 @@ submodule commits, dirty status, tool versions, deterministic seeds, metrics,
 input hashes, and artifact inventory. Verification refuses to certify a dirty
 `thesis-submitted` run.
 
-Some electromagnetic workflows require Gmsh, PETSc with MUMPS, SLEPc, or
-NGSolve reference inputs. Their registry descriptors declare prerequisites; a
-missing prerequisite is an error, never a skipped successful run. The manual
+Some electromagnetic workflows require Gmsh, PETSc with MUMPS, or SLEPc.
+Optional publication-reference comparisons additionally require NGSolve. Their
+registry descriptors declare runtime prerequisites; a missing prerequisite is
+an error, never a skipped successful run. The manual
 publication workflow builds the FEEC helper programs with
 `scripts/build-petsc-helpers.sh` and runs the gated
 `feg-infer` and external-reference regression tests before executing the 15

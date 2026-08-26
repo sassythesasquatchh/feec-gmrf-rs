@@ -1,4 +1,9 @@
 use common::linalg::nalgebra::CsrMatrix as FeecCsr;
+use feec_gmrf::prelude::{
+    sparse_mat_from_feec_csr, write_csv, FactoredGaussianPrior, GaussianPrior,
+    HutchinsonVarianceConfig, LinearMap, ProbeDistribution, ReportCell, ReportTable,
+    VarianceMethod,
+};
 use feg_infer::{
     prior::{
         matern::{
@@ -15,26 +20,14 @@ use feg_infer::{
         },
         trace_normalization::{trace_normalization_from_mean_variance, TraceNormalization},
     },
-    sparse::{feec_csr_to_gmrf, symmetrize_feec_csr},
-};
-use gmrf_core::{
-    estimate_hutchinson_transformed_variances, estimate_hutchinson_variances,
-    estimate_hutchinson_weighted_covariance_trace,
-    estimate_hutchinson_weighted_transformed_covariance_trace, exact_solve_diag,
-    exact_solve_transformed_diag, exact_weighted_covariance_trace,
-    exact_weighted_transformed_covariance_trace, Gmrf, ProbeBatchConfig, ProbeDistribution,
-    SparseCholeskyFactor, SparseMatrix as GmrfSparse, SparseRowOperator, Vector as GmrfVector,
+    sparse::symmetrize_feec_csr,
 };
 use manifold::{
     gen::cartesian::CartesianMeshInfo,
     geometry::coord::{mesh::MeshCoords, simplex::SimplexHandleExt},
     topology::complex::Complex,
 };
-use std::{
-    fs::{self, File},
-    io::{self, BufWriter, Write},
-    path::Path,
-};
+use std::{fs, io, path::Path};
 
 const DEFAULT_PRACTICAL_RANGE: f64 = 0.20;
 
@@ -143,6 +136,30 @@ pub struct VarianceStats {
     pub mean: f64,
     pub median: f64,
     pub max: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TraceEstimate {
+    value: f64,
+    relative_standard_error: Option<f64>,
+}
+
+impl From<feec_gmrf::infer::WeightedCovarianceTraceEstimate> for TraceEstimate {
+    fn from(estimate: feec_gmrf::infer::WeightedCovarianceTraceEstimate) -> Self {
+        Self {
+            value: estimate.value,
+            relative_standard_error: estimate.relative_standard_error,
+        }
+    }
+}
+
+impl From<feec_gmrf::infer::WeightedVarianceEstimate> for TraceEstimate {
+    fn from(estimate: feec_gmrf::infer::WeightedVarianceEstimate) -> Self {
+        Self {
+            value: estimate.weighted_trace,
+            relative_standard_error: estimate.weighted_trace_relative_standard_error,
+        }
+    }
 }
 
 impl VarianceStats {
@@ -294,21 +311,24 @@ fn compute_sparse_weight_row(
     raw_precision: &FeecCsr,
     weight: &FeecCsr,
 ) -> Result<MaternTraceNormalizationRow, String> {
-    let weight = feec_csr_to_gmrf(weight);
-    let (raw_q, raw_factor) = factorize(raw_precision)?;
+    let raw_prior = root_prior(raw_precision)?;
+    let mut raw_factored = raw_prior.factor().map_err(|err| err.to_string())?;
+    let weight = sparse_mat_from_feec_csr(weight);
     let row_seed = row_seed(config.rng_seed, stage, level, alpha);
-    let raw_exact = if raw_factor.dimension() <= config.exact_max_dofs {
-        Some(exact_weighted_covariance_trace(&raw_factor, &weight).map_err(|err| err.to_string())?)
+    let raw_exact = if raw_precision.nrows() <= config.exact_max_dofs {
+        Some(
+            raw_factored
+                .weighted_covariance_trace(&weight, VarianceMethod::Exact)
+                .map(TraceEstimate::from)
+                .map_err(|err| err.to_string())?,
+        )
     } else {
         None
     };
-    let raw_hutchinson = estimate_hutchinson_weighted_covariance_trace(
-        &raw_factor,
-        &weight,
-        probe_config(config, row_seed),
-        ProbeDistribution::Rademacher,
-    )
-    .map_err(|err| err.to_string())?;
+    let raw_hutchinson = raw_factored
+        .weighted_covariance_trace(&weight, hutchinson_method(config, row_seed)?)
+        .map(TraceEstimate::from)
+        .map_err(|err| err.to_string())?;
 
     let raw_trace_for_normalization = raw_exact
         .as_ref()
@@ -319,26 +339,25 @@ fn compute_sparse_weight_row(
         domain_measure,
     )?;
     let normalized_precision = normalization.scale_precision(raw_precision);
-    let (_normalized_q, normalized_factor) = factorize(&normalized_precision)?;
+    let normalized_prior = root_prior(&normalized_precision)?;
+    let normalized_factored = normalized_prior.factor().map_err(|err| err.to_string())?;
     let normalized_exact = if raw_exact.is_some() {
         Some(
-            exact_weighted_covariance_trace(&normalized_factor, &weight)
+            normalized_factored
+                .weighted_covariance_trace(&weight, VarianceMethod::Exact)
+                .map(TraceEstimate::from)
                 .map_err(|err| err.to_string())?,
         )
     } else {
         None
     };
-    let normalized_hutchinson = estimate_hutchinson_weighted_covariance_trace(
-        &normalized_factor,
-        &weight,
-        probe_config(config, row_seed),
-        ProbeDistribution::Rademacher,
-    )
-    .map_err(|err| err.to_string())?;
+    let normalized_hutchinson = normalized_factored
+        .weighted_covariance_trace(&weight, hutchinson_method(config, row_seed)?)
+        .map(TraceEstimate::from)
+        .map_err(|err| err.to_string())?;
 
     let raw_marginal_stats = sparse_marginal_stats(
-        &raw_q,
-        &raw_factor,
+        &mut raw_factored,
         raw_exact.is_some(),
         config,
         row_seed.wrapping_add(1),
@@ -348,8 +367,8 @@ fn compute_sparse_weight_row(
         level,
         alpha,
         kappa,
-        raw_factor.dimension(),
-        raw_factor.dimension(),
+        raw_precision.nrows(),
+        raw_precision.nrows(),
         domain_measure,
         raw_exact,
         raw_hutchinson,
@@ -371,27 +390,34 @@ fn compute_transformed_weight_row(
     kappa: f64,
     domain_measure: f64,
     raw_precision: &FeecCsr,
-    operator: &SparseRowOperator,
-    output_weights: &GmrfVector,
+    operator: &LinearMap,
+    output_weights: &[f64],
 ) -> Result<MaternTraceNormalizationRow, String> {
-    let (raw_q, raw_factor) = factorize(raw_precision)?;
+    let raw_prior = root_prior(raw_precision)?;
+    let mut raw_factored = raw_prior.factor().map_err(|err| err.to_string())?;
     let row_seed = row_seed(config.rng_seed, stage, level, alpha);
-    let raw_exact = if raw_factor.dimension() <= config.exact_max_dofs {
+    let raw_exact = if raw_precision.nrows() <= config.exact_max_dofs {
         Some(
-            exact_weighted_transformed_covariance_trace(&raw_factor, operator, output_weights)
+            raw_factored
+                .pushforward_weighted_variance_estimate(
+                    operator,
+                    output_weights,
+                    VarianceMethod::Exact,
+                )
+                .map(TraceEstimate::from)
                 .map_err(|err| err.to_string())?,
         )
     } else {
         None
     };
-    let raw_hutchinson = estimate_hutchinson_weighted_transformed_covariance_trace(
-        &raw_factor,
-        operator,
-        output_weights,
-        probe_config(config, row_seed),
-        ProbeDistribution::Rademacher,
-    )
-    .map_err(|err| err.to_string())?;
+    let raw_hutchinson = raw_factored
+        .pushforward_weighted_variance_estimate(
+            operator,
+            output_weights,
+            hutchinson_method(config, row_seed)?,
+        )
+        .map(TraceEstimate::from)
+        .map_err(|err| err.to_string())?;
 
     let raw_trace_for_normalization = raw_exact
         .as_ref()
@@ -402,31 +428,33 @@ fn compute_transformed_weight_row(
         domain_measure,
     )?;
     let normalized_precision = normalization.scale_precision(raw_precision);
-    let (_normalized_q, normalized_factor) = factorize(&normalized_precision)?;
+    let normalized_prior = root_prior(&normalized_precision)?;
+    let mut normalized_factored = normalized_prior.factor().map_err(|err| err.to_string())?;
     let normalized_exact = if raw_exact.is_some() {
         Some(
-            exact_weighted_transformed_covariance_trace(
-                &normalized_factor,
-                operator,
-                output_weights,
-            )
-            .map_err(|err| err.to_string())?,
+            normalized_factored
+                .pushforward_weighted_variance_estimate(
+                    operator,
+                    output_weights,
+                    VarianceMethod::Exact,
+                )
+                .map(TraceEstimate::from)
+                .map_err(|err| err.to_string())?,
         )
     } else {
         None
     };
-    let normalized_hutchinson = estimate_hutchinson_weighted_transformed_covariance_trace(
-        &normalized_factor,
-        operator,
-        output_weights,
-        probe_config(config, row_seed),
-        ProbeDistribution::Rademacher,
-    )
-    .map_err(|err| err.to_string())?;
+    let normalized_hutchinson = normalized_factored
+        .pushforward_weighted_variance_estimate(
+            operator,
+            output_weights,
+            hutchinson_method(config, row_seed)?,
+        )
+        .map(TraceEstimate::from)
+        .map_err(|err| err.to_string())?;
 
     let raw_marginal_stats = transformed_marginal_stats(
-        &raw_q,
-        &raw_factor,
+        &mut raw_factored,
         operator,
         raw_exact.is_some(),
         config,
@@ -437,8 +465,8 @@ fn compute_transformed_weight_row(
         level,
         alpha,
         kappa,
-        raw_factor.dimension(),
-        operator.nrows(),
+        raw_precision.nrows(),
+        operator.output_dimension(),
         domain_measure,
         raw_exact,
         raw_hutchinson,
@@ -460,11 +488,11 @@ fn finish_row(
     ndofs: usize,
     output_dim: usize,
     domain_measure: f64,
-    raw_exact: Option<gmrf_core::WeightedTraceEstimate>,
-    raw_hutchinson: gmrf_core::WeightedTraceEstimate,
+    raw_exact: Option<TraceEstimate>,
+    raw_hutchinson: TraceEstimate,
     normalization: TraceNormalization,
-    normalized_exact: Option<gmrf_core::WeightedTraceEstimate>,
-    normalized_hutchinson: gmrf_core::WeightedTraceEstimate,
+    normalized_exact: Option<TraceEstimate>,
+    normalized_hutchinson: TraceEstimate,
     raw_marginal_stats: VarianceStats,
 ) -> Result<MaternTraceNormalizationRow, String> {
     let normalized_marginal_stats = raw_marginal_stats.scaled(1.0 / normalization.precision_scale);
@@ -502,78 +530,60 @@ fn finish_row(
     })
 }
 
-fn factorize(precision: &FeecCsr) -> Result<(GmrfSparse, SparseCholeskyFactor), String> {
-    let q = feec_csr_to_gmrf(precision);
-    let factor = q
-        .cholesky_sqrt_lower()
-        .map_err(|err| format!("precision factorization failed: {err}"))?;
-    Ok((q, factor))
-}
-
 fn sparse_marginal_stats(
-    precision: &GmrfSparse,
-    factor: &SparseCholeskyFactor,
+    prior: &mut FactoredGaussianPrior,
     use_exact: bool,
     config: &MaternTraceNormalizationConfig,
     seed: u64,
 ) -> Result<VarianceStats, String> {
     let variances = if use_exact {
-        exact_solve_diag(factor)
+        prior
+            .latent_variance_estimate(VarianceMethod::Exact)
             .map_err(|err| err.to_string())?
             .values
     } else {
-        let mut gmrf =
-            Gmrf::from_mean_and_precision(GmrfVector::zeros(precision.nrows()), precision.clone())
-                .map_err(|err| err.to_string())?;
-        estimate_hutchinson_variances(
-            &mut gmrf,
-            config.hutchinson_probes,
-            config.hutchinson_batches,
-            seed,
-            ProbeDistribution::Rademacher,
-        )
-        .map_err(|err| err.to_string())?
-        .values
+        prior
+            .latent_variance_estimate(hutchinson_method(config, seed)?)
+            .map_err(|err| err.to_string())?
+            .values
     };
-    VarianceStats::from_slice(variances.as_slice())
+    VarianceStats::from_slice(&variances)
 }
 
 fn transformed_marginal_stats(
-    precision: &GmrfSparse,
-    factor: &SparseCholeskyFactor,
-    operator: &SparseRowOperator,
+    prior: &mut FactoredGaussianPrior,
+    operator: &LinearMap,
     use_exact: bool,
     config: &MaternTraceNormalizationConfig,
     seed: u64,
 ) -> Result<VarianceStats, String> {
     let variances = if use_exact {
-        exact_solve_transformed_diag(factor, operator)
+        prior
+            .pushforward_variance_estimate(operator, VarianceMethod::Exact)
             .map_err(|err| err.to_string())?
             .values
     } else {
-        let mut gmrf =
-            Gmrf::from_mean_and_precision(GmrfVector::zeros(precision.nrows()), precision.clone())
-                .map_err(|err| err.to_string())?;
-        estimate_hutchinson_transformed_variances(
-            &mut gmrf,
-            operator,
-            config.hutchinson_probes,
-            config.hutchinson_batches,
-            seed,
-            ProbeDistribution::Rademacher,
-        )
-        .map_err(|err| err.to_string())?
-        .values
+        prior
+            .pushforward_variance_estimate(operator, hutchinson_method(config, seed)?)
+            .map_err(|err| err.to_string())?
+            .values
     };
-    VarianceStats::from_slice(variances.as_slice())
+    VarianceStats::from_slice(&variances)
 }
 
-fn probe_config(config: &MaternTraceNormalizationConfig, rng_seed: u64) -> ProbeBatchConfig {
-    ProbeBatchConfig {
-        num_probes: config.hutchinson_probes,
-        batch_count: config.hutchinson_batches,
-        rng_seed,
-    }
+fn hutchinson_method(
+    config: &MaternTraceNormalizationConfig,
+    rng_seed: u64,
+) -> Result<VarianceMethod, String> {
+    Ok(VarianceMethod::Hutchinson(
+        HutchinsonVarianceConfig::new(
+            config.hutchinson_probes,
+            config.hutchinson_batches,
+            rng_seed,
+        )
+        .map_err(|err| err.to_string())?
+        .distribution(ProbeDistribution::Rademacher),
+    ))
 }
 
 fn row_seed(base: u64, stage: MaternTraceStage, level: usize, alpha: MaternAlpha) -> u64 {
@@ -582,10 +592,18 @@ fn row_seed(base: u64, stage: MaternTraceStage, level: usize, alpha: MaternAlpha
         .wrapping_add(alpha.as_u32() as u64)
 }
 
+fn root_prior(precision: &FeecCsr) -> Result<GaussianPrior, String> {
+    GaussianPrior::new(
+        vec![0.0; precision.nrows()],
+        sparse_mat_from_feec_csr(precision),
+    )
+    .map_err(|err| format!("failed to build root Gaussian prior: {err}"))
+}
+
 fn stacked_reconstruction_operator(
     topology: &Complex,
     reconstruction: &feg_infer::prior::matern::one_form::ReconstructedBarycenterFieldOperator,
-) -> Result<SparseRowOperator, String> {
+) -> Result<LinearMap, String> {
     let mut rows =
         Vec::with_capacity(reconstruction.component_count() * reconstruction.cell_count());
     for component_index in 0..reconstruction.component_count() {
@@ -594,14 +612,13 @@ fn stacked_reconstruction_operator(
             .ok_or_else(|| format!("missing reconstructed component {component_index}"))?;
         rows.extend(component_rows.iter().cloned());
     }
-    SparseRowOperator::new(topology.edges().len(), rows).map_err(|err| err.to_string())
+    LinearMap::weighted_rows(topology.edges().len(), &rows).map_err(|err| err.to_string())
 }
 
-fn stacked_component_cell_weights(ambient_dim: usize, cell_volumes: &[f64]) -> GmrfVector {
-    GmrfVector::from_iterator(
-        ambient_dim * cell_volumes.len(),
-        (0..ambient_dim).flat_map(|_| cell_volumes.iter().copied()),
-    )
+fn stacked_component_cell_weights(ambient_dim: usize, cell_volumes: &[f64]) -> Vec<f64> {
+    (0..ambient_dim)
+        .flat_map(|_| cell_volumes.iter().copied())
+        .collect()
 }
 
 fn cell_volumes(topology: &Complex, coords: &MeshCoords) -> Result<Vec<f64>, String> {
@@ -620,51 +637,102 @@ fn cell_volumes(topology: &Complex, coords: &MeshCoords) -> Result<Vec<f64>, Str
 }
 
 fn write_summary_csv(report: &MaternTraceNormalizationReport, path: &Path) -> io::Result<()> {
-    let mut writer = BufWriter::new(File::create(path)?);
-    writeln!(
-        writer,
-        "stage,level,alpha,kappa,ndofs,output_dim,domain_measure,normalization_source,raw_exact_trace,raw_exact_mean_trace_variance,raw_hutchinson_trace,raw_hutchinson_relative_standard_error,tau_multiplier,precision_scale,normalized_exact_trace,normalized_exact_mean_trace_variance,normalized_hutchinson_trace,normalized_hutchinson_mean_trace_variance,normalized_hutchinson_relative_standard_error,raw_variance_min,raw_variance_mean,raw_variance_median,raw_variance_max,normalized_variance_min,normalized_variance_mean,normalized_variance_median,normalized_variance_max"
-    )?;
+    let mut table = ReportTable::new(
+        "summary",
+        [
+            "stage",
+            "level",
+            "alpha",
+            "kappa",
+            "ndofs",
+            "output_dim",
+            "domain_measure",
+            "normalization_source",
+            "variance_estimator",
+            "hutchinson_probes",
+            "hutchinson_batches",
+            "rng_seed",
+            "exact_max_dofs",
+            "raw_exact_trace",
+            "raw_exact_mean_trace_variance",
+            "raw_hutchinson_trace",
+            "raw_hutchinson_relative_standard_error",
+            "tau_multiplier",
+            "precision_scale",
+            "normalized_exact_trace",
+            "normalized_exact_mean_trace_variance",
+            "normalized_hutchinson_trace",
+            "normalized_hutchinson_mean_trace_variance",
+            "normalized_hutchinson_relative_standard_error",
+            "raw_variance_min",
+            "raw_variance_mean",
+            "raw_variance_median",
+            "raw_variance_max",
+            "normalized_variance_min",
+            "normalized_variance_mean",
+            "normalized_variance_median",
+            "normalized_variance_max",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    )
+    .map_err(report_io)?;
     for row in &report.rows {
-        writeln!(
-            writer,
-            "{},{},{},{:.16e},{},{},{:.16e},{},{},{},{:.16e},{},{:.16e},{:.16e},{},{},{:.16e},{:.16e},{},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e},{:.16e}",
-            row.stage.label(),
-            row.level,
-            row.alpha.as_u32(),
-            row.kappa,
-            row.ndofs,
-            row.output_dim,
-            row.domain_measure,
-            row.normalization_source,
-            optional_f64(row.raw_exact_trace),
-            optional_f64(row.raw_exact_mean_trace_variance),
-            row.raw_hutchinson_trace,
-            optional_f64(row.raw_hutchinson_relative_standard_error),
-            row.tau_multiplier,
-            row.precision_scale,
-            optional_f64(row.normalized_exact_trace),
-            optional_f64(row.normalized_exact_mean_trace_variance),
-            row.normalized_hutchinson_trace,
-            row.normalized_hutchinson_mean_trace_variance,
-            optional_f64(row.normalized_hutchinson_relative_standard_error),
-            row.raw_marginal_stats.min,
-            row.raw_marginal_stats.mean,
-            row.raw_marginal_stats.median,
-            row.raw_marginal_stats.max,
-            row.normalized_marginal_stats.min,
-            row.normalized_marginal_stats.mean,
-            row.normalized_marginal_stats.median,
-            row.normalized_marginal_stats.max
-        )?;
+        table
+            .push_row(vec![
+                ReportCell::Text(row.stage.label().to_string()),
+                integer(row.level)?,
+                ReportCell::Integer(i64::from(row.alpha.as_u32())),
+                ReportCell::Float(row.kappa),
+                integer(row.ndofs)?,
+                integer(row.output_dim)?,
+                ReportCell::Float(row.domain_measure),
+                ReportCell::Text(row.normalization_source.clone()),
+                ReportCell::Text("hutchinson".to_string()),
+                integer(report.config.hutchinson_probes)?,
+                integer(report.config.hutchinson_batches)?,
+                ReportCell::Text(report.config.rng_seed.to_string()),
+                integer(report.config.exact_max_dofs)?,
+                optional_cell(row.raw_exact_trace),
+                optional_cell(row.raw_exact_mean_trace_variance),
+                ReportCell::Float(row.raw_hutchinson_trace),
+                optional_cell(row.raw_hutchinson_relative_standard_error),
+                ReportCell::Float(row.tau_multiplier),
+                ReportCell::Float(row.precision_scale),
+                optional_cell(row.normalized_exact_trace),
+                optional_cell(row.normalized_exact_mean_trace_variance),
+                ReportCell::Float(row.normalized_hutchinson_trace),
+                ReportCell::Float(row.normalized_hutchinson_mean_trace_variance),
+                optional_cell(row.normalized_hutchinson_relative_standard_error),
+                ReportCell::Float(row.raw_marginal_stats.min),
+                ReportCell::Float(row.raw_marginal_stats.mean),
+                ReportCell::Float(row.raw_marginal_stats.median),
+                ReportCell::Float(row.raw_marginal_stats.max),
+                ReportCell::Float(row.normalized_marginal_stats.min),
+                ReportCell::Float(row.normalized_marginal_stats.mean),
+                ReportCell::Float(row.normalized_marginal_stats.median),
+                ReportCell::Float(row.normalized_marginal_stats.max),
+            ])
+            .map_err(report_io)?;
     }
-    writer.flush()
+    write_csv(path, &table).map_err(report_io)
 }
 
-fn optional_f64(value: Option<f64>) -> String {
-    value
-        .map(|value| format!("{value:.16e}"))
-        .unwrap_or_default()
+fn optional_cell(value: Option<f64>) -> ReportCell {
+    value.map(ReportCell::Float).unwrap_or(ReportCell::Missing)
+}
+
+fn integer(value: usize) -> io::Result<ReportCell> {
+    i64::try_from(value)
+        .map(ReportCell::Integer)
+        .map_err(|_| io::Error::other("integer exceeds report-table range"))
+}
+
+fn report_io(error: feec_gmrf::FeecGmrfError) -> io::Error {
+    match error {
+        feec_gmrf::FeecGmrfError::Io(error) => error,
+        error => io::Error::other(error),
+    }
 }
 
 #[cfg(test)]
@@ -699,5 +767,14 @@ mod tests {
             assert!(row.tau_multiplier.is_finite() && row.tau_multiplier > 0.0);
             assert!(row.normalized_marginal_stats.mean.is_finite());
         }
+
+        let out_dir =
+            std::env::temp_dir().join(format!("matern_trace_report_table_{}", std::process::id()));
+        write_matern_trace_normalization_outputs(&report, &out_dir)
+            .expect("report table should write");
+        let csv = fs::read_to_string(out_dir.join("summary.csv")).expect("summary CSV");
+        assert!(csv.starts_with("stage,level,alpha,kappa,ndofs,output_dim"));
+        assert!(csv.contains("variance_estimator,hutchinson_probes,hutchinson_batches,rng_seed"));
+        let _ = fs::remove_dir_all(out_dir);
     }
 }

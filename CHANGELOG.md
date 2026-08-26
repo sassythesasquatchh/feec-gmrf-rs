@@ -22,8 +22,21 @@ tolerances or reference data.
   publication profiles.
 - Centralized physical-RMS calibration through generic transformed GMRF
   covariance actions.
+- Added cached prior factors, reusable prepared linear-Gaussian designs,
+  heteroscedastic observation rows, exact/Hutchinson/automatic variance
+  policies, weighted covariance traces, and factorization diagnostics to the
+  root API.
+- Added a root sparse one-form Hodge façade and canonical predictive diagnostics,
+  then migrated seven state-only publication workflows away from direct generic
+  GMRF orchestration. Mixed state/source and nonlinear workflows remain
+  explicitly out of scope for this migration wave.
 - Exposed exact covariance pushforwards for named derived quantities through
   the supported `Posterior` API, including hard-constraint corrections.
+- Added the first-class `feec_gmrf::report` façade for validated posterior
+  fields, exact QoI covariance/correlation, predictive diagnostics, scalar
+  metrics, deterministic console summaries, typed CSV tables, and cochain or
+  top-cell VTU bundles. Both introductory examples and the first two reporting
+  pilot studies use the new artifact APIs.
 - Added top-level homogeneous and prescribed essential-boundary elimination.
   FEEC Matérn operators are reduced before the mass-inverse recurrence, fixed
   values are folded into all linear and nonlinear model terms, and posterior
@@ -32,6 +45,10 @@ tolerances or reference data.
 - Removed tracked generated solver products and observation caches.
 - Removed byte-identical duplicate torus and toroidal-inductor meshes while
   retaining the canonical filenames and unchanged mesh hashes.
+- Added a clean recursive-clone installation contract for Apple Silicon macOS
+  and Ubuntu 24.04. The documented core path builds pinned repository-local
+  PETSc/MUMPS/SLEPc releases, validates selection precedence and failure modes,
+  and keeps NGSolve confined to optional publication-reference checks.
 
 ### Numerical corrections requiring release review
 

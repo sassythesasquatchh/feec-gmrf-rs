@@ -19,10 +19,11 @@
 
 use feec_gmrf::prelude::*;
 use manifold::gen::cartesian::CartesianMeshInfo;
-use std::f64::consts::PI;
+use std::{f64::consts::PI, fs, path::Path};
 
 const PRIOR_FIELD_RMS_TARGET: f64 = 1.0;
 const SENSOR_STANDARD_DEVIATION: f64 = 0.05;
+const OUTPUT_ROOT: &str = "out/examples/minimal_0form";
 
 fn main() -> Result<()> {
     // A 0-form cochain has one coefficient per vertex.
@@ -88,110 +89,141 @@ fn main() -> Result<()> {
         .condition()?;
     let mc = VarianceMethod::MonteCarlo(MonteCarloVarianceConfig::new(1024, 8, 42)?);
 
-    let sensor_predictions = posterior.pushforward_mean(&sensor_map)?;
-    println!("2D 0-form Matérn workflow");
-    println!("  vertices: {}", posterior.mean().len());
-    println!(
-        "  prior scalar-field RMS calibration: {:.6} -> {:.6}, precision scale {:.6e}",
-        calibration.uncalibrated_rms, calibration.target_rms, calibration.precision_scale,
-    );
-    let sensor_posterior_variances = posterior
-        .pushforward_variance_estimate(&sensor_map, VarianceMethod::Exact)?
-        .values;
-    for (index, (((point, observed), predicted), (prior_variance, posterior_variance))) in
-        sensor_points
-            .iter()
-            .zip(sensor_values.iter())
-            .zip(sensor_predictions.iter())
-            .zip(
-                prior_sensor_variances
-                    .iter()
-                    .zip(&sensor_posterior_variances),
-            )
-            .enumerate()
-    {
-        println!(
-            "  sensor {index}: ({:.2}, {:.2}) observed={observed:+.6} posterior={predicted:+.6} residual={:+.3} noise SD, prior/posterior SD={:.6}/{:.6}",
-            point.0,
-            point.1,
-            (predicted - observed) / SENSOR_STANDARD_DEVIATION,
-            prior_variance.max(0.0).sqrt(),
-            posterior_variance.max(0.0).sqrt(),
-        );
-    }
-
-    let transect_mean = posterior.derived_mean("y=0.5 transect")?;
-    let transect_exact =
-        posterior.derived_variance_estimate("y=0.5 transect", VarianceMethod::Exact)?;
-    let transect_mc = posterior.derived_variance_estimate("y=0.5 transect", mc)?;
     let transect_truth = transect
         .iter()
         .map(|(_, x)| truth(*x, 0.5))
         .collect::<Vec<_>>();
-    let transect_rmse = mean_squared_error(&transect_mean, &transect_truth).sqrt();
-    let transect_coverage = coverage_fraction(
-        &transect_mean,
-        &transect_exact.values,
-        &transect_truth,
-        1.96,
-    );
-    println!(
-        "  transect: {} points, mean range [{:+.6}, {:+.6}], truth RMSE {:.6}, pointwise 95% coverage {:.1}%, max MC relative SE {:.3}",
-        transect_mean.len(),
-        transect_mean.iter().copied().fold(f64::INFINITY, f64::min),
-        transect_mean
-            .iter()
-            .copied()
-            .fold(f64::NEG_INFINITY, f64::max),
-        transect_rmse,
-        100.0 * transect_coverage,
-        transect_mc
-            .relative_standard_error
-            .as_ref()
-            .expect("eight batches provide standard errors")
-            .iter()
-            .copied()
-            .fold(0.0, f64::max),
-    );
-    println!(
-        "  transect exact/MC variance relative L2 error: {:.4}",
-        relative_l2(&transect_mc.values, &transect_exact.values)
-    );
-
-    let query_mean = posterior.pushforward_mean(&query_map)?[0];
-    let query_exact = posterior
-        .pushforward_variance_estimate(&query_map, VarianceMethod::Exact)?
-        .values[0];
-    let query_mc = posterior.pushforward_variance_estimate(&query_map, mc)?;
-    println!(
-        "  ad hoc query (0.375, 0.625): truth={:+.6}, mean={:+.6}, truth z={:+.3}, prior/posterior std={:.6}/{:.6}, MC std={:.6} ± variance SE {:.3e}",
-        2.0_f64.sqrt() / 4.0,
-        query_mean,
-        (query_mean - 2.0_f64.sqrt() / 4.0) / query_exact.sqrt(),
-        prior_query_variance.sqrt(),
-        query_exact.sqrt(),
-        query_mc.values[0].sqrt(),
-        query_mc.batch_standard_error.as_ref().unwrap()[0],
-    );
-
-    let exact = posterior.latent_variance_estimate(VarianceMethod::Exact)?;
-    let estimated = posterior.latent_variance_estimate(mc)?;
-    let latent_mc_error = relative_l2(&estimated.values, &exact.values);
-    println!(
-        "  all-coefficient exact/MC variance relative L2 error: {:.4} ({} samples in {:?})",
-        latent_mc_error, estimated.sample_count, estimated.batch_sizes,
-    );
-    let sensor_max_residual = sensor_predictions
+    let query_truth = 2.0_f64.sqrt() / 4.0;
+    let full_truth = coords
+        .coord_iter()
+        .map(|point| truth(point[0], point[1]))
+        .collect::<Vec<_>>();
+    let sensor_labels = sensor_points
         .iter()
-        .zip(&sensor_values)
-        .map(|(predicted, observed)| ((predicted - observed) / SENSOR_STANDARD_DEVIATION).abs())
+        .enumerate()
+        .map(|(index, _)| format!("sensor_{index}"))
+        .collect::<Vec<_>>();
+    let mut report = PosteriorReportBuilder::new(&mut posterior)
+        .field(
+            FieldRequest::mapped(
+                "sensors",
+                "Observed sensor coefficients",
+                sensor_map.clone(),
+            )
+            .unit("field units")
+            .truth(sensor_values.clone())
+            .baseline_variances(prior_sensor_variances.clone()),
+        )
+        .prediction(PredictionRequest::mapped(
+            "sensor_predictions",
+            "Sensor posterior predictions",
+            sensor_map,
+            sensor_labels,
+            sensor_values.clone(),
+            vec![SENSOR_STANDARD_DEVIATION.powi(2); sensor_values.len()],
+        ))
+        .field(
+            FieldRequest::derived(
+                "transect_exact",
+                "y=0.5 transect (exact variance)",
+                "y=0.5 transect",
+            )
+            .truth(transect_truth),
+        )
+        .field(
+            FieldRequest::derived(
+                "transect_mc",
+                "y=0.5 transect (Monte Carlo variance)",
+                "y=0.5 transect",
+            )
+            .variance_method(mc),
+        )
+        .field(
+            FieldRequest::mapped("query_exact", "Ad hoc query", query_map.clone())
+                .truth(vec![query_truth])
+                .baseline_variances(vec![prior_query_variance]),
+        )
+        .field(
+            FieldRequest::mapped("query_mc", "Ad hoc query (Monte Carlo)", query_map)
+                .variance_method(mc),
+        )
+        .field(FieldRequest::latent("latent_exact", "All coefficients").truth(full_truth))
+        .field(
+            FieldRequest::latent("latent_mc", "All coefficients (Monte Carlo)").variance_method(mc),
+        )
+        .include_factorization_diagnostics(true)
+        .build()?;
+
+    let sensor = report.field("sensors").expect("requested field");
+    let transect_exact = report.field("transect_exact").expect("requested field");
+    let transect_mc = report.field("transect_mc").expect("requested field");
+    let query = report.field("query_exact").expect("requested field");
+    let latent_exact = report.field("latent_exact").expect("requested field");
+    let latent_mc = report.field("latent_mc").expect("requested field");
+    let sensor_max_residual = sensor
+        .errors
+        .as_ref()
+        .expect("sensor truth supplied")
+        .iter()
+        .map(|error| (error / SENSOR_STANDARD_DEVIATION).abs())
         .fold(0.0, f64::max);
-    let sensor_min_variance_reduction = prior_sensor_variances
+    let sensor_min_variance_reduction = sensor
+        .variance_reductions
+        .as_ref()
+        .expect("sensor baseline supplied")
         .iter()
-        .zip(&sensor_posterior_variances)
-        .map(|(prior, posterior)| 1.0 - posterior / prior)
+        .flatten()
+        .copied()
         .fold(1.0, f64::min);
-    let query_truth_z = (query_mean - 2.0_f64.sqrt() / 4.0).abs() / query_exact.max(0.0).sqrt();
+    let query_truth_z = query.z_scores.as_ref().unwrap()[0].unwrap().abs();
+    let transect_rmse = transect_exact
+        .truth_rmse()
+        .expect("transect truth supplied");
+    let transect_coverage = transect_exact
+        .truth_coverage(1.96)
+        .expect("transect truth supplied");
+    let transect_mc_error = relative_l2(
+        &transect_mc.variance.values,
+        &transect_exact.variance.values,
+    );
+    let latent_mc_error = relative_l2(&latent_mc.variance.values, &latent_exact.variance.values);
+
+    report.push_metric(ReportMetric::new(
+        "transect_rmse",
+        "Transect truth RMSE",
+        transect_rmse,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "transect_coverage",
+        "Transect pointwise 95% coverage",
+        transect_coverage,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "transect_mc_relative_l2",
+        "Transect exact/MC variance relative L2 error",
+        transect_mc_error,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "latent_mc_relative_l2",
+        "All-coefficient exact/MC variance relative L2 error",
+        latent_mc_error,
+    ))?;
+    report.push_metric(ReportMetric::new(
+        "prior_rms_precision_scale",
+        "Prior RMS calibration precision scale",
+        calibration.precision_scale,
+    ))?;
+
+    println!("2D 0-form Matérn workflow");
+    println!(
+        "  prior scalar-field RMS calibration: {:.6} -> {:.6}",
+        calibration.uncalibrated_rms, calibration.target_rms
+    );
+    write_console_report(
+        &mut std::io::stdout(),
+        &report,
+        &ConsoleReportOptions::default(),
+    )?;
     validate_exemplar_outcomes(
         sensor_max_residual,
         sensor_min_variance_reduction,
@@ -199,9 +231,32 @@ fn main() -> Result<()> {
         transect_coverage,
         latent_mc_error,
     )?;
-    println!(
-        "  exemplar checks: PASS (sensor assimilation, uncertainty reduction, truth coverage, exact/MC agreement)"
-    );
+    println!("exemplar checks: PASS (sensor assimilation, uncertainty reduction, truth coverage, exact/MC agreement)");
+
+    let output_root = Path::new(OUTPUT_ROOT);
+    fs::create_dir_all(output_root)?;
+    write_csv_directory(output_root, &report.tables()?)?;
+    write_minimal_tables(output_root, &report, &sensor_points, &transect)?;
+    let mut vtu = CochainVtuBuilder::new(0);
+    vtu.add_field_report("posterior", report.field("latent_exact").unwrap())?
+        .add_values(
+            "truth",
+            report.field("latent_exact").unwrap().truth.clone().unwrap(),
+        )?
+        .add_values(
+            "posterior_variance_mc",
+            report.field("latent_mc").unwrap().variance.values.clone(),
+        )?
+        .add_values(
+            "posterior_standard_deviation_mc",
+            report
+                .field("latent_mc")
+                .unwrap()
+                .standard_deviations
+                .clone(),
+        )?;
+    vtu.write(output_root.join("posterior_0form.vtu"), &coords, &topology)?;
+    println!("wrote reporting artifacts under {}", output_root.display());
     Ok(())
 }
 
@@ -235,22 +290,166 @@ fn relative_l2(estimate: &[f64], exact: &[f64]) -> f64 {
     numerator / denominator
 }
 
-fn mean_squared_error(estimate: &[f64], truth: &[f64]) -> f64 {
-    estimate
-        .iter()
-        .zip(truth)
-        .map(|(estimate, truth)| (estimate - truth).powi(2))
-        .sum::<f64>()
-        / estimate.len() as f64
+fn write_minimal_tables(
+    output_root: &Path,
+    report: &PosteriorReport,
+    sensor_points: &[(f64, f64)],
+    transect_points: &[(usize, f64)],
+) -> Result<()> {
+    let sensors = report.field("sensors").expect("requested field");
+    let mut sensor_table = ReportTable::new(
+        "sensors",
+        [
+            "index",
+            "x",
+            "y",
+            "observed",
+            "posterior_mean",
+            "posterior_variance",
+            "posterior_standard_deviation",
+            "noise_standardized_residual",
+            "prior_variance",
+            "variance_reduction",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    )?;
+    for (index, point) in sensor_points.iter().enumerate() {
+        sensor_table.push_row(vec![
+            ReportCell::Integer(index as i64),
+            ReportCell::Float(point.0),
+            ReportCell::Float(point.1),
+            ReportCell::Float(sensors.truth.as_ref().unwrap()[index]),
+            ReportCell::Float(sensors.mean[index]),
+            ReportCell::Float(sensors.variance.values[index]),
+            ReportCell::Float(sensors.standard_deviations[index]),
+            ReportCell::Float(sensors.errors.as_ref().unwrap()[index] / SENSOR_STANDARD_DEVIATION),
+            ReportCell::Float(sensors.baseline_variances.as_ref().unwrap()[index]),
+            optional_cell(sensors.variance_reductions.as_ref().unwrap()[index]),
+        ])?;
+    }
+    write_csv(output_root.join("sensors.csv"), &sensor_table)?;
+
+    let exact = report.field("transect_exact").expect("requested field");
+    let mc = report.field("transect_mc").expect("requested field");
+    let mut transect_table = ReportTable::new(
+        "transect",
+        [
+            "index",
+            "x",
+            "truth",
+            "posterior_mean",
+            "exact_variance",
+            "exact_standard_deviation",
+            "truth_z_score",
+            "mc_variance",
+            "mc_standard_deviation",
+            "mc_relative_standard_error",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    )?;
+    for (index, (_, x)) in transect_points.iter().enumerate() {
+        transect_table.push_row(vec![
+            ReportCell::Integer(index as i64),
+            ReportCell::Float(*x),
+            ReportCell::Float(exact.truth.as_ref().unwrap()[index]),
+            ReportCell::Float(exact.mean[index]),
+            ReportCell::Float(exact.variance.values[index]),
+            ReportCell::Float(exact.standard_deviations[index]),
+            optional_cell(exact.z_scores.as_ref().unwrap()[index]),
+            ReportCell::Float(mc.variance.values[index]),
+            ReportCell::Float(mc.standard_deviations[index]),
+            mc.variance
+                .relative_standard_error
+                .as_ref()
+                .map(|values| ReportCell::Float(values[index]))
+                .unwrap_or(ReportCell::Missing),
+        ])?;
+    }
+    write_csv(output_root.join("transect.csv"), &transect_table)?;
+
+    let exact = report.field("query_exact").expect("requested field");
+    let mc = report.field("query_mc").expect("requested field");
+    let mut query_table = ReportTable::new(
+        "query",
+        [
+            "x",
+            "y",
+            "truth",
+            "posterior_mean",
+            "exact_variance",
+            "exact_standard_deviation",
+            "truth_z_score",
+            "prior_variance",
+            "variance_reduction",
+            "mc_variance",
+            "mc_variance_standard_error",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    )?;
+    query_table.push_row(vec![
+        ReportCell::Float(0.375),
+        ReportCell::Float(0.625),
+        ReportCell::Float(exact.truth.as_ref().unwrap()[0]),
+        ReportCell::Float(exact.mean[0]),
+        ReportCell::Float(exact.variance.values[0]),
+        ReportCell::Float(exact.standard_deviations[0]),
+        optional_cell(exact.z_scores.as_ref().unwrap()[0]),
+        ReportCell::Float(exact.baseline_variances.as_ref().unwrap()[0]),
+        optional_cell(exact.variance_reductions.as_ref().unwrap()[0]),
+        ReportCell::Float(mc.variance.values[0]),
+        mc.variance
+            .batch_standard_error
+            .as_ref()
+            .map(|values| ReportCell::Float(values[0]))
+            .unwrap_or(ReportCell::Missing),
+    ])?;
+    write_csv(output_root.join("query.csv"), &query_table)?;
+
+    let exact = report.field("latent_exact").expect("requested field");
+    let mc = report.field("latent_mc").expect("requested field");
+    let mut estimator_table = ReportTable::new(
+        "estimator_comparison",
+        [
+            "index",
+            "exact_variance",
+            "mc_variance",
+            "difference",
+            "mc_batch_standard_error",
+            "mc_relative_standard_error",
+        ]
+        .map(str::to_string)
+        .to_vec(),
+    )?;
+    for index in 0..exact.mean.len() {
+        estimator_table.push_row(vec![
+            ReportCell::Integer(index as i64),
+            ReportCell::Float(exact.variance.values[index]),
+            ReportCell::Float(mc.variance.values[index]),
+            ReportCell::Float(mc.variance.values[index] - exact.variance.values[index]),
+            mc.variance
+                .batch_standard_error
+                .as_ref()
+                .map(|values| ReportCell::Float(values[index]))
+                .unwrap_or(ReportCell::Missing),
+            mc.variance
+                .relative_standard_error
+                .as_ref()
+                .map(|values| ReportCell::Float(values[index]))
+                .unwrap_or(ReportCell::Missing),
+        ])?;
+    }
+    write_csv(
+        output_root.join("estimator_comparison.csv"),
+        &estimator_table,
+    )?;
+    Ok(())
 }
 
-fn coverage_fraction(mean: &[f64], variance: &[f64], truth: &[f64], z: f64) -> f64 {
-    mean.iter()
-        .zip(variance)
-        .zip(truth)
-        .filter(|((mean, variance), truth)| (*mean - **truth).abs() <= z * variance.max(0.0).sqrt())
-        .count() as f64
-        / mean.len() as f64
+fn optional_cell(value: Option<f64>) -> ReportCell {
+    value.map(ReportCell::Float).unwrap_or(ReportCell::Missing)
 }
 
 fn validate_exemplar_outcomes(

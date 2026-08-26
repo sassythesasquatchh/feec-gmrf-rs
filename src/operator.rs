@@ -1,6 +1,7 @@
 //! Backend-neutral sparse operators and FEEC form-operator bundles.
 
 use crate::{FeecGmrfError, Result};
+use common::linalg::nalgebra::CsrMatrix as FeecCsr;
 use feg_core::{SparseTriplet, SparseTripletMatrix};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -19,6 +20,11 @@ impl LinearMap {
     pub fn new(matrix: SparseMat) -> Result<Self> {
         validate_sparse(&matrix)?;
         Ok(Self { matrix })
+    }
+
+    /// Convert a FEEC CSR matrix into the stable backend-neutral map type.
+    pub fn from_feec_csr(matrix: &FeecCsr) -> Result<Self> {
+        Self::new(sparse_mat_from_feec_csr(matrix))
     }
 
     /// Construct an identity map.
@@ -153,6 +159,21 @@ impl LinearMap {
                 .map_err(FeecGmrfError::Dimension)?,
         )
     }
+}
+
+/// Convert a FEEC CSR matrix into the stable backend-neutral sparse type.
+pub fn sparse_mat_from_feec_csr(matrix: &FeecCsr) -> SparseMat {
+    SparseMat::from_triplets(
+        matrix.nrows(),
+        matrix.ncols(),
+        matrix
+            .triplet_iter()
+            .map(|(row, col, value)| SparseTriplet {
+                row,
+                col,
+                value: *value,
+            }),
+    )
 }
 
 /// A validated differential-form degree.

@@ -151,6 +151,33 @@ pub fn scalar_field_l2_rms_weights(topology: &Complex, coords: &MeshCoords) -> R
     )
 }
 
+/// Reconstruct a 1-form cochain as cell-barycenter physical vector components.
+/// Outputs are ordered component-major, with all cells for component zero
+/// followed by all cells for each remaining component.
+pub fn reconstructed_barycenter_1form_map(
+    topology: &Complex,
+    coords: &MeshCoords,
+) -> Result<PhysicalMap> {
+    let reconstruction =
+        feg_infer::prior::matern::one_form::build_reconstructed_barycenter_field_operator(
+            topology, coords,
+        )
+        .map_err(FeecGmrfError::Assembly)?;
+    let mut rows =
+        Vec::with_capacity(reconstruction.component_count() * reconstruction.cell_count());
+    for component in 0..reconstruction.component_count() {
+        rows.extend_from_slice(reconstruction.component_rows(component).ok_or_else(|| {
+            FeecGmrfError::Assembly(format!(
+                "reconstructed 1-form field is missing component {component}"
+            ))
+        })?);
+    }
+    PhysicalMap::new(
+        "reconstructed_1form_field",
+        LinearMap::weighted_rows(topology.edges().len(), &rows)?,
+    )
+}
+
 impl PhysicalMap {
     /// Construct a physical map from an explicit linear operator.
     pub fn new(name: impl Into<String>, map: LinearMap) -> Result<Self> {
@@ -228,6 +255,33 @@ pub fn calibrate_prior_to_physical_rms(
     calibrate_prior_to_weighted_physical_rms(prior, physical_map, &weights, target_rms)
 }
 
+/// Estimator-aware variant of [`calibrate_prior_to_physical_rms`].
+pub fn calibrate_prior_to_physical_rms_with_method(
+    prior: &GaussianPrior,
+    physical_map: &LinearMap,
+    target_rms: f64,
+    method: crate::infer::VarianceMethod,
+) -> Result<(
+    GaussianPrior,
+    PhysicalRmsCalibration,
+    crate::infer::WeightedVarianceEstimate,
+)> {
+    if physical_map.output_dimension() == 0 {
+        return Err(FeecGmrfError::InvalidParameter(
+            "physical RMS calibration requires at least one output".to_string(),
+        ));
+    }
+    let weights =
+        vec![1.0 / physical_map.output_dimension() as f64; physical_map.output_dimension()];
+    calibrate_prior_to_weighted_physical_rms_with_method(
+        prior,
+        physical_map,
+        &weights,
+        target_rms,
+        method,
+    )
+}
+
 /// Scale a prior so `sum_i output_weights[i] * Var((Gx)_i) = target_rms^2`.
 ///
 /// The supplied weight scale is preserved.
@@ -237,6 +291,28 @@ pub fn calibrate_prior_to_weighted_physical_rms(
     output_weights: &[f64],
     target_rms: f64,
 ) -> Result<(GaussianPrior, PhysicalRmsCalibration)> {
+    let (prior, calibration, _) = calibrate_prior_to_weighted_physical_rms_with_method(
+        prior,
+        physical_map,
+        output_weights,
+        target_rms,
+        crate::infer::VarianceMethod::Exact,
+    )?;
+    Ok((prior, calibration))
+}
+
+/// Estimator-aware weighted physical-RMS calibration.
+pub fn calibrate_prior_to_weighted_physical_rms_with_method(
+    prior: &GaussianPrior,
+    physical_map: &LinearMap,
+    output_weights: &[f64],
+    target_rms: f64,
+    method: crate::infer::VarianceMethod,
+) -> Result<(
+    GaussianPrior,
+    PhysicalRmsCalibration,
+    crate::infer::WeightedVarianceEstimate,
+)> {
     if !target_rms.is_finite() || target_rms <= 0.0 {
         return Err(FeecGmrfError::InvalidParameter(
             "target physical RMS must be finite and positive".to_string(),
@@ -264,12 +340,9 @@ pub fn calibrate_prior_to_weighted_physical_rms(
         ));
     }
 
-    let variances = prior.pushforward_variances(physical_map)?;
-    let weighted_variance = variances
-        .iter()
-        .zip(output_weights)
-        .map(|(variance, weight)| variance * weight)
-        .sum::<f64>();
+    let estimate =
+        prior.pushforward_weighted_variance_estimate(physical_map, output_weights, method)?;
+    let weighted_variance = estimate.weighted_trace;
     if !weighted_variance.is_finite() || weighted_variance <= 0.0 {
         return Err(FeecGmrfError::Inference(
             "physical pushforward has zero or non-finite prior variance".to_string(),
@@ -285,6 +358,7 @@ pub fn calibrate_prior_to_weighted_physical_rms(
             target_rms,
             precision_scale,
         },
+        estimate,
     ))
 }
 

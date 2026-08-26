@@ -14,20 +14,16 @@ use crate::{
     },
     de_rham, visual_output,
 };
-use common::linalg::nalgebra::{CooMatrix as FeecCoo, CsrMatrix as FeecCsr, Vector as FeecVector};
+use common::linalg::nalgebra::{CsrMatrix as FeecCsr, Vector as FeecVector};
 use ddf::{cochain::Cochain, whitney::lsf::WhitneyLsf};
 use exterior::field::ExteriorField;
-use feg_infer::{
-    conditioning::linear::{
-        condition_feec_linear_observation_model, feec_observation_matrix,
-        FeecWeightedObservationRow,
-    },
-    prior::hodge::{compute_harmonic_basis_1form, mass_orthonormalize_harmonic_basis_1form},
-    sparse::{feec_vec_to_gmrf, sparse_row_operator_from_feec_csr},
+use feec_gmrf::prelude::{
+    sparse_mat_from_feec_csr, GaussianNoise, GaussianPrior, LinearGaussianModelBuilder, LinearMap,
+    LinearObservation, Posterior, VarianceMethod,
 };
-use gmrf_core::{
-    types::{DenseMatrix as GmrfDenseMatrix, SparseMatrix as GmrfSparseMatrix},
-    Gmrf,
+use feg_infer::{
+    conditioning::linear::{feec_observation_matrix, FeecWeightedObservationRow},
+    prior::hodge::{compute_harmonic_basis_1form, mass_orthonormalize_harmonic_basis_1form},
 };
 use manifold::{
     geometry::{
@@ -687,13 +683,12 @@ struct AnnulusModelCandidate {
     build_seconds: f64,
 }
 
-#[derive(Debug, Clone)]
 struct ConditionedAnnulusModel {
-    latent_to_h: FeecCsr,
-    posterior_precision: GmrfSparseMatrix,
+    latent_to_h: LinearMap,
+    posterior: Posterior,
     posterior_precision_nnz: usize,
     posterior_factor_nnz: usize,
-    latent_mean: FeecVector,
+    posterior_fill_ratio: f64,
     h_mean: FeecVector,
     q_mean: f64,
     q_std: f64,
@@ -767,7 +762,7 @@ pub fn run_annulus_h_formulation(
                 training_for_regime(regime, &noisy_line, &noisy_residual, &noisy_circulation);
             for selected in &selected_models {
                 let conditioning_start = Instant::now();
-                let conditioned =
+                let mut conditioned =
                     condition_model(&selected.model, &training, workspace.topology.nsimplices(1))?;
                 let conditioning_seconds = conditioning_start.elapsed().as_secs_f64();
                 let prediction_start = Instant::now();
@@ -775,12 +770,12 @@ pub fn run_annulus_h_formulation(
                     trial,
                     regime,
                     selected.model.model_kind,
-                    &conditioned,
+                    &mut conditioned,
                     &heldout_observations,
                     workspace.topology.nsimplices(1),
                 )?;
                 let topo_spread =
-                    compute_topo_spread(&conditioned, &workspace.heldout_loop_supports)?;
+                    compute_topo_spread(&mut conditioned, &workspace.heldout_loop_supports)?;
                 let prediction_seconds = prediction_start.elapsed().as_secs_f64();
                 let metric = compute_metric_row(
                     trial,
@@ -934,7 +929,7 @@ pub fn run_annulus_h_mesh_invariance(
                 let training =
                     training_for_regime(regime, &noisy_line, &noisy_residual, &noisy_circulation);
                 let direct_support = direct_support_edges(regime, &noisy_line, &noisy_circulation);
-                let conditioned =
+                let mut conditioned =
                     condition_model(&model, &training, workspace.topology.nsimplices(1))?;
                 let reference_period_observation = AnnulusObservation {
                     kind: AnnulusObservationKind::HeldoutCirculation,
@@ -948,7 +943,7 @@ pub fn run_annulus_h_mesh_invariance(
                     0,
                     regime,
                     model.model_kind,
-                    &conditioned,
+                    &mut conditioned,
                     std::slice::from_ref(&reference_period_observation),
                     workspace.topology.nsimplices(1),
                 )?
@@ -977,7 +972,7 @@ pub fn run_annulus_h_mesh_invariance(
                     0,
                     regime,
                     model.model_kind,
-                    &conditioned,
+                    &mut conditioned,
                     &qoi_observations,
                     workspace.topology.nsimplices(1),
                 )?;
@@ -1478,12 +1473,12 @@ fn select_model(
             validation_train,
             workspace.topology.nsimplices(1),
         )
-        .and_then(|conditioned| {
+        .and_then(|mut conditioned| {
             predict_observables(
                 0,
                 AnnulusRegime::A,
                 candidate.model.model_kind,
-                &conditioned,
+                &mut conditioned,
                 validation_heldout,
                 workspace.topology.nsimplices(1),
             )
@@ -1760,19 +1755,49 @@ fn condition_model(
     observations: &[AnnulusObservation],
     h_dimension: usize,
 ) -> Result<ConditionedAnnulusModel, Box<dyn Error>> {
-    let conditioned = condition_feec_linear_observation_model(
-        &model.prior_precision,
-        &model.latent_to_h,
-        &model.h_offset,
-        &annulus_weighted_observation_rows(observations),
-        h_dimension,
-        VARIANCE_FLOOR,
+    let prior = GaussianPrior::new(
+        vec![0.0; model.latent_dimension()],
+        sparse_mat_from_feec_csr(&model.prior_precision),
     )?;
-    let posterior_precision = conditioned.posterior_precision;
-    let posterior_precision_nnz = conditioned.posterior_precision_nnz;
-    let posterior_factor_nnz = conditioned.posterior_factor_nnz;
-    let latent_mean = conditioned.latent_mean;
-    let h_mean = conditioned.observed_mean;
+    let latent_to_h = LinearMap::from_feec_csr(&model.latent_to_h)?;
+    if latent_to_h.output_dimension() != h_dimension {
+        return Err(invalid_data(format!(
+            "latent-to-H output dimension {} does not match H dimension {h_dimension}",
+            latent_to_h.output_dimension()
+        ))
+        .into());
+    }
+    let h_observation_matrix = observation_matrix(observations, h_dimension, false)?;
+    let h_observation_map = LinearMap::from_feec_csr(&h_observation_matrix)?;
+    let latent_observation_map = h_observation_map.compose(&latent_to_h)?;
+    let h_offset = model.h_offset.iter().copied().collect::<Vec<_>>();
+    let observation_bias = h_observation_map.apply(&h_offset)?;
+    let observation_values = observations
+        .iter()
+        .map(|observation| observation.observed_value)
+        .collect::<Vec<_>>();
+    let observation_variances = observations
+        .iter()
+        .map(|observation| observation.noise_variance.max(VARIANCE_FLOOR))
+        .collect::<Vec<_>>();
+    let mut posterior = LinearGaussianModelBuilder::new(prior)
+        .observe(LinearObservation::with_bias(
+            latent_observation_map,
+            observation_values,
+            observation_bias,
+            GaussianNoise::independent_variances(&observation_variances)?,
+        )?)?
+        .condition()?;
+    let diagnostics = posterior.factorization_diagnostics()?;
+    let latent_mean = FeecVector::from_vec(posterior.mean().to_vec());
+    let h_mean = FeecVector::from_vec(
+        latent_to_h
+            .apply(posterior.mean())?
+            .into_iter()
+            .zip(h_offset)
+            .map(|(value, offset)| value + offset)
+            .collect(),
+    );
     let (q_mean, q_std) = if let Some(q_column) = model.q_column {
         if q_column >= latent_mean.len() {
             return Err(invalid_data(format!(
@@ -1781,29 +1806,21 @@ fn condition_model(
             ))
             .into());
         }
-        let mut q_coo = FeecCoo::new(1, latent_mean.len());
-        q_coo.push(0, q_column, 1.0);
-        let q_csr = FeecCsr::from(&q_coo);
-        let q_operator = sparse_row_operator_from_feec_csr(&q_csr).map_err(invalid_data)?;
-        let constraints = GmrfDenseMatrix::zeros(0, latent_mean.len());
-        let mut posterior = Gmrf::from_mean_and_precision(
-            feec_vec_to_gmrf(&latent_mean),
-            posterior_precision.clone(),
-        )?;
+        let q_operator = LinearMap::selector(latent_mean.len(), &[q_column])?;
         let q_variance = posterior
-            .exact_transformed_variance_decomposition(&q_operator, &constraints)?
-            .constrained_diag[0]
+            .pushforward_variance_estimate(&q_operator, VarianceMethod::Exact)?
+            .values[0]
             .max(VARIANCE_FLOOR);
         (latent_mean[q_column], q_variance.sqrt())
     } else {
         (f64::NAN, f64::NAN)
     };
     Ok(ConditionedAnnulusModel {
-        latent_to_h: model.latent_to_h.clone(),
-        posterior_precision,
-        posterior_precision_nnz,
-        posterior_factor_nnz,
-        latent_mean,
+        latent_to_h,
+        posterior,
+        posterior_precision_nnz: diagnostics.precision_nonzeros,
+        posterior_factor_nnz: diagnostics.factor_nonzeros,
+        posterior_fill_ratio: diagnostics.fill_ratio,
         h_mean,
         q_mean,
         q_std,
@@ -1814,22 +1831,17 @@ fn predict_observables(
     trial: usize,
     regime: AnnulusRegime,
     model: AnnulusModelKind,
-    conditioned: &ConditionedAnnulusModel,
+    conditioned: &mut ConditionedAnnulusModel,
     observations: &[AnnulusObservation],
     h_dimension: usize,
 ) -> Result<Vec<AnnulusPredictionRow>, Box<dyn Error>> {
     let observation_matrix = observation_matrix(observations, h_dimension, false)?;
-    let latent_operator = &observation_matrix * &conditioned.latent_to_h;
-    let latent_row_operator =
-        sparse_row_operator_from_feec_csr(&latent_operator).map_err(invalid_data)?;
-    let mut posterior = Gmrf::from_mean_and_precision(
-        feec_vec_to_gmrf(&conditioned.latent_mean),
-        conditioned.posterior_precision.clone(),
-    )?;
-    let constraints = GmrfDenseMatrix::zeros(0, conditioned.posterior_precision.nrows());
-    let variance = posterior
-        .exact_transformed_variance_decomposition(&latent_row_operator, &constraints)?
-        .constrained_diag;
+    let observation_map = LinearMap::from_feec_csr(&observation_matrix)?;
+    let latent_operator = observation_map.compose(&conditioned.latent_to_h)?;
+    let variance = conditioned
+        .posterior
+        .pushforward_variance_estimate(&latent_operator, VarianceMethod::Exact)?
+        .values;
     let means = &observation_matrix * &conditioned.h_mean;
     Ok(observations
         .iter()
@@ -1886,7 +1898,7 @@ fn predict_observable_means(
 }
 
 fn compute_topo_spread(
-    conditioned: &ConditionedAnnulusModel,
+    conditioned: &mut ConditionedAnnulusModel,
     loops: &[AnnulusSupport],
 ) -> Result<f64, Box<dyn Error>> {
     if loops.is_empty() {
@@ -1904,14 +1916,11 @@ fn compute_topo_spread(
         })
         .collect::<Vec<_>>();
     let loop_matrix = observation_matrix(&loop_observations, conditioned.h_mean.len(), false)?;
-    let latent_loop_matrix = &loop_matrix * &conditioned.latent_to_h;
-    let loop_operator =
-        sparse_row_operator_from_feec_csr(&latent_loop_matrix).map_err(invalid_data)?;
-    let mut posterior = Gmrf::from_mean_and_precision(
-        feec_vec_to_gmrf(&conditioned.latent_mean),
-        conditioned.posterior_precision.clone(),
-    )?;
-    let covariance = posterior.exact_transformed_covariance(&loop_operator)?;
+    let loop_map = LinearMap::from_feec_csr(&loop_matrix)?;
+    let latent_loop_map = loop_map.compose(&conditioned.latent_to_h)?;
+    let covariance = conditioned
+        .posterior
+        .pushforward_covariance(&latent_loop_map)?;
     let means = &loop_matrix * &conditioned.h_mean;
     let mean_bar = mean(means.iter().copied());
     let mean_spread = means
@@ -1922,13 +1931,17 @@ fn compute_topo_spread(
         })
         .sum::<f64>()
         / loops.len() as f64;
-    let trace = (0..loops.len()).map(|i| covariance[(i, i)]).sum::<f64>();
-    let mut total = 0.0;
-    for i in 0..loops.len() {
-        for j in 0..loops.len() {
-            total += covariance[(i, j)];
-        }
-    }
+    let trace = covariance
+        .iter()
+        .enumerate()
+        .take(loops.len())
+        .map(|(index, row)| row[index])
+        .sum::<f64>();
+    let total = covariance
+        .iter()
+        .take(loops.len())
+        .flat_map(|row| row.iter().take(loops.len()))
+        .sum::<f64>();
     Ok(mean_spread + trace / loops.len() as f64 - total / (loops.len() * loops.len()) as f64)
 }
 
@@ -1964,7 +1977,6 @@ fn compute_metric_row(
         .collect::<Vec<_>>();
     let prior_precision_nnz = sparse_nnz(&selected.model.prior_precision);
     let latent_dimension = selected.model.latent_dimension();
-    let posterior_lower_nnz = gmrf_lower_triangle_nnz(&conditioned.posterior_precision);
     AnnulusMetricRow {
         trial,
         regime,
@@ -2002,15 +2014,11 @@ fn compute_metric_row(
         prior_precision_density: square_density(latent_dimension, prior_precision_nnz),
         posterior_precision_nnz: conditioned.posterior_precision_nnz,
         posterior_precision_density: square_density(
-            conditioned.posterior_precision.nrows(),
+            latent_dimension,
             conditioned.posterior_precision_nnz,
         ),
         posterior_factor_nnz: conditioned.posterior_factor_nnz,
-        posterior_fill_ratio: if posterior_lower_nnz > 0 {
-            conditioned.posterior_factor_nnz as f64 / posterior_lower_nnz as f64
-        } else {
-            f64::NAN
-        },
+        posterior_fill_ratio: conditioned.posterior_fill_ratio,
     }
 }
 
@@ -2063,13 +2071,6 @@ fn sparse_nnz(matrix: &FeecCsr) -> usize {
     matrix
         .triplet_iter()
         .filter(|(_, _, value)| **value != 0.0)
-        .count()
-}
-
-fn gmrf_lower_triangle_nnz(matrix: &GmrfSparseMatrix) -> usize {
-    matrix
-        .triplet_iter()
-        .filter(|(row, col, value)| row >= col && **value != 0.0)
         .count()
 }
 
@@ -4118,6 +4119,69 @@ fn invalid_input(message: impl Into<String>) -> io::Error {
 
 fn invalid_data(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
+}
+
+#[cfg(test)]
+mod root_api_tests {
+    use super::*;
+    use common::linalg::nalgebra::CooMatrix as FeecCoo;
+
+    fn identity(dimension: usize) -> FeecCsr {
+        let mut matrix = FeecCoo::new(dimension, dimension);
+        for index in 0..dimension {
+            matrix.push(index, index, 1.0);
+        }
+        FeecCsr::from(&matrix)
+    }
+
+    #[test]
+    fn annulus_conditioning_uses_affine_root_model_and_pushforward_variance() {
+        let model = AnnulusLinearModel {
+            model_kind: AnnulusModelKind::FeecGmrf,
+            prior_precision: identity(2),
+            latent_to_h: identity(2),
+            h_offset: FeecVector::from_vec(vec![1.0, -1.0]),
+            q_column: Some(0),
+            selected_kappa: 1.0,
+            selected_tau0: 1.0,
+            selected_tau1: 1.0,
+        };
+        let training = AnnulusObservation {
+            kind: AnnulusObservationKind::TrainLine,
+            label: "training".to_string(),
+            entries: vec![(0, 1.0)],
+            truth_value: 2.0,
+            observed_value: 2.0,
+            noise_variance: 1.0,
+        };
+        let mut conditioned =
+            condition_model(&model, &[training], 2).expect("root conditioning should succeed");
+        assert!((conditioned.h_mean[0] - 1.5).abs() < 1e-12);
+        assert!((conditioned.h_mean[1] + 1.0).abs() < 1e-12);
+        assert!((conditioned.q_mean - 0.5).abs() < 1e-12);
+        assert!((conditioned.q_std - 0.5_f64.sqrt()).abs() < 1e-12);
+
+        let heldout = AnnulusObservation {
+            kind: AnnulusObservationKind::HeldoutLine,
+            label: "heldout".to_string(),
+            entries: vec![(0, 1.0)],
+            truth_value: 1.5,
+            observed_value: 1.5,
+            noise_variance: 1.0,
+        };
+        let predictions = predict_observables(
+            0,
+            AnnulusRegime::A,
+            model.model_kind,
+            &mut conditioned,
+            &[heldout],
+            2,
+        )
+        .expect("root pushforward should succeed");
+        assert_eq!(predictions.len(), 1);
+        assert!((predictions[0].mean - 1.5).abs() < 1e-12);
+        assert!((predictions[0].latent_variance - 0.5).abs() < 1e-12);
+    }
 }
 
 #[cfg(all(test, feature = "heavy-tests"))]

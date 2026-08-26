@@ -1,5 +1,6 @@
 /target/
 /tmp/
+/.native/
 /tests/external-consumer/Cargo.lock
 /out/
 **/target/

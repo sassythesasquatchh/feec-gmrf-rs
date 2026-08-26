@@ -48,6 +48,7 @@ rand = "0.8"
 rand_distr = "0.4"
 thiserror = "1.0"
 criterion = "0.5"
+csv = "1"
 
 [features]
 default = []
@@ -66,3 +67,4 @@ exterior = { path = "feec/crates/exterior" }
 gmrf-core = { path = "gmrf-rs" }
 thiserror = { workspace = true }
 rand = { workspace = true }
+csv = { workspace = true }

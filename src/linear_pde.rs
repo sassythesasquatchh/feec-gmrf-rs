@@ -1,7 +1,9 @@
 //! State-only models for boundary-reduced linear FEEC systems.
 
 use crate::boundary::EssentialBoundaryElimination;
-use crate::model::{DerivedQuantity, LinearGaussianModelBuilder, LinearObservation};
+use crate::model::{
+    DerivedQuantity, LinearConstraint, LinearGaussianModelBuilder, LinearObservation,
+};
 use crate::operator::{BoundaryLayout, FormDegree, FormOperators, LinearMap};
 use crate::physical::PhysicalMap;
 use crate::prior::{GaussianPrior, MassInversePolicy, MaternPriorBuilder};
@@ -346,6 +348,12 @@ impl<'a> LinearPdeModelBuilder<'a> {
 
     pub fn observe(mut self, observation: LinearObservation) -> Result<Self> {
         self.inner = self.inner.observe(observation)?;
+        Ok(self)
+    }
+
+    /// Add a hard equality constraint on the active or full FEEC state.
+    pub fn constrain(mut self, constraint: LinearConstraint) -> Result<Self> {
+        self.inner = self.inner.constrain(constraint)?;
         Ok(self)
     }
 
