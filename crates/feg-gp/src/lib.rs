@@ -3,7 +3,6 @@
 #[cfg(feature = "external-solvers")]
 mod hodge;
 
-use common::linalg::nalgebra::quadratic_form_sparse;
 use common::linalg::nalgebra::{CsrMatrix, Matrix as NaMatrix, Vector as NaVector};
 #[cfg(feature = "external-solvers")]
 use common::linalg::petsc::{
@@ -523,8 +522,7 @@ impl EigenBasis {
         if !orthogonality_tolerance.is_finite() || orthogonality_tolerance < 0.0 {
             return Err(GpError::InvalidMassOrthogonalityTolerance);
         }
-        mass_normalize_eigenvectors(mass, &mut eigenvectors)?;
-        validate_mass_orthogonality(mass, &eigenvectors, orthogonality_tolerance)?;
+        mass_normalize_and_validate_eigenvectors(mass, &mut eigenvectors, orthogonality_tolerance)?;
         Self::from_hodge_laplace_eigenpairs(eigenvalues, eigenvectors)
     }
 
@@ -2084,10 +2082,105 @@ fn nalgebra_matrix_to_faer(matrix: &NaMatrix) -> Mat<f64> {
     out
 }
 
+/// Mass-normalize all columns and validate their mutual mass orthogonality.
+///
+/// This forms `M V` once in `O(nnz(M) r)`, then forms the dense Gram matrix
+/// `V^T M V` with the optimized dense matrix product used elsewhere in this
+/// crate.  The former scalar-pair implementation traversed every mass nonzero
+/// for every pair of modes, `O(nnz(M) r^2)`.  Peak workspace here is one
+/// explicit `N x r` product and one `r x r` Gram matrix; no copy of `V` is
+/// made for the dense product.
+fn mass_normalize_and_validate_eigenvectors(
+    mass: &CsrMatrix,
+    eigenvectors: &mut NaMatrix,
+    tolerance: f64,
+) -> Result<(), GpError> {
+    let row_count = eigenvectors.nrows();
+    let rank = eigenvectors.ncols();
+    let mass_times_eigenvectors = apply_mass_to_eigenvectors(mass, eigenvectors);
+    let eigenvectors_ref = MatRef::from_column_major_slice(
+        eigenvectors.as_slice(),
+        eigenvectors.nrows(),
+        eigenvectors.ncols(),
+    );
+    let mass_times_ref = MatRef::from_column_major_slice(
+        mass_times_eigenvectors.as_slice(),
+        mass_times_eigenvectors.nrows(),
+        mass_times_eigenvectors.ncols(),
+    );
+    let mut gram = Mat::zeros(rank, rank);
+    matmul(
+        &mut gram,
+        Accum::Replace,
+        eigenvectors_ref.transpose(),
+        mass_times_ref,
+        1.0,
+        Par::Seq,
+    );
+
+    let mut scales = Vec::with_capacity(rank);
+    for col in 0..rank {
+        let norm2 = gram[(idx(col), idx(col))];
+        if !norm2.is_finite() || norm2 <= 0.0 {
+            return Err(GpError::InvalidEigenvectorNorm { value: norm2 });
+        }
+        scales.push(1.0 / norm2.sqrt());
+    }
+
+    for (col, &scale) in scales.iter().enumerate() {
+        for row in 0..row_count {
+            eigenvectors[(row, col)] *= scale;
+        }
+    }
+
+    for left in 0..rank {
+        for right in (left + 1)..rank {
+            let value = gram[(idx(left), idx(right))] * scales[left] * scales[right];
+            if !value.is_finite() || value.abs() > tolerance {
+                return Err(GpError::EigenvectorsNotMassOrthogonal {
+                    left,
+                    right,
+                    value,
+                    tolerance,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Preserve the normalize-only semantics of the legacy mesh constructor while
+/// applying `M` to all columns in one sparse--dense product.
+#[cfg(any(feature = "external-solvers", test))]
 fn mass_normalize_eigenvectors(
     mass: &CsrMatrix,
     eigenvectors: &mut NaMatrix,
 ) -> Result<(), GpError> {
+    let mass_times_eigenvectors = apply_mass_to_eigenvectors(mass, eigenvectors);
+    for col in 0..eigenvectors.ncols() {
+        let norm2 = eigenvectors
+            .column(col)
+            .dot(&mass_times_eigenvectors.column(col));
+        if !norm2.is_finite() || norm2 <= 0.0 {
+            return Err(GpError::InvalidEigenvectorNorm { value: norm2 });
+        }
+        eigenvectors.column_mut(col).scale_mut(1.0 / norm2.sqrt());
+    }
+    Ok(())
+}
+
+fn apply_mass_to_eigenvectors(mass: &CsrMatrix, eigenvectors: &NaMatrix) -> NaMatrix {
+    mass * eigenvectors
+}
+
+#[cfg(test)]
+fn scalar_mass_normalize_and_validate_reference(
+    mass: &CsrMatrix,
+    eigenvectors: &mut NaMatrix,
+    tolerance: f64,
+) -> Result<(), GpError> {
+    use common::linalg::nalgebra::quadratic_form_sparse;
+
     for col in 0..eigenvectors.ncols() {
         let vec = eigenvectors.column(col).into_owned();
         let norm2 = quadratic_form_sparse(mass, &vec);
@@ -2099,14 +2192,6 @@ fn mass_normalize_eigenvectors(
             eigenvectors[(row, col)] *= scale;
         }
     }
-    Ok(())
-}
-
-fn validate_mass_orthogonality(
-    mass: &CsrMatrix,
-    eigenvectors: &NaMatrix,
-    tolerance: f64,
-) -> Result<(), GpError> {
     for left in 0..eigenvectors.ncols() {
         for right in (left + 1)..eigenvectors.ncols() {
             let mut value = 0.0;
@@ -2660,7 +2745,7 @@ mod tests {
 
     #[test]
     fn mass_normalization_scales_columns_to_unit_mass() {
-        use common::linalg::nalgebra::{CooMatrix, Vector as NaVector};
+        use common::linalg::nalgebra::{quadratic_form_sparse, CooMatrix, Vector as NaVector};
 
         let mass =
             CooMatrix::try_from_triplets(2, 2, vec![0, 1], vec![0, 1], vec![2.0, 8.0]).unwrap();
@@ -2710,6 +2795,184 @@ mod tests {
             error,
             GpError::EigenvectorsNotMassOrthogonal { .. }
         ));
+    }
+
+    #[test]
+    fn optimized_mass_validation_matches_scalar_reference_on_non_diagonal_mass() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let rows = vec![0, 0, 1, 1, 1, 2, 2];
+        let cols = vec![0, 1, 0, 1, 2, 1, 2];
+        let values = vec![2.0, 0.25, 0.25, 3.0, -0.4, -0.4, 4.0];
+        let mass =
+            CsrMatrix::from(&CooMatrix::try_from_triplets(3, 3, rows, cols, values).unwrap());
+        let mass_dense =
+            NaMatrix::from_row_slice(3, 3, &[2.0, 0.25, 0.0, 0.25, 3.0, -0.4, 0.0, -0.4, 4.0]);
+        let lower = mass_dense.cholesky().unwrap().l();
+        let mut input = lower.transpose().try_inverse().unwrap();
+        for (col, scale) in [2.0, 0.5, 4.0].into_iter().enumerate() {
+            input.column_mut(col).scale_mut(scale);
+        }
+
+        let mut optimized = input.clone();
+        let mut scalar = input;
+        mass_normalize_and_validate_eigenvectors(&mass, &mut optimized, 1.0e-12).unwrap();
+        scalar_mass_normalize_and_validate_reference(&mass, &mut scalar, 1.0e-12).unwrap();
+
+        for row in 0..optimized.nrows() {
+            for col in 0..optimized.ncols() {
+                assert_close(optimized[(row, col)], scalar[(row, col)], 2.0e-15);
+            }
+        }
+    }
+
+    #[test]
+    fn optimized_mass_validation_preserves_first_failure_and_tolerance() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let mass = CsrMatrix::from(
+            &CooMatrix::try_from_triplets(
+                3,
+                3,
+                vec![0, 0, 1, 1, 1, 2, 2],
+                vec![0, 1, 0, 1, 2, 1, 2],
+                vec![2.0, 0.25, 0.25, 3.0, -0.4, -0.4, 4.0],
+            )
+            .unwrap(),
+        );
+        let input =
+            NaMatrix::from_column_slice(3, 3, &[1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+        let tolerance = 1.0e-12;
+        let mut optimized = input.clone();
+        let mut scalar = input;
+        let optimized_error =
+            mass_normalize_and_validate_eigenvectors(&mass, &mut optimized, tolerance).unwrap_err();
+        let scalar_error =
+            scalar_mass_normalize_and_validate_reference(&mass, &mut scalar, tolerance)
+                .unwrap_err();
+
+        match (optimized_error, scalar_error) {
+            (
+                GpError::EigenvectorsNotMassOrthogonal {
+                    left: optimized_left,
+                    right: optimized_right,
+                    value: optimized_value,
+                    tolerance: optimized_tolerance,
+                },
+                GpError::EigenvectorsNotMassOrthogonal {
+                    left: scalar_left,
+                    right: scalar_right,
+                    value: scalar_value,
+                    tolerance: scalar_tolerance,
+                },
+            ) => {
+                assert_eq!(
+                    (optimized_left, optimized_right),
+                    (scalar_left, scalar_right)
+                );
+                assert_eq!(optimized_tolerance, scalar_tolerance);
+                assert_close(optimized_value, scalar_value, 2.0e-15);
+            }
+            errors => panic!("unexpected errors: {errors:?}"),
+        }
+    }
+
+    #[test]
+    fn optimized_mass_validation_rejects_zero_norm_column() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let mass = CsrMatrix::from(
+            &CooMatrix::try_from_triplets(2, 2, vec![0, 1], vec![0, 1], vec![2.0, 3.0]).unwrap(),
+        );
+        let mut eigenvectors = NaMatrix::from_column_slice(2, 2, &[1.0, 0.0, 0.0, 0.0]);
+        let error = mass_normalize_and_validate_eigenvectors(&mass, &mut eigenvectors, 1.0e-12)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::InvalidEigenvectorNorm { value: 0.0 }
+        ));
+    }
+
+    #[test]
+    #[ignore = "release-only comparison of optimized and scalar-reference validation"]
+    fn mass_validation_microbenchmark() {
+        use common::linalg::nalgebra::CooMatrix;
+        use std::time::Instant;
+
+        let dimension = 512;
+        let rank = 192;
+        let mut rows = Vec::new();
+        let mut cols = Vec::new();
+        let mut values = Vec::new();
+        let mut dense_mass = NaMatrix::zeros(dimension, dimension);
+        for row in 0..dimension {
+            for offset in -5_isize..=5 {
+                let col = row as isize + offset;
+                if !(0..dimension as isize).contains(&col) {
+                    continue;
+                }
+                let col = col as usize;
+                let value = if offset == 0 {
+                    4.0
+                } else {
+                    -0.15 / offset.unsigned_abs() as f64
+                };
+                rows.push(row);
+                cols.push(col);
+                values.push(value);
+                dense_mass[(row, col)] = value;
+            }
+        }
+        let mass = CsrMatrix::from(
+            &CooMatrix::try_from_triplets(dimension, dimension, rows, cols, values).unwrap(),
+        );
+        let lower = dense_mass.cholesky().unwrap().l();
+        let selectors = NaMatrix::from_fn(
+            dimension,
+            rank,
+            |row, col| if row == col { 1.0 } else { 0.0 },
+        );
+        let input = lower.transpose().lu().solve(&selectors).unwrap();
+
+        let mut optimized = input.clone();
+        let optimized_start = Instant::now();
+        mass_normalize_and_validate_eigenvectors(&mass, &mut optimized, 1.0e-10).unwrap();
+        let optimized_elapsed = optimized_start.elapsed();
+
+        let mut scalar = input;
+        let scalar_start = Instant::now();
+        scalar_mass_normalize_and_validate_reference(&mass, &mut scalar, 1.0e-10).unwrap();
+        let scalar_elapsed = scalar_start.elapsed();
+        for row in 0..dimension {
+            for col in 0..rank {
+                assert_close(optimized[(row, col)], scalar[(row, col)], 1.0e-12);
+            }
+        }
+        eprintln!(
+            "mass validation N={dimension} r={rank}: optimized={optimized_elapsed:?}, scalar={scalar_elapsed:?}, speedup={:.3}",
+            scalar_elapsed.as_secs_f64() / optimized_elapsed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "bounded rank-2048 workspace check; run explicitly in release mode"]
+    fn mass_validation_rank_2048_resource_check() {
+        use std::time::Instant;
+
+        let rank = 2048;
+        let mass = CsrMatrix::identity(rank);
+        let mut eigenvectors = NaMatrix::identity(rank, rank);
+        let workspace_entries = rank * rank + rank * rank;
+        let workspace_bytes = workspace_entries * std::mem::size_of::<f64>();
+        assert_eq!(workspace_bytes, 64 * 1024 * 1024);
+
+        let start = Instant::now();
+        mass_normalize_and_validate_eigenvectors(&mass, &mut eigenvectors, 0.0).unwrap();
+        eprintln!(
+            "mass validation N={rank} r={rank}: elapsed={:?}, explicit workspace={} MiB",
+            start.elapsed(),
+            workspace_bytes / (1024 * 1024)
+        );
     }
 
     #[cfg(feature = "external-solvers")]
