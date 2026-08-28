@@ -6,7 +6,8 @@ pub use crate::boundary::{
 };
 pub use crate::diagnostics::{
     gaussian_predictive_diagnostics, gaussian_predictive_diagnostics_95,
-    relative_sparse_frobenius_error, GaussianPredictiveDiagnostics,
+    relative_precision_certificate, relative_sparse_frobenius_error, GaussianPredictiveDiagnostics,
+    RelativePrecisionCertificate,
 };
 pub use crate::error::{FeecGmrfError, Result};
 pub use crate::hodge::{

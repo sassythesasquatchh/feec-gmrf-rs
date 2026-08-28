@@ -41,6 +41,11 @@ pub enum FeecGmrfError {
         "exact eliminated reference requires dimension {dimension}, exceeding configured maximum {maximum}"
     )]
     ExactReferenceSizeExceeded { dimension: usize, maximum: usize },
+    /// A deliberately dense finite-mesh diagnostic exceeded its configured guard.
+    #[error(
+        "dense diagnostic requires dimension {dimension}, exceeding configured maximum {maximum}"
+    )]
+    DenseDiagnosticSizeExceeded { dimension: usize, maximum: usize },
     /// Sparse support constraints are not independent.
     #[error("supported Gaussian constraints are not full row-rank")]
     SupportedConstraintRank,
