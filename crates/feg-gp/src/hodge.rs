@@ -1,6 +1,7 @@
 use crate::{
-    condition_low_rank_factors, condition_low_rank_factors_with_covariance,
-    diagonal_from_feature_matrix, full_covariance_from_feature_matrix, weighted_feature_matrix,
+    condition_low_rank_factors, condition_low_rank_factors_at_outputs,
+    condition_low_rank_factors_with_covariance, diagonal_from_feature_matrix,
+    full_covariance_from_feature_matrix, sparse_dense_product, weighted_feature_matrix,
     ConditionedFullGp, ConditionedGp, GpError, DEFAULT_K,
 };
 use common::linalg::faer::FaerCholesky;
@@ -639,6 +640,25 @@ impl HodgeCompositionalGp {
         )
     }
 
+    /// Condition all configured Hodge branches and push the posterior moments
+    /// through a sparse physical or engineering output operator.
+    pub fn condition_linear_observations_at_outputs(
+        &self,
+        observation_matrix: &CsrMatrix,
+        observation_values: &[f64],
+        noise_variance: f64,
+        output_matrix: &CsrMatrix,
+    ) -> Result<ConditionedGp, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.combined_features)?;
+        condition_low_rank_factors_at_outputs(
+            &self.combined_features,
+            &output_features,
+            observation_matrix,
+            observation_values,
+            noise_variance,
+        )
+    }
+
     pub fn condition_branch_linear_observations(
         &self,
         kind: HodgeBranchKind,
@@ -663,6 +683,27 @@ impl HodgeCompositionalGp {
     ) -> Result<ConditionedFullGp, GpError> {
         condition_low_rank_factors_with_covariance(
             self.branch_features(kind),
+            observation_matrix,
+            observation_values,
+            noise_variance,
+        )
+    }
+
+    /// Condition one Hodge branch and push its posterior moments through a
+    /// sparse physical or engineering output operator.
+    pub fn condition_branch_linear_observations_at_outputs(
+        &self,
+        kind: HodgeBranchKind,
+        observation_matrix: &CsrMatrix,
+        observation_values: &[f64],
+        noise_variance: f64,
+        output_matrix: &CsrMatrix,
+    ) -> Result<ConditionedGp, GpError> {
+        let branch_features = self.branch_features(kind);
+        let output_features = sparse_dense_product(output_matrix, branch_features)?;
+        condition_low_rank_factors_at_outputs(
+            branch_features,
+            &output_features,
             observation_matrix,
             observation_values,
             noise_variance,
@@ -1116,10 +1157,14 @@ fn solve_reduced_hodge_eigenpairs(
 
 fn orthonormalize_branch(
     ambient_dimension: usize,
-    candidates: Vec<(f64, NaVector)>,
+    mut candidates: Vec<(f64, NaVector)>,
     ambient_mass: &CsrMatrix,
     tolerance: f64,
 ) -> HodgeBranchBasis {
+    // Eigensolver ordering is not part of the algebraic interface.  Sort
+    // explicitly so a subsequent rank-k truncation always retains the
+    // smallest Hodge--Laplacian eigenvalues (largest Matérn weights).
+    candidates.sort_by(|(left, _), (right, _)| left.total_cmp(right));
     let mut eigenvalues = Vec::new();
     let mut columns = Vec::new();
 
@@ -1324,5 +1369,24 @@ mod tests {
             )
             .expect_err("negative expected mass energy should be rejected");
         assert!(matches!(err, GpError::InvalidExpectedMassEnergy));
+    }
+
+    #[test]
+    fn branch_orthonormalization_orders_modes_by_smallest_eigenvalue() {
+        let mut mass = CooMatrix::new(3, 3);
+        for index in 0..3 {
+            mass.push(index, index, 1.0);
+        }
+        let mass = CsrMatrix::from(&mass);
+        let candidates = vec![
+            (9.0, NaVector::from_vec(vec![0.0, 0.0, 1.0])),
+            (1.0, NaVector::from_vec(vec![1.0, 0.0, 0.0])),
+            (4.0, NaVector::from_vec(vec![0.0, 1.0, 0.0])),
+        ];
+
+        let basis = orthonormalize_branch(3, candidates, &mass, 1.0e-12);
+        assert_eq!(basis.eigenvalues(), &[1.0, 4.0, 9.0]);
+        let truncated = basis.truncate_smallest(2);
+        assert_eq!(truncated.eigenvalues(), &[1.0, 4.0]);
     }
 }
