@@ -1,6 +1,7 @@
 use feg_case_studies::c51_spectral_covariance_rank::{
     run_c51_spectral_covariance_rank, C51SpectralCovarianceRankConfig,
-    C51SpectralCovarianceRankMetadata,
+    C51SpectralCovarianceRankMetadata, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10,
+    C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8,
 };
 use std::env;
 use std::path::PathBuf;
@@ -67,6 +68,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config = config.with_maximum_rank(maximum_rank)?;
             }
             config
+        }
+        C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 | C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10 => {
+            let expected_refinement = if profile == C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 {
+                8
+            } else {
+                10
+            };
+            let refinement = refinement.ok_or_else(|| {
+                format!(
+                    "{profile} requires --refinement {expected_refinement}; the mesh-specific extension profile is immutable"
+                )
+            })?;
+            if refinement != expected_refinement {
+                return Err(format!(
+                    "{profile} requires --refinement {expected_refinement}, received {refinement}"
+                )
+                .into());
+            }
+            if maximum_rank.is_some() {
+                return Err(format!(
+                    "{profile} has an immutable rank grid and rejects --maximum-rank"
+                )
+                .into());
+            }
+            C51SpectralCovarianceRankConfig::rank_extension(refinement)?
         }
         _ => return Err(format!("unknown C51 spectral covariance profile {profile}").into()),
     };

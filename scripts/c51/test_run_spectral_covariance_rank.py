@@ -83,7 +83,11 @@ class SpectralRankRunnerTests(unittest.TestCase):
 
     def test_scientific_command_is_exact_rank_discovery_cli(self):
         command = runner.scientific_command(
-            pathlib.Path("/tmp/bin"), 8, 2048, pathlib.Path("/tmp/out/study")
+            pathlib.Path("/tmp/bin"),
+            "publication-discovery-v1",
+            8,
+            2048,
+            pathlib.Path("/tmp/out/study"),
         )
         self.assertEqual(
             command,
@@ -99,6 +103,40 @@ class SpectralRankRunnerTests(unittest.TestCase):
                 "/tmp/out/study",
             ],
         )
+
+    def test_rank_extension_command_has_immutable_profile_without_maximum_override(self):
+        command = runner.scientific_command(
+            pathlib.Path("/tmp/bin"),
+            "rank-extension-v1-n10",
+            10,
+            None,
+            pathlib.Path("/tmp/out/study"),
+        )
+        self.assertEqual(
+            command,
+            [
+                "/tmp/bin",
+                "--profile",
+                "rank-extension-v1-n10",
+                "--refinement",
+                "10",
+                "--output",
+                "/tmp/out/study",
+            ],
+        )
+
+    def test_rank_extension_profile_requires_matching_refinement_and_no_maximum(self):
+        resolved = runner.resolve_profile("rank-extension-v1-n8", 8, None)
+        self.assertEqual(resolved["maximum_rank"], 3032)
+        self.assertEqual(
+            resolved["rank_grid"], [2048, 2304, 2560, 2816, 3000, 3032]
+        )
+        self.assertEqual(resolved["evidence_tier"], "rank_extension")
+        self.assertTrue(resolved["post_primary"])
+        with self.assertRaisesRegex(ValueError, "requires refinement 8"):
+            runner.resolve_profile("rank-extension-v1-n8", 10, None)
+        with self.assertRaisesRegex(ValueError, "rejects --maximum-rank"):
+            runner.resolve_profile("rank-extension-v1-n8", 8, 3032)
 
     def test_build_is_locked_release_example(self):
         self.assertEqual(
@@ -220,6 +258,63 @@ class SpectralRankRunnerTests(unittest.TestCase):
         self.assertEqual(plan["refinement"], 8)
         self.assertIn("sampled_process_tree_rss_bytes", plan["caps"])
         self.assertFalse(output.exists())
+
+    def test_rank_extension_dry_run_records_post_primary_evidence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            output = root / "not-created"
+            args = runner.parse_args(
+                [
+                    "--repository",
+                    str(pathlib.Path(__file__).resolve().parents[2]),
+                    "--profile",
+                    "rank-extension-v1-n10",
+                    "--refinement",
+                    "10",
+                    "--output",
+                    str(output),
+                    "--dry-run",
+                ]
+            )
+            plan = runner.dry_run_plan(args, args.repository.resolve())
+        self.assertEqual(plan["maximum_rank"], 4096)
+        self.assertEqual(plan["rank_grid"], [2048, 2560, 3072, 3584, 4096])
+        self.assertEqual(plan["evidence_tier"], "rank_extension")
+        self.assertTrue(plan["post_primary"])
+        self.assertNotIn("--maximum-rank", plan["scientific_command"])
+        self.assertFalse(output.exists())
+
+    def test_rank_extension_attempt_manifest_is_explicitly_timing_ineligible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            args = runner.parse_args(
+                [
+                    "--profile",
+                    "rank-extension-v1-n8",
+                    "--refinement",
+                    "8",
+                    "--output",
+                    str(root / "attempt"),
+                ]
+            )
+            profile = runner.resolve_profile(args.profile, args.refinement, args.maximum_rank)
+            manifest = runner.initial_manifest(
+                args,
+                pathlib.Path(root),
+                root / "attempt",
+                root / "binary",
+                {},
+                {},
+                {},
+                {},
+                profile,
+            )
+        self.assertEqual(manifest["rank_grid"], [2048, 2304, 2560, 2816, 3000, 3032])
+        self.assertEqual(manifest["requested_maximum_rank"], None)
+        self.assertEqual(manifest["evidence_tier"], "rank_extension")
+        self.assertFalse(manifest["method_performance_timing_eligible"])
+        self.assertTrue(manifest["shared_maximum_basis"])
+        self.assertIn("post-primary", manifest["post_primary_rationale"])
 
     def test_atomic_manifest_contains_valid_json(self):
         with tempfile.TemporaryDirectory() as temporary:

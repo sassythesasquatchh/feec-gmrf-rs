@@ -17,6 +17,7 @@ def load_rows(path: Path) -> list[dict[str, str]]:
         rows = list(csv.DictReader(handle))
     required = {
         *GROUP_COLUMNS,
+        "evidence_tier",
         "rank",
         "status",
         "selection_e_primary",
@@ -31,6 +32,9 @@ def load_rows(path: Path) -> list[dict[str, str]]:
 def analyze_group(rows: list[dict[str, str]], threshold: float) -> dict[str, str]:
     ordered = sorted(rows, key=lambda row: int(row["rank"]))
     maximum_rank = int(ordered[-1]["rank"])
+    evidence_tiers = {row.get("evidence_tier", "rank_discovery") for row in ordered}
+    if len(evidence_tiers) != 1:
+        raise ValueError("a spectral rank curve cannot mix evidence tiers")
     candidate = None
     for index, row in enumerate(ordered):
         suffix = ordered[index:]
@@ -44,6 +48,7 @@ def analyze_group(rows: list[dict[str, str]], threshold: float) -> dict[str, str
 
     result = {
         **{column: ordered[0][column] for column in GROUP_COLUMNS},
+        "evidence_tier": evidence_tiers.pop(),
         "threshold": f"{threshold:.17e}",
         "maximum_tested_rank": str(maximum_rank),
         "locked_rank": "",
@@ -76,7 +81,10 @@ def analyze_group(rows: list[dict[str, str]], threshold: float) -> dict[str, str
         result["reason"] = "all ranks through 2048 were measured but no sustained selection pass exists"
     else:
         result["status"] = "required_rank_gt_max_tested"
-        result["reason"] = "all available ranks were measured but no sustained selection pass exists"
+        result["reason"] = (
+            f"all ranks through the maximum tested rank {maximum_rank} were measured "
+            "but no sustained selection pass exists"
+        )
     return result
 
 

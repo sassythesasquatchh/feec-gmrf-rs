@@ -88,6 +88,30 @@ outside scientific measurement. It then executes the release binary directly
 with the immutable `publication-discovery-v1` profile and exactly one requested
 refinement and maximum rank. The attempt directory must not already exist.
 
+The post-primary rank extension is deliberately separate from that discovery
+profile. It was frozen only after the corrected alpha-2 primary results left
+registered 5%/2% decisions unresolved. Each mesh-specific profile has an
+immutable rank grid, rejects `--maximum-rank`, records
+`evidence_tier: rank_extension`, and remains timing-ineligible:
+
+```text
+python3 scripts/c51/run_spectral_covariance_rank.py \
+  --profile rank-extension-v1-n8 \
+  --refinement 8 \
+  --output out/c51/spectral-rank-extension-v1-n8
+
+python3 scripts/c51/run_spectral_covariance_rank.py \
+  --profile rank-extension-v1-n10 \
+  --refinement 10 \
+  --output out/c51/spectral-rank-extension-v1-n10
+```
+
+The frozen grids are `2048,2304,2560,2816,3000,3032` for `n=8` and
+`2048,2560,3072,3584,4096` for `n=10`, both at alpha 2. A fully measured
+unattained `n=10` threshold is reported against the actual maximum tested rank
+4,096, never against the primary cap 2,048. Resource-censored attempts remain
+computationally unavailable rather than rank lower bounds.
+
 The child starts in a fresh process group. The runner samples the summed RSS of
 that process tree, wall time, and all file sizes in the attempt directory. It
 terminates the entire group when any cap is exceeded. Defaults are six hours,

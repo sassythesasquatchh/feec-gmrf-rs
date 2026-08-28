@@ -33,7 +33,19 @@ pub const C51_SPECTRAL_COVARIANCE_STUDY_ID: &str = "c51/spectral-covariance-rank
 pub const C51_SPECTRAL_RANK_GRID: [usize; 12] = [
     32, 64, 128, 256, 512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048,
 ];
+/// Frozen post-primary alpha-2 rank grid for the `n=8` extension.
+pub const C51_SPECTRAL_RANK_EXTENSION_N8_GRID: [usize; 6] =
+    [2_048, 2_304, 2_560, 2_816, 3_000, 3_032];
+/// Frozen post-primary alpha-2 rank grid for the `n=10` extension.
+pub const C51_SPECTRAL_RANK_EXTENSION_N10_GRID: [usize; 5] = [2_048, 2_560, 3_072, 3_584, 4_096];
 pub const C51_COVARIANCE_THRESHOLDS: [f64; 3] = [0.10, 0.05, 0.02];
+
+/// Immutable CLI/archive profile for the `n=8` post-primary extension.
+pub const C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8: &str = "rank-extension-v1-n8";
+/// Immutable CLI/archive profile for the `n=10` post-primary extension.
+pub const C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10: &str = "rank-extension-v1-n10";
+/// Frozen explanation for why the extension follows, but does not mutate, the primary study.
+pub const C51_SPECTRAL_RANK_EXTENSION_RATIONALE: &str = "post-primary extension frozen after publication-discovery-v1 left corrected alpha=2 5%/2% decisions unresolved; it may resolve registered thresholds but may not support method timing";
 
 const OUTPUT_DIMENSION: usize = 9;
 const OBSERVATION_GRID_POINTS_PER_AXIS: usize = 6;
@@ -90,6 +102,65 @@ impl C51SpectralCovarianceRankConfig {
             maximum_basis_storage_bytes: 512 * 1024 * 1024,
             ..Self::smoke()
         }
+    }
+
+    /// Frozen post-primary alpha=2 extension. This is a separate evidence tier
+    /// and never mutates the primary publication-discovery-v1 rank grid.
+    pub fn rank_extension(refinement: usize) -> Result<Self> {
+        let (profile, ranks) = match refinement {
+            8 => (
+                C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8,
+                C51_SPECTRAL_RANK_EXTENSION_N8_GRID.as_slice(),
+            ),
+            10 => (
+                C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10,
+                C51_SPECTRAL_RANK_EXTENSION_N10_GRID.as_slice(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "C51 rank extension refinement must be exactly 8 or 10",
+                ))
+            }
+        };
+        let config = Self {
+            profile: profile.to_string(),
+            refinements: vec![refinement],
+            ranks: ranks.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn evidence_tier(&self) -> &'static str {
+        if self.is_rank_extension() {
+            "rank_extension"
+        } else {
+            "rank_discovery"
+        }
+    }
+
+    pub fn post_primary_rationale(&self) -> Option<&'static str> {
+        self.is_rank_extension()
+            .then_some(C51_SPECTRAL_RANK_EXTENSION_RATIONALE)
+    }
+
+    pub fn expected_state_dimension(&self) -> Option<usize> {
+        match self.profile.as_str() {
+            C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 => Some(3_032),
+            C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10 => Some(6_130),
+            _ => None,
+        }
+    }
+
+    fn is_rank_extension(&self) -> bool {
+        matches!(
+            self.profile.as_str(),
+            C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 | C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10
+        )
     }
 
     /// Restrict a publication run to one mesh so n=8 can be inspected before n=10.
@@ -157,7 +228,26 @@ impl C51SpectralCovarianceRankConfig {
                 "publication rank discovery must retain mandatory ranks 2000 and 2048",
             ));
         }
-        if self.alphas != [MaternAlpha::Two, MaternAlpha::Three] {
+        let expected_extension = match self.profile.as_str() {
+            C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 => {
+                Some((8, C51_SPECTRAL_RANK_EXTENSION_N8_GRID.as_slice()))
+            }
+            C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10 => {
+                Some((10, C51_SPECTRAL_RANK_EXTENSION_N10_GRID.as_slice()))
+            }
+            _ => None,
+        };
+        if let Some((refinement, ranks)) = expected_extension {
+            if self.refinements != [refinement]
+                || self.ranks != ranks
+                || self.requested_maximum_rank.is_some()
+                || self.alphas != [MaternAlpha::Two]
+            {
+                return Err(invalid(
+                    "C51 rank-extension profiles have immutable refinement, alpha, and rank grids",
+                ));
+            }
+        } else if self.alphas != [MaternAlpha::Two, MaternAlpha::Three] {
             return Err(invalid(
                 "C51 spectral covariance study requires separate alpha=2 and alpha=3 runs",
             ));
@@ -626,7 +716,7 @@ impl C51SpectralCovarianceRankArchive {
             .map_err(csv_error)?;
         for row in &self.rows {
             let mut record = vec![
-                "rank_discovery".to_string(),
+                self.config.evidence_tier().to_string(),
                 row.method_performance_timing_eligible.to_string(),
                 row.refinement.to_string(),
                 row.state_dimension.to_string(),
@@ -901,7 +991,17 @@ impl C51SpectralCovarianceRankArchive {
         )?;
         writeln!(writer, "study_id: {C51_SPECTRAL_COVARIANCE_STUDY_ID}")?;
         writeln!(writer, "profile: {}", self.config.profile)?;
-        writeln!(writer, "evidence_tier: rank_discovery")?;
+        writeln!(writer, "evidence_tier: {}", self.config.evidence_tier())?;
+        match self.config.post_primary_rationale() {
+            Some(rationale) => {
+                writeln!(writer, "post_primary: true")?;
+                writeln!(writer, "post_primary_rationale: {}", yaml_string(rationale))?;
+            }
+            None => {
+                writeln!(writer, "post_primary: false")?;
+                writeln!(writer, "post_primary_rationale: null")?;
+            }
+        }
         writeln!(writer, "method_performance_timing_eligible: false")?;
         writeln!(writer, "shared_maximum_basis: true")?;
         writeln!(writer, "command: {}", yaml_string(&self.metadata.command))?;
@@ -916,6 +1016,11 @@ impl C51SpectralCovarianceRankArchive {
             "refinements: {}",
             yaml_usizes(&self.config.refinements)
         )?;
+        write_yaml_usize_option(
+            &mut writer,
+            "expected_state_dimension",
+            self.config.expected_state_dimension(),
+        )?;
         writeln!(writer, "ranks: {}", yaml_usizes(&self.config.ranks))?;
         write_yaml_usize_option(
             &mut writer,
@@ -923,7 +1028,18 @@ impl C51SpectralCovarianceRankArchive {
             self.config.requested_maximum_rank,
         )?;
         writeln!(writer, "thresholds: [0.10, 0.05, 0.02]")?;
-        writeln!(writer, "alpha_values: [2, 3]")?;
+        writeln!(
+            writer,
+            "alpha_values: {}",
+            yaml_usizes(
+                &self
+                    .config
+                    .alphas
+                    .iter()
+                    .map(|alpha| alpha.as_u32() as usize)
+                    .collect::<Vec<_>>()
+            )
+        )?;
         writeln!(writer, "kappa: {:.17e}", self.config.kappa)?;
         writeln!(writer, "tau: {:.17e}", self.config.tau)?;
         writeln!(
@@ -2577,6 +2693,56 @@ mod tests {
         assert!(C51SpectralCovarianceRankConfig::publication()
             .for_publication_refinement(6)
             .is_err());
+    }
+
+    #[test]
+    fn rank_extension_profiles_are_mesh_specific_post_primary_evidence() {
+        let n8 = C51SpectralCovarianceRankConfig::rank_extension(8).unwrap();
+        assert_eq!(n8.profile, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8);
+        assert_eq!(n8.refinements, [8]);
+        assert_eq!(n8.ranks, C51_SPECTRAL_RANK_EXTENSION_N8_GRID);
+        assert_eq!(n8.alphas, [MaternAlpha::Two]);
+        assert_eq!(n8.evidence_tier(), "rank_extension");
+        assert!(n8.post_primary_rationale().is_some());
+
+        let n10 = C51SpectralCovarianceRankConfig::rank_extension(10).unwrap();
+        assert_eq!(n10.profile, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10);
+        assert_eq!(n10.refinements, [10]);
+        assert_eq!(n10.ranks, C51_SPECTRAL_RANK_EXTENSION_N10_GRID);
+        assert_eq!(n10.evidence_tier(), "rank_extension");
+
+        assert!(C51SpectralCovarianceRankConfig::rank_extension(6).is_err());
+        let mut mutated = n8;
+        mutated.ranks.pop();
+        assert!(mutated.validate().is_err());
+    }
+
+    #[test]
+    fn rank_extension_manifest_names_alpha_and_post_primary_tier_truthfully() {
+        let path = std::env::temp_dir().join(format!(
+            "c51-rank-extension-manifest-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let archive = C51SpectralCovarianceRankArchive {
+            metadata: C51SpectralCovarianceRankMetadata::discovery("test"),
+            config: C51SpectralCovarianceRankConfig::rank_extension(10).unwrap(),
+            basis_attempts: Vec::new(),
+            rows: Vec::new(),
+            covariances: Vec::new(),
+            exact_covariance_audits: Vec::new(),
+            sensor_banks: Vec::new(),
+            plumbing_gates: Vec::new(),
+        };
+        archive.write_manifest(&path).unwrap();
+        let manifest = std::fs::read_to_string(&path).unwrap();
+        assert!(manifest.contains("profile: rank-extension-v1-n10"));
+        assert!(manifest.contains("evidence_tier: rank_extension"));
+        assert!(manifest.contains("post_primary: true"));
+        assert!(manifest.contains("post_primary_rationale: \"post-primary extension"));
+        assert!(manifest.contains("alpha_values: [2]"));
+        assert!(manifest.contains("method_performance_timing_eligible: false"));
+        std::fs::remove_file(path).unwrap();
     }
 
     #[test]

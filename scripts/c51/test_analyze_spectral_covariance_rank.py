@@ -11,8 +11,9 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(MODULE)
 
 
-def row(rank, selection, heldout, status="measured"):
+def row(rank, selection, heldout, status="measured", evidence_tier="rank_discovery"):
     return {
+        "evidence_tier": evidence_tier,
         "refinement": "8",
         "alpha": "2",
         "design": "prior",
@@ -51,6 +52,26 @@ class RankAnalyzerTests(unittest.TestCase):
         result = MODULE.analyze_group(rows, 0.10)
         self.assertEqual(result["status"], "computationally_unavailable")
         self.assertNotEqual(result["status"], "required_rank_gt_2048")
+
+    def test_rank_extension_failure_is_greater_than_actual_maximum_tested(self):
+        rows = [
+            row(2048, 0.04, 0.04, evidence_tier="rank_extension"),
+            row(2560, 0.03, 0.03, evidence_tier="rank_extension"),
+            row(4096, 0.021, 0.019, evidence_tier="rank_extension"),
+        ]
+        result = MODULE.analyze_group(rows, 0.02)
+        self.assertEqual(result["evidence_tier"], "rank_extension")
+        self.assertEqual(result["status"], "required_rank_gt_max_tested")
+        self.assertEqual(result["maximum_tested_rank"], "4096")
+        self.assertIn("4096", result["reason"])
+
+    def test_rank_curve_rejects_mixed_primary_and_extension_rows(self):
+        rows = [
+            row(2048, 0.04, 0.04),
+            row(2304, 0.03, 0.03, evidence_tier="rank_extension"),
+        ]
+        with self.assertRaisesRegex(ValueError, "mix evidence tiers"):
+            MODULE.analyze_group(rows, 0.05)
 
 
 if __name__ == "__main__":

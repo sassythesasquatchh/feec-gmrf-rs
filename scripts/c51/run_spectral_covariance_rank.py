@@ -30,8 +30,24 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 
-SCHEMA_VERSION = "c51-spectral-rank-attempt-v1"
-PROFILE = "publication-discovery-v1"
+SCHEMA_VERSION = "c51-spectral-rank-attempt-v2"
+PRIMARY_PROFILE = "publication-discovery-v1"
+RANK_EXTENSION_PROFILES = {
+    "rank-extension-v1-n8": {
+        "refinement": 8,
+        "ranks": (2048, 2304, 2560, 2816, 3000, 3032),
+        "evidence_tier": "rank_extension",
+    },
+    "rank-extension-v1-n10": {
+        "refinement": 10,
+        "ranks": (2048, 2560, 3072, 3584, 4096),
+        "evidence_tier": "rank_extension",
+    },
+}
+RANK_EXTENSION_RATIONALE = (
+    "post-primary extension frozen after publication-discovery-v1 left corrected "
+    "alpha=2 5%/2% decisions unresolved; shared-basis rows are timing ineligible"
+)
 EXAMPLE = "c51_spectral_covariance_rank"
 PACKAGE = "feg-case-studies"
 FEATURES = "experimental,external-solvers"
@@ -213,21 +229,60 @@ def build_command(cargo: str) -> list[str]:
 
 def scientific_command(
     binary: pathlib.Path,
+    profile: str,
     refinement: int,
-    maximum_rank: int,
+    maximum_rank: int | None,
     study_output: pathlib.Path,
 ) -> list[str]:
-    return [
+    command = [
         str(binary),
         "--profile",
-        PROFILE,
+        profile,
         "--refinement",
         str(refinement),
-        "--maximum-rank",
-        str(maximum_rank),
         "--output",
         str(study_output),
     ]
+    if maximum_rank is not None:
+        command[5:5] = ["--maximum-rank", str(maximum_rank)]
+    return command
+
+
+def resolve_profile(
+    profile: str, refinement: int, maximum_rank: int | None
+) -> dict[str, Any]:
+    if profile == PRIMARY_PROFILE:
+        if refinement not in (8, 10):
+            raise ValueError("publication-discovery-v1 requires refinement 8 or 10")
+        if maximum_rank is None:
+            raise ValueError("publication-discovery-v1 requires --maximum-rank")
+        return {
+            "profile": profile,
+            "refinement": refinement,
+            "maximum_rank": maximum_rank,
+            "rank_grid": None,
+            "evidence_tier": "rank_discovery",
+            "post_primary": False,
+            "post_primary_rationale": None,
+        }
+    if profile in RANK_EXTENSION_PROFILES:
+        frozen = RANK_EXTENSION_PROFILES[profile]
+        if refinement != frozen["refinement"]:
+            raise ValueError(
+                f"{profile} requires refinement {frozen['refinement']}, received {refinement}"
+            )
+        if maximum_rank is not None:
+            raise ValueError(f"{profile} has an immutable grid and rejects --maximum-rank")
+        return {
+            "profile": profile,
+            "refinement": refinement,
+            "maximum_rank": frozen["ranks"][-1],
+            "rank_grid": list(frozen["ranks"]),
+            "evidence_tier": frozen["evidence_tier"],
+            "post_primary": True,
+            "post_primary_rationale": RANK_EXTENSION_RATIONALE,
+        }
+    raise ValueError(f"unknown C51 spectral covariance profile {profile}")
 
 
 def directory_bytes(root: pathlib.Path) -> int:
@@ -591,7 +646,12 @@ def validate_positive(name: str, value: float | int) -> None:
         raise ValueError(f"{name} must be positive")
 
 
-def dry_run_plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
+def dry_run_plan(
+    args: argparse.Namespace,
+    repository: pathlib.Path,
+    profile: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    profile = profile or resolve_profile(args.profile, args.refinement, args.maximum_rank)
     binary = release_binary(repository)
     output = args.output.resolve()
     return {
@@ -600,13 +660,17 @@ def dry_run_plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str
         "repository": str(repository),
         "attempt_output": str(output),
         "study_output": str(output / "study"),
-        "profile": PROFILE,
+        "profile": profile["profile"],
+        "evidence_tier": profile["evidence_tier"],
+        "post_primary": profile["post_primary"],
+        "post_primary_rationale": profile["post_primary_rationale"],
         "refinement": args.refinement,
-        "maximum_rank": args.maximum_rank,
+        "maximum_rank": profile["maximum_rank"],
+        "rank_grid": profile["rank_grid"],
         "build_command": build_command(args.cargo),
         "anticipated_binary": str(binary),
         "scientific_command": scientific_command(
-            binary, args.refinement, args.maximum_rank, output / "study"
+            binary, args.profile, args.refinement, args.maximum_rank, output / "study"
         ),
         "caps": {
             "wall_time_seconds": args.wall_time_limit_seconds,
@@ -634,17 +698,25 @@ def initial_manifest(
     source: Mapping[str, Any],
     platform_info: Mapping[str, Any],
     tools: Mapping[str, Any],
+    profile: Mapping[str, Any],
 ) -> dict[str, Any]:
     scientific = scientific_command(
-        binary, args.refinement, args.maximum_rank, output / "study"
+        binary, args.profile, args.refinement, args.maximum_rank, output / "study"
     )
     return {
         "schema_version": SCHEMA_VERSION,
         "outcome": "running",
         "reason": "attempt initialized",
-        "profile": PROFILE,
+        "profile": profile["profile"],
+        "evidence_tier": profile["evidence_tier"],
+        "post_primary": profile["post_primary"],
+        "post_primary_rationale": profile["post_primary_rationale"],
+        "method_performance_timing_eligible": False,
+        "shared_maximum_basis": True,
         "refinement": args.refinement,
-        "maximum_rank": args.maximum_rank,
+        "maximum_rank": profile["maximum_rank"],
+        "rank_grid": profile["rank_grid"],
+        "requested_maximum_rank": args.maximum_rank,
         "attempt_output": str(output),
         "study_output": str(output / "study"),
         "command": scientific,
@@ -682,7 +754,8 @@ def run_attempt(args: argparse.Namespace) -> int:
         return 2
     try:
         validate_positive("refinement", args.refinement)
-        validate_positive("maximum rank", args.maximum_rank)
+        profile = resolve_profile(args.profile, args.refinement, args.maximum_rank)
+        validate_positive("maximum rank", profile["maximum_rank"])
         validate_positive("wall-time limit", args.wall_time_limit_seconds)
         validate_positive("RSS cap", args.rss_cap_bytes)
         validate_positive("disk cap", args.disk_cap_bytes)
@@ -696,7 +769,7 @@ def run_attempt(args: argparse.Namespace) -> int:
         print("resource-capped C51 runs are supported only on macOS and Linux", file=sys.stderr)
         return 2
     if args.dry_run:
-        print(json.dumps(dry_run_plan(args, repository), indent=2, sort_keys=True))
+        print(json.dumps(dry_run_plan(args, repository, profile), indent=2, sort_keys=True))
         return 0
 
     # Freeze source and tool state before creating a possibly unignored output
@@ -732,6 +805,7 @@ def run_attempt(args: argparse.Namespace) -> int:
             captured_source,
             captured_platform,
             captured_tools,
+            profile,
         )
     except BaseException as error:
         interrupted = isinstance(error, KeyboardInterrupt)
@@ -739,13 +813,20 @@ def run_attempt(args: argparse.Namespace) -> int:
             "schema_version": SCHEMA_VERSION,
             "outcome": "interrupted" if interrupted else "initialization_failed",
             "reason": f"attempt metadata initialization failed: {error}",
-            "profile": PROFILE,
+            "profile": profile["profile"],
+            "evidence_tier": profile["evidence_tier"],
+            "post_primary": profile["post_primary"],
+            "post_primary_rationale": profile["post_primary_rationale"],
+            "method_performance_timing_eligible": False,
+            "shared_maximum_basis": True,
             "refinement": args.refinement,
-            "maximum_rank": args.maximum_rank,
+            "maximum_rank": profile["maximum_rank"],
+            "rank_grid": profile["rank_grid"],
+            "requested_maximum_rank": args.maximum_rank,
             "attempt_output": str(output),
             "study_output": str(output / "study"),
             "command": scientific_command(
-                binary, args.refinement, args.maximum_rank, output / "study"
+                binary, args.profile, args.refinement, args.maximum_rank, output / "study"
             ),
             "caps": {
                 "wall_time_seconds": args.wall_time_limit_seconds,
@@ -837,7 +918,7 @@ def run_attempt(args: argparse.Namespace) -> int:
         return 2
 
     command = scientific_command(
-        binary, args.refinement, args.maximum_rank, output / "study"
+        binary, args.profile, args.refinement, args.maximum_rank, output / "study"
     )
     result = run_monitored_process(
         command=command,
@@ -930,8 +1011,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         type=pathlib.Path,
         default=pathlib.Path(__file__).resolve().parents[2],
     )
+    parser.add_argument(
+        "--profile",
+        choices=(PRIMARY_PROFILE, *RANK_EXTENSION_PROFILES),
+        default=PRIMARY_PROFILE,
+    )
     parser.add_argument("--refinement", required=True, type=int)
-    parser.add_argument("--maximum-rank", required=True, type=int)
+    parser.add_argument("--maximum-rank", type=int)
     parser.add_argument("--output", required=True, type=pathlib.Path)
     parser.add_argument("--wall-time-limit-seconds", type=float, default=DEFAULT_WALL_TIME_SECONDS)
     parser.add_argument("--rss-cap-bytes", type=int, default=DEFAULT_RSS_CAP_BYTES)
