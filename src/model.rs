@@ -406,6 +406,21 @@ impl LinearGaussianModelBuilder {
     pub fn prepare(self) -> Result<crate::infer::PreparedLinearGaussianModel> {
         crate::infer::prepare_linear_model(self)
     }
+
+    /// Prepare a fixed design and report posterior-update, symbolic-analysis,
+    /// numeric-factorization, and initial-solve resources separately.
+    ///
+    /// Peak resident memory is intentionally left for a fresh-process external
+    /// monitor and can be attached to the returned report before archiving a
+    /// benchmark row.
+    pub fn prepare_with_resource_report(
+        self,
+    ) -> Result<(
+        crate::infer::PreparedLinearGaussianModel,
+        crate::infer::SparseDirectResourceReport,
+    )> {
+        crate::infer::prepare_linear_model_with_resource_report(self)
+    }
 }
 
 /// Existing nonlinear model contracts and solvers.

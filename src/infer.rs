@@ -5,7 +5,8 @@ use crate::model::{DerivedQuantity, LinearGaussianModelBuilder};
 use crate::operator::{LinearMap, SparseMat};
 use crate::{FeecGmrfError, Result};
 use gmrf_core::observation::{
-    condition_linear_gaussian_with_factor, ht_precision_weighted_observations,
+    condition_linear_gaussian_with_factor,
+    condition_linear_gaussian_with_factor_and_resource_report, ht_precision_weighted_observations,
     ht_weighted_observations, LinearObservationTerm,
 };
 use gmrf_core::types::{CooMatrix, DenseMatrix, SparseMatrix, Vector};
@@ -1206,6 +1207,12 @@ fn validate_output_weights(weights: &[f64], output_dimension: usize) -> Result<(
 pub(crate) fn prepare_linear_model(
     builder: LinearGaussianModelBuilder,
 ) -> Result<PreparedLinearGaussianModel> {
+    Ok(prepare_linear_model_with_resource_report(builder)?.0)
+}
+
+pub(crate) fn prepare_linear_model_with_resource_report(
+    builder: LinearGaussianModelBuilder,
+) -> Result<(PreparedLinearGaussianModel, SparseDirectResourceReport)> {
     let prior_precision = gmrf_sparse(builder.prior.precision());
     let prior_mean = Vector::from_vec(builder.prior.mean().to_vec());
     let boundary_elimination = builder.prior.boundary_elimination().cloned();
@@ -1254,7 +1261,11 @@ pub(crate) fn prepare_linear_model(
             ),
         })
         .collect::<Vec<_>>();
-    let factored = condition_linear_gaussian_with_factor(&prior_precision, &terms)?;
+    let (factored, resources) = condition_linear_gaussian_with_factor_and_resource_report(
+        &prior_precision,
+        &terms,
+        gmrf_core::CholeskyOrdering::Amd,
+    )?;
     let constraints = stack_constraints(&builder.constraints, builder.prior.dimension())?;
     let constraint_solver = constraints
         .as_ref()
@@ -1272,18 +1283,21 @@ pub(crate) fn prepare_linear_model(
              }| (name, (operator, bias)),
         )
         .collect();
-    Ok(PreparedLinearGaussianModel {
-        prior_mean,
-        observations,
-        default_values,
-        posterior_precision: factored.posterior_precision,
-        posterior_factor: factored.posterior_factor,
-        public_precision,
-        constraints,
-        constraint_solver,
-        derived,
-        boundary_elimination,
-    })
+    Ok((
+        PreparedLinearGaussianModel {
+            prior_mean,
+            observations,
+            default_values,
+            posterior_precision: factored.posterior_precision,
+            posterior_factor: factored.posterior_factor,
+            public_precision,
+            constraints,
+            constraint_solver,
+            derived,
+            boundary_elimination,
+        },
+        resources,
+    ))
 }
 
 pub(crate) fn condition_linear_model(builder: LinearGaussianModelBuilder) -> Result<Posterior> {

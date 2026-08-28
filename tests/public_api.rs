@@ -351,6 +351,50 @@ fn heteroscedastic_rows_and_prepared_conditioning_use_the_public_model() {
 }
 
 #[test]
+fn prepared_model_reports_observation_update_factorization_and_initial_solve() {
+    let prior = GaussianPrior::new(vec![0.0, 0.0, 0.0], SparseMat::diagonal(3, 2.0)).unwrap();
+    let observation = LinearObservation::at_indices(
+        3,
+        &[0, 2],
+        vec![1.0, -0.5],
+        GaussianNoise::variance(0.25).unwrap(),
+    )
+    .unwrap();
+
+    let (prepared, resources) = LinearGaussianModelBuilder::new(prior)
+        .observe(observation)
+        .unwrap()
+        .prepare_with_resource_report()
+        .unwrap();
+
+    assert_eq!(prepared.observation_row_counts(), [2]);
+    assert_eq!(resources.dimension, 3);
+    assert!(matches!(
+        resources.assembly.wall_time,
+        ResourceMeasurement::Measured(_)
+    ));
+    assert!(matches!(
+        resources.analysis.wall_time,
+        ResourceMeasurement::Measured(_)
+    ));
+    assert!(matches!(
+        resources.numeric_factorization.wall_time,
+        ResourceMeasurement::Measured(_)
+    ));
+    assert!(matches!(
+        resources.factor_storage_nonzeros,
+        ResourceMeasurement::Measured(_)
+    ));
+    assert_eq!(resources.solve.calls, 1);
+    assert_eq!(resources.solve.right_hand_sides, 1);
+    assert_vector_close(
+        prepared.condition().unwrap().mean(),
+        &[2.0 / 3.0, 0.0, -1.0 / 3.0],
+        1e-12,
+    );
+}
+
+#[test]
 fn prepared_mean_only_path_respects_hard_constraints() {
     let prior = GaussianPrior::new(vec![0.0, 0.0], SparseMat::diagonal(2, 1.0)).unwrap();
     let observation =
