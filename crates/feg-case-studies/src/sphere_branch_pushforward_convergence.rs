@@ -1,7 +1,7 @@
 //! Analytic convergence study for exact/coexact 1-form pushforwards on S^2.
 //!
-//! The experiment compares ordinary potential priors with the spectrum-matched
-//! sparse-anchor correction for alpha=2.  Outputs are ambient vector component
+//! The experiment compares potential-spectrum and form-spectrum Hodge--Matérn
+//! priors for alpha=2. Outputs are ambient vector component
 //! covariances reconstructed at selected triangle barycenters.
 
 use crate::sphere_sparse_anchor_kernel_validation::{
@@ -11,13 +11,11 @@ use common::linalg::nalgebra::CsrMatrix as FeecCsr;
 use feg_core::HodgeBranchKind;
 use feg_infer::{
     prior::{
-        matern::{one_form::build_reconstructed_barycenter_field_operator, MaternAlpha},
-        sparse_anchor_hodge::{
-            build_ordinary_potential_hodge_1form_prior_with_coords,
-            build_sparse_anchor_hodge_1form_prior_with_coords,
-            OrdinaryPotentialHodge1FormPriorConfig, SparseAnchorBranchConfig,
-            SparseAnchorHodge1FormPriorConfig,
+        hodge_matern::{
+            build_hodge_matern_1form_prior_with_coords, HodgeMatern1FormPriorConfig,
+            HodgeMaternBranchConfig, HodgeMaternSpectrum,
         },
+        matern::{one_form::build_reconstructed_barycenter_field_operator, MaternAlpha},
     },
     sparse::{feec_csr_to_gmrf, sparse_row_operator_from_feec_csr},
 };
@@ -72,15 +70,15 @@ impl Default for SphereBranchPushforwardConvergenceConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SphereBranchPushforwardModel {
-    OrdinaryPotential,
-    SpectrallyCorrected,
+    PotentialMatern,
+    FormMatern,
 }
 
 impl SphereBranchPushforwardModel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::OrdinaryPotential => "ordinary_potential",
-            Self::SpectrallyCorrected => "spectrally_corrected",
+            Self::PotentialMatern => "potential_matern",
+            Self::FormMatern => "form_matern",
         }
     }
 }
@@ -111,8 +109,8 @@ impl SphereBranchPushforwardComponent {
 }
 
 const REPORT_MODELS: [SphereBranchPushforwardModel; 2] = [
-    SphereBranchPushforwardModel::OrdinaryPotential,
-    SphereBranchPushforwardModel::SpectrallyCorrected,
+    SphereBranchPushforwardModel::PotentialMatern,
+    SphereBranchPushforwardModel::FormMatern,
 ];
 const REPORT_COMPONENTS: [SphereBranchPushforwardComponent; 3] = [
     SphereBranchPushforwardComponent::Exact,
@@ -273,40 +271,28 @@ fn compute_model_covariance(
     config: &SphereBranchPushforwardConvergenceConfig,
 ) -> Result<ModelCovariance, String> {
     let branches = component.branches();
-    let branch_config = SparseAnchorBranchConfig {
+    let branch_config = HodgeMaternBranchConfig {
         kappa: config.kappa,
         tau: config.tau,
         alpha: MaternAlpha::Two,
     };
-    let prior = match model {
-        SphereBranchPushforwardModel::OrdinaryPotential => {
-            build_ordinary_potential_hodge_1form_prior_with_coords(
-                &level.topology,
-                &level.coords,
-                &level.metric,
-                OrdinaryPotentialHodge1FormPriorConfig {
-                    branches,
-                    exact: branch_config,
-                    coexact: branch_config,
-                    ..OrdinaryPotentialHodge1FormPriorConfig::default()
-                },
-            )
-        }
-        SphereBranchPushforwardModel::SpectrallyCorrected => {
-            build_sparse_anchor_hodge_1form_prior_with_coords(
-                &level.topology,
-                &level.coords,
-                &level.metric,
-                SparseAnchorHodge1FormPriorConfig {
-                    branches,
-                    exact: branch_config,
-                    coexact: branch_config,
-                    harmonic_dim: Some(0),
-                    ..SparseAnchorHodge1FormPriorConfig::default()
-                },
-            )
-        }
-    }?;
+    let spectrum = match model {
+        SphereBranchPushforwardModel::PotentialMatern => HodgeMaternSpectrum::Potential,
+        SphereBranchPushforwardModel::FormMatern => HodgeMaternSpectrum::Form,
+    };
+    let prior = build_hodge_matern_1form_prior_with_coords(
+        &level.topology,
+        &level.coords,
+        &level.metric,
+        spectrum,
+        HodgeMatern1FormPriorConfig {
+            branches,
+            exact: branch_config,
+            coexact: branch_config,
+            harmonic_dim: Some(0),
+            ..HodgeMatern1FormPriorConfig::default()
+        },
+    )?;
     let transform_operator = sparse_row_operator_from_feec_csr(&prior.latent_to_ambient)?;
     let latent_operator = SparseRowOperator::compose(&level.operator, &transform_operator)
         .map_err(|err| err.to_string())?;
@@ -513,8 +499,8 @@ fn fit_summary_rows(rows: &[SphereBranchCovarianceSummaryRow]) -> Vec<SphereBran
 
 fn fit_status(model: SphereBranchPushforwardModel) -> &'static str {
     match model {
-        SphereBranchPushforwardModel::SpectrallyCorrected => "expected_convergent",
-        SphereBranchPushforwardModel::OrdinaryPotential => "diagnostic_baseline",
+        SphereBranchPushforwardModel::FormMatern => "expected_convergent",
+        SphereBranchPushforwardModel::PotentialMatern => "diagnostic_baseline",
     }
 }
 
@@ -819,8 +805,7 @@ mod tests {
         let mut rows = rows
             .iter()
             .filter(|row| {
-                row.model == SphereBranchPushforwardModel::SpectrallyCorrected
-                    && row.component == component
+                row.model == SphereBranchPushforwardModel::FormMatern && row.component == component
             })
             .collect::<Vec<_>>();
         rows.sort_by_key(|row| row.refinement_level);

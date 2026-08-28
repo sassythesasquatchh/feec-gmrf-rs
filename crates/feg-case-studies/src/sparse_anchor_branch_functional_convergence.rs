@@ -1,7 +1,7 @@
 //! Functional variance convergence for 3D Hodge-Matern and decomposed branches.
 //!
 //! This experiment compares the full 1-form Hodge-Matern baseline,
-//! spectrum-matched sparse-anchor branch priors, and ordinary-potential
+//! form-spectrum and potential-spectrum decomposed branch priors, and
 //! pushforward diagnostics. It uses native 1-form line integrals and
 //! barycenter-reconstructed point component/trace pushforwards.
 
@@ -10,6 +10,10 @@ use common::linalg::nalgebra::CsrMatrix as FeecCsr;
 use feg_core::HodgeBranchKind;
 use feg_infer::{
     prior::{
+        hodge_matern::{
+            build_hodge_matern_1form_prior_with_coords, HodgeMatern1FormPrior,
+            HodgeMatern1FormPriorConfig, HodgeMaternBranchConfig, HodgeMaternSpectrum,
+        },
         matern::{
             one_form::{
                 build_hodge_laplacian_1form, build_matern_precision_1form_for_alpha_with_coords,
@@ -17,12 +21,6 @@ use feg_infer::{
                 MaternMassInverse as Matern1FormMassInverse,
             },
             MaternAlpha,
-        },
-        sparse_anchor_hodge::{
-            build_ordinary_potential_hodge_1form_prior_with_coords,
-            build_sparse_anchor_hodge_1form_prior_with_coords,
-            OrdinaryPotentialHodge1FormPriorConfig, SparseAnchorBranchConfig,
-            SparseAnchorHodge1FormPrior, SparseAnchorHodge1FormPriorConfig,
         },
     },
     sparse::{feec_csr_to_gmrf, sparse_row_operator_from_feec_csr},
@@ -75,16 +73,16 @@ impl Default for BranchFunctionalConvergenceConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum BranchFunctionalModel {
     BaselineHodgeMatern,
-    SpectrumMatched,
-    OrdinaryPotential,
+    FormMatern,
+    PotentialMatern,
 }
 
 impl BranchFunctionalModel {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::BaselineHodgeMatern => "baseline_hodge_matern",
-            Self::SpectrumMatched => "spectrum_matched",
-            Self::OrdinaryPotential => "ordinary_potential",
+            Self::FormMatern => "form_matern",
+            Self::PotentialMatern => "potential_matern",
         }
     }
 }
@@ -122,8 +120,8 @@ impl BranchFunctionalComponent {
 
 const REPORT_MODELS: [BranchFunctionalModel; 3] = [
     BranchFunctionalModel::BaselineHodgeMatern,
-    BranchFunctionalModel::SpectrumMatched,
-    BranchFunctionalModel::OrdinaryPotential,
+    BranchFunctionalModel::FormMatern,
+    BranchFunctionalModel::PotentialMatern,
 ];
 const FULL_1FORM_COMPONENTS: [BranchFunctionalComponent; 1] =
     [BranchFunctionalComponent::Full1Form];
@@ -135,7 +133,7 @@ const BRANCH_COMPONENTS: [BranchFunctionalComponent; 2] = [
 fn components_for_model(model: BranchFunctionalModel) -> &'static [BranchFunctionalComponent] {
     match model {
         BranchFunctionalModel::BaselineHodgeMatern => &FULL_1FORM_COMPONENTS,
-        BranchFunctionalModel::SpectrumMatched | BranchFunctionalModel::OrdinaryPotential => {
+        BranchFunctionalModel::FormMatern | BranchFunctionalModel::PotentialMatern => {
             &BRANCH_COMPONENTS
         }
     }
@@ -231,7 +229,7 @@ impl BuiltPrior {
         }
     }
 
-    fn from_sparse_anchor(prior: SparseAnchorHodge1FormPrior) -> Self {
+    fn from_hodge_matern(prior: HodgeMatern1FormPrior) -> Self {
         Self {
             latent_dimension: prior.latent_dimension(),
             precision: prior.precision,
@@ -351,7 +349,7 @@ fn build_prior(
     model: BranchFunctionalModel,
     component: BranchFunctionalComponent,
 ) -> Result<BuiltPrior, String> {
-    let branch_config = SparseAnchorBranchConfig {
+    let branch_config = HodgeMaternBranchConfig {
         kappa: config.kappa,
         tau: config.tau,
         alpha: MaternAlpha::Two,
@@ -380,34 +378,26 @@ fn build_prior(
             )?;
             Ok(BuiltPrior::from_ambient_precision(precision))
         }
-        BranchFunctionalModel::SpectrumMatched => {
-            build_sparse_anchor_hodge_1form_prior_with_coords(
+        BranchFunctionalModel::FormMatern | BranchFunctionalModel::PotentialMatern => {
+            let spectrum = match model {
+                BranchFunctionalModel::FormMatern => HodgeMaternSpectrum::Form,
+                BranchFunctionalModel::PotentialMatern => HodgeMaternSpectrum::Potential,
+                BranchFunctionalModel::BaselineHodgeMatern => unreachable!(),
+            };
+            build_hodge_matern_1form_prior_with_coords(
                 &mesh.topology,
                 &mesh.coords,
                 &mesh.metric,
-                SparseAnchorHodge1FormPriorConfig {
+                spectrum,
+                HodgeMatern1FormPriorConfig {
                     branches: component.branches()?,
                     exact: branch_config,
                     coexact: branch_config,
                     harmonic_dim: Some(0),
-                    ..SparseAnchorHodge1FormPriorConfig::default()
+                    ..HodgeMatern1FormPriorConfig::default()
                 },
             )
-            .map(BuiltPrior::from_sparse_anchor)
-        }
-        BranchFunctionalModel::OrdinaryPotential => {
-            build_ordinary_potential_hodge_1form_prior_with_coords(
-                &mesh.topology,
-                &mesh.coords,
-                &mesh.metric,
-                OrdinaryPotentialHodge1FormPriorConfig {
-                    branches: component.branches()?,
-                    exact: branch_config,
-                    coexact: branch_config,
-                    ..OrdinaryPotentialHodge1FormPriorConfig::default()
-                },
-            )
-            .map(BuiltPrior::from_sparse_anchor)
+            .map(BuiltPrior::from_hodge_matern)
         }
     }
 }
@@ -642,11 +632,11 @@ fn variance_row(
 fn status_for(model: BranchFunctionalModel, observable_kind: BranchObservableKind) -> &'static str {
     match (model, observable_kind) {
         (BranchFunctionalModel::BaselineHodgeMatern, _) => "expected_convergent",
-        (BranchFunctionalModel::SpectrumMatched, _) => "expected_convergent",
-        (BranchFunctionalModel::OrdinaryPotential, BranchObservableKind::Line) => {
+        (BranchFunctionalModel::FormMatern, _) => "expected_convergent",
+        (BranchFunctionalModel::PotentialMatern, BranchObservableKind::Line) => {
             "expected_log_borderline_growth"
         }
-        (BranchFunctionalModel::OrdinaryPotential, _) => "expected_point_growth",
+        (BranchFunctionalModel::PotentialMatern, _) => "expected_point_growth",
     }
 }
 
@@ -714,7 +704,7 @@ fn fit_summary_rows(rows: &[BranchFunctionalSummaryRow]) -> Vec<BranchFunctional
             continue;
         }
         let (diagnostic, value, expected, status) = match (model, observable_kind) {
-            (BranchFunctionalModel::OrdinaryPotential, BranchObservableKind::Line) => {
+            (BranchFunctionalModel::PotentialMatern, BranchObservableKind::Line) => {
                 let xs = group
                     .iter()
                     .map(|row| (row.n as f64).ln())
@@ -730,7 +720,7 @@ fn fit_summary_rows(rows: &[BranchFunctionalSummaryRow]) -> Vec<BranchFunctional
                     "borderline_log_diagnostic",
                 )
             }
-            (BranchFunctionalModel::OrdinaryPotential, _) => {
+            (BranchFunctionalModel::PotentialMatern, _) => {
                 let xs = group
                     .iter()
                     .map(|row| (row.n as f64).ln())
@@ -913,7 +903,7 @@ pub fn write_readme(path: &Path, config: &BranchFunctionalConvergenceConfig) -> 
     )?;
     writeln!(
         writer,
-        "- models: baseline_hodge_matern full_1form, spectrum_matched exact/coexact, and ordinary_potential exact/coexact"
+        "- models: baseline_hodge_matern full_1form, form_matern exact/coexact, and potential_matern exact/coexact"
     )?;
     writeln!(writer)?;
     writeln!(
@@ -987,19 +977,19 @@ mod tests {
                 BranchFunctionalComponent::Full1Form,
             ),
             (
-                BranchFunctionalModel::SpectrumMatched,
+                BranchFunctionalModel::FormMatern,
                 BranchFunctionalComponent::Exact,
             ),
             (
-                BranchFunctionalModel::SpectrumMatched,
+                BranchFunctionalModel::FormMatern,
                 BranchFunctionalComponent::Coexact,
             ),
             (
-                BranchFunctionalModel::OrdinaryPotential,
+                BranchFunctionalModel::PotentialMatern,
                 BranchFunctionalComponent::Exact,
             ),
             (
-                BranchFunctionalModel::OrdinaryPotential,
+                BranchFunctionalModel::PotentialMatern,
                 BranchFunctionalComponent::Coexact,
             ),
         ];
@@ -1017,11 +1007,10 @@ mod tests {
         assert!(result.rows.iter().all(|row| match row.model {
             BranchFunctionalModel::BaselineHodgeMatern =>
                 row.component == BranchFunctionalComponent::Full1Form,
-            BranchFunctionalModel::SpectrumMatched | BranchFunctionalModel::OrdinaryPotential =>
-                matches!(
-                    row.component,
-                    BranchFunctionalComponent::Exact | BranchFunctionalComponent::Coexact
-                ),
+            BranchFunctionalModel::FormMatern | BranchFunctionalModel::PotentialMatern => matches!(
+                row.component,
+                BranchFunctionalComponent::Exact | BranchFunctionalComponent::Coexact
+            ),
         }));
         assert_eq!(result.summaries.len(), 5 * 3);
         assert!(result.fit_summaries.is_empty());

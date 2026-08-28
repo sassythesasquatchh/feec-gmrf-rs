@@ -1,5 +1,6 @@
 pub mod exact_potential;
 pub mod hodge;
+pub mod hodge_matern;
 pub mod matern;
 pub mod spacetime;
 pub mod sparse_anchor_hodge;

@@ -1,16 +1,15 @@
 //! Variance convergence for exact/coexact smooth 1-form observables on S^2.
 //!
 //! This experiment tests fixed real vector-spherical-harmonic observables against
-//! alpha=2 ordinary-potential and spectrum-matched sparse-anchor branch priors.
+//! alpha=2 potential-spectrum and form-spectrum Hodge--Matérn branch priors.
 //! It computes only transformed marginal variances, not full covariance matrices.
 
 use crate::sphere_sparse_anchor_kernel_validation::analytic_branch_covariance;
 use common::linalg::nalgebra::Vector as FeecVector;
 use exterior::field::DiffFormClosure;
 use feec_gmrf::prelude::{
-    HodgeBranchKind, HodgeOneFormPrior, HodgeOneFormPriorBuilder, LinearMap,
-    OrdinaryPotentialHodge1FormPriorConfig, SparseAnchorBranchConfig,
-    SparseAnchorHodge1FormPriorConfig, VarianceMethod,
+    HodgeBranchKind, HodgeMatern1FormPriorConfig, HodgeMaternBranchConfig, HodgeOneFormPrior,
+    HodgeOneFormPriorBuilder, LinearMap, VarianceMethod,
 };
 use feg_infer::prior::matern::{
     one_form::build_reconstructed_barycenter_field_operator, MaternAlpha,
@@ -89,22 +88,22 @@ impl SphereBranchObservableConvergenceConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SphereBranchObservableModel {
-    OrdinaryPotential,
-    SpectrallyCorrected,
+    PotentialMatern,
+    FormMatern,
 }
 
 impl SphereBranchObservableModel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::OrdinaryPotential => "ordinary_potential",
-            Self::SpectrallyCorrected => "spectrally_corrected",
+            Self::PotentialMatern => "potential_matern",
+            Self::FormMatern => "form_matern",
         }
     }
 }
 
 const REPORT_MODELS: [SphereBranchObservableModel; 2] = [
-    SphereBranchObservableModel::OrdinaryPotential,
-    SphereBranchObservableModel::SpectrallyCorrected,
+    SphereBranchObservableModel::PotentialMatern,
+    SphereBranchObservableModel::FormMatern,
 ];
 const REPORT_BRANCHES: [HodgeBranchKind; 2] = [HodgeBranchKind::Exact, HodgeBranchKind::Coexact];
 
@@ -662,38 +661,35 @@ fn build_prior(
     model: SphereBranchObservableModel,
     prior_branch: HodgeBranchKind,
 ) -> Result<HodgeOneFormPrior, String> {
-    let branch_config = SparseAnchorBranchConfig {
+    let branch_config = HodgeMaternBranchConfig {
         kappa: config.kappa,
         tau: config.tau,
         alpha: MaternAlpha::Two,
     };
     let branches = vec![prior_branch];
     let builder = match model {
-        SphereBranchObservableModel::OrdinaryPotential => {
-            HodgeOneFormPriorBuilder::ordinary_potential(
-                &mesh.topology,
-                &mesh.metric,
-                OrdinaryPotentialHodge1FormPriorConfig {
-                    branches,
-                    exact: branch_config,
-                    coexact: branch_config,
-                    ..OrdinaryPotentialHodge1FormPriorConfig::default()
-                },
-            )
-        }
-        SphereBranchObservableModel::SpectrallyCorrected => {
-            HodgeOneFormPriorBuilder::sparse_anchor(
-                &mesh.topology,
-                &mesh.metric,
-                SparseAnchorHodge1FormPriorConfig {
-                    branches,
-                    exact: branch_config,
-                    coexact: branch_config,
-                    harmonic_dim: Some(0),
-                    ..SparseAnchorHodge1FormPriorConfig::default()
-                },
-            )
-        }
+        SphereBranchObservableModel::PotentialMatern => HodgeOneFormPriorBuilder::potential_matern(
+            &mesh.topology,
+            &mesh.metric,
+            HodgeMatern1FormPriorConfig {
+                branches,
+                exact: branch_config,
+                coexact: branch_config,
+                harmonic_dim: Some(0),
+                ..HodgeMatern1FormPriorConfig::default()
+            },
+        ),
+        SphereBranchObservableModel::FormMatern => HodgeOneFormPriorBuilder::form_matern(
+            &mesh.topology,
+            &mesh.metric,
+            HodgeMatern1FormPriorConfig {
+                branches,
+                exact: branch_config,
+                coexact: branch_config,
+                harmonic_dim: Some(0),
+                ..HodgeMatern1FormPriorConfig::default()
+            },
+        ),
     };
     builder
         .with_coords(&mesh.coords)

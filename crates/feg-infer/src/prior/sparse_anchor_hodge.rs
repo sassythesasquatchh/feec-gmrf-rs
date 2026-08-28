@@ -37,14 +37,30 @@ const SPARSE_COEXACT_COCLOSED_RELATIVE_TOLERANCE: f64 = 2e-1;
 #[cfg(test)]
 const ORDINARY_POTENTIAL_3D_COEXACT_COCLOSED_RELATIVE_TOLERANCE: f64 = 1.0;
 
+/// Matérn parameters for one non-harmonic Hodge branch.
 #[derive(Debug, Clone, Copy)]
-pub struct SparseAnchorBranchConfig {
+pub struct HodgeMaternBranchConfig {
     pub kappa: f64,
     pub tau: f64,
     pub alpha: MaternAlpha,
 }
 
-impl Default for SparseAnchorBranchConfig {
+/// Legacy implementation-oriented name for [`HodgeMaternBranchConfig`].
+pub type SparseAnchorBranchConfig = HodgeMaternBranchConfig;
+
+/// Placement of the requested Matérn spectrum in a decomposed Hodge prior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HodgeMaternSpectrum {
+    /// Put the Matérn spectrum on the latent potential before `d`/`delta`.
+    /// The resulting form covariance has the additional exterior-calculus
+    /// eigenvalue factor `lambda`.
+    Potential,
+    /// Choose the potential precision so the synthesized form branch has the
+    /// requested Matérn spectrum, without the additional `lambda` factor.
+    Form,
+}
+
+impl Default for HodgeMaternBranchConfig {
     fn default() -> Self {
         Self {
             kappa: 1.0,
@@ -54,11 +70,12 @@ impl Default for SparseAnchorBranchConfig {
     }
 }
 
+/// Shared configuration for potential- and form-spectrum Hodge--Matérn priors.
 #[derive(Debug, Clone)]
-pub struct SparseAnchorHodge1FormPriorConfig {
+pub struct HodgeMatern1FormPriorConfig {
     pub branches: Vec<HodgeBranchKind>,
-    pub exact: SparseAnchorBranchConfig,
-    pub coexact: SparseAnchorBranchConfig,
+    pub exact: HodgeMaternBranchConfig,
+    pub coexact: HodgeMaternBranchConfig,
     pub harmonic_precision: f64,
     pub harmonic_dim: Option<usize>,
     pub harmonic_basis_override: Option<FeecMatrix>,
@@ -67,12 +84,12 @@ pub struct SparseAnchorHodge1FormPriorConfig {
     pub two_form_mass_inverse: Matern2FormMassInverse,
 }
 
-impl Default for SparseAnchorHodge1FormPriorConfig {
+impl Default for HodgeMatern1FormPriorConfig {
     fn default() -> Self {
         Self {
             branches: HodgeBranchKind::ALL.to_vec(),
-            exact: SparseAnchorBranchConfig::default(),
-            coexact: SparseAnchorBranchConfig::default(),
+            exact: HodgeMaternBranchConfig::default(),
+            coexact: HodgeMaternBranchConfig::default(),
             harmonic_precision: 1.0,
             harmonic_dim: None,
             harmonic_basis_override: None,
@@ -83,7 +100,7 @@ impl Default for SparseAnchorHodge1FormPriorConfig {
     }
 }
 
-impl SparseAnchorHodge1FormPriorConfig {
+impl HodgeMatern1FormPriorConfig {
     pub fn selected(branches: impl IntoIterator<Item = HodgeBranchKind>) -> Self {
         Self {
             branches: branches.into_iter().collect(),
@@ -91,6 +108,9 @@ impl SparseAnchorHodge1FormPriorConfig {
         }
     }
 }
+
+/// Legacy implementation-oriented name for [`HodgeMatern1FormPriorConfig`].
+pub type SparseAnchorHodge1FormPriorConfig = HodgeMatern1FormPriorConfig;
 
 #[derive(Debug, Clone)]
 pub struct OrdinaryPotentialHodge1FormPriorConfig {
@@ -125,41 +145,51 @@ impl OrdinaryPotentialHodge1FormPriorConfig {
 }
 
 #[derive(Debug, Clone)]
-pub struct SparseAnchorGauge {
+pub struct HodgePotentialGauge {
     pub anchors: Vec<usize>,
     pub kept_dofs: Vec<usize>,
     pub nullity: usize,
     pub max_transform_null_residual: f64,
 }
 
+/// Legacy implementation-oriented name for [`HodgePotentialGauge`].
+pub type SparseAnchorGauge = HodgePotentialGauge;
+
 #[derive(Debug, Clone)]
-pub struct SparseAnchorHodge1FormBranch {
+pub struct HodgeMatern1FormBranch {
     pub kind: HodgeBranchKind,
     pub offset: usize,
     pub latent_dimension: usize,
     pub ambient_dimension: usize,
     pub precision: FeecCsr,
     pub transform: FeecCsr,
-    pub gauge: Option<SparseAnchorGauge>,
+    pub gauge: Option<HodgePotentialGauge>,
 }
 
-impl SparseAnchorHodge1FormBranch {
+/// Legacy implementation-oriented name for [`HodgeMatern1FormBranch`].
+pub type SparseAnchorHodge1FormBranch = HodgeMatern1FormBranch;
+
+impl HodgeMatern1FormBranch {
     pub fn latent_range(&self) -> Range<usize> {
         self.offset..self.offset + self.latent_dimension
     }
 }
 
+/// A decomposed sparse Hodge--Matérn prior in its latent coordinates.
 #[derive(Debug, Clone)]
-pub struct SparseAnchorHodge1FormPrior {
+pub struct HodgeMatern1FormPrior {
     pub ambient_dimension: usize,
     pub precision: FeecCsr,
     pub latent_to_ambient: FeecCsr,
     pub mass_1form: FeecCsr,
     pub harmonic_basis: FeecMatrix,
-    pub branches: Vec<SparseAnchorHodge1FormBranch>,
+    pub branches: Vec<HodgeMatern1FormBranch>,
 }
 
-impl SparseAnchorHodge1FormPrior {
+/// Legacy implementation-oriented name for [`HodgeMatern1FormPrior`].
+pub type SparseAnchorHodge1FormPrior = HodgeMatern1FormPrior;
+
+impl HodgeMatern1FormPrior {
     pub fn latent_dimension(&self) -> usize {
         self.precision.nrows()
     }
@@ -174,6 +204,31 @@ impl SparseAnchorHodge1FormPrior {
             precision: feec_csr_to_core_triplet(&self.precision),
         }
     }
+}
+
+pub fn build_hodge_matern_1form_prior(
+    topology: &Complex,
+    metric: &MeshLengths,
+    spectrum: HodgeMaternSpectrum,
+    config: HodgeMatern1FormPriorConfig,
+) -> Result<HodgeMatern1FormPrior, String> {
+    build_hodge_matern_1form_prior_with_optional_coords(topology, None, metric, spectrum, config)
+}
+
+pub fn build_hodge_matern_1form_prior_with_coords(
+    topology: &Complex,
+    coords: &MeshCoords,
+    metric: &MeshLengths,
+    spectrum: HodgeMaternSpectrum,
+    config: HodgeMatern1FormPriorConfig,
+) -> Result<HodgeMatern1FormPrior, String> {
+    build_hodge_matern_1form_prior_with_optional_coords(
+        topology,
+        Some(coords),
+        metric,
+        spectrum,
+        config,
+    )
 }
 
 pub fn build_sparse_anchor_hodge_1form_prior(
@@ -226,10 +281,26 @@ fn build_sparse_anchor_hodge_1form_prior_with_optional_coords(
     metric: &MeshLengths,
     config: SparseAnchorHodge1FormPriorConfig,
 ) -> Result<SparseAnchorHodge1FormPrior, String> {
-    validate_config(&config)?;
+    build_hodge_matern_1form_prior_with_optional_coords(
+        topology,
+        coords,
+        metric,
+        HodgeMaternSpectrum::Form,
+        config,
+    )
+}
+
+fn build_hodge_matern_1form_prior_with_optional_coords(
+    topology: &Complex,
+    coords: Option<&MeshCoords>,
+    metric: &MeshLengths,
+    spectrum: HodgeMaternSpectrum,
+    config: HodgeMatern1FormPriorConfig,
+) -> Result<HodgeMatern1FormPrior, String> {
+    validate_spectrum_config(&config, spectrum)?;
     if !(topology.dim() == 2 || topology.dim() == 3) {
         return Err(format!(
-            "sparse-anchor Hodge 1-form prior supports 2D/3D meshes, got dimension {}",
+            "Hodge 1-form Matérn prior supports 2D/3D meshes, got dimension {}",
             topology.dim()
         ));
     }
@@ -242,10 +313,24 @@ fn build_sparse_anchor_hodge_1form_prior_with_optional_coords(
 
     for kind in &config.branches {
         let mut branch = match kind {
-            HodgeBranchKind::Exact => build_exact_branch(topology, metric, &config)?,
-            HodgeBranchKind::Coexact => {
-                build_coexact_branch(topology, coords, metric, &hodge_1form.mass_u, &config)?
-            }
+            HodgeBranchKind::Exact => match spectrum {
+                HodgeMaternSpectrum::Potential => {
+                    build_ordinary_potential_exact_branch(topology, metric, &config)?
+                }
+                HodgeMaternSpectrum::Form => build_exact_branch(topology, metric, &config)?,
+            },
+            HodgeBranchKind::Coexact => match spectrum {
+                HodgeMaternSpectrum::Potential => build_ordinary_potential_coexact_branch(
+                    topology,
+                    coords,
+                    metric,
+                    &hodge_1form.mass_u,
+                    &config,
+                )?,
+                HodgeMaternSpectrum::Form => {
+                    build_coexact_branch(topology, coords, metric, &hodge_1form.mass_u, &config)?
+                }
+            },
             HodgeBranchKind::Harmonic => {
                 let harmonic_dim = config
                     .harmonic_dim
@@ -278,9 +363,7 @@ fn build_sparse_anchor_hodge_1form_prior_with_optional_coords(
 
     feec_csr_to_gmrf(&precision)
         .cholesky_sqrt_lower()
-        .map_err(|err| {
-            format!("sparse-anchor joint precision did not factorize after branch anchoring: {err}")
-        })?;
+        .map_err(|err| format!("joint Hodge-Matérn precision did not factorize: {err}"))?;
 
     Ok(SparseAnchorHodge1FormPrior {
         ambient_dimension,
@@ -299,65 +382,21 @@ fn build_ordinary_potential_hodge_1form_prior_with_optional_coords(
     config: OrdinaryPotentialHodge1FormPriorConfig,
 ) -> Result<SparseAnchorHodge1FormPrior, String> {
     validate_ordinary_potential_config(&config)?;
-    if !(topology.dim() == 2 || topology.dim() == 3) {
-        return Err(format!(
-            "ordinary-potential Hodge 1-form diagnostic prior supports 2D/3D meshes, got dimension {}",
-            topology.dim()
-        ));
-    }
-
-    let hodge_1form = build_hodge_laplacian_1form(topology, metric);
-    let ambient_dimension = hodge_1form.mass_u.nrows();
-    let mut branches = Vec::with_capacity(config.branches.len());
-    let mut offset = 0;
-
-    for kind in &config.branches {
-        let mut branch = match kind {
-            HodgeBranchKind::Exact => {
-                build_ordinary_potential_exact_branch(topology, metric, &config)?
-            }
-            HodgeBranchKind::Coexact => build_ordinary_potential_coexact_branch(
-                topology,
-                coords,
-                metric,
-                &hodge_1form.mass_u,
-                &config,
-            )?,
-            HodgeBranchKind::Harmonic => {
-                return Err(
-                    "ordinary-potential diagnostic prior supports exact/coexact branches only"
-                        .to_string(),
-                )
-            }
-        };
-        branch.offset = offset;
-        offset += branch.latent_dimension;
-        branches.push(branch);
-    }
-
-    let precision_blocks = branches
-        .iter()
-        .map(|branch| &branch.precision)
-        .collect::<Vec<_>>();
-    let transform_blocks = branches
-        .iter()
-        .map(|branch| &branch.transform)
-        .collect::<Vec<_>>();
-    let precision = block_diag_feec_csr(&precision_blocks);
-    let latent_to_ambient = hstack_feec_csr(&transform_blocks)?;
-
-    feec_csr_to_gmrf(&precision)
-        .cholesky_sqrt_lower()
-        .map_err(|err| format!("ordinary-potential joint precision did not factorize: {err}"))?;
-
-    Ok(SparseAnchorHodge1FormPrior {
-        ambient_dimension,
-        precision,
-        latent_to_ambient,
-        mass_1form: hodge_1form.mass_u,
-        harmonic_basis: FeecMatrix::zeros(ambient_dimension, 0),
-        branches,
-    })
+    build_hodge_matern_1form_prior_with_optional_coords(
+        topology,
+        coords,
+        metric,
+        HodgeMaternSpectrum::Potential,
+        SparseAnchorHodge1FormPriorConfig {
+            branches: config.branches,
+            exact: config.exact,
+            coexact: config.coexact,
+            zero_form_mass_inverse: config.zero_form_mass_inverse,
+            one_form_mass_inverse: config.one_form_mass_inverse,
+            two_form_mass_inverse: config.two_form_mass_inverse,
+            ..SparseAnchorHodge1FormPriorConfig::default()
+        },
+    )
 }
 
 fn build_exact_branch(
@@ -403,7 +442,7 @@ fn build_exact_branch(
 fn build_ordinary_potential_exact_branch(
     topology: &Complex,
     metric: &MeshLengths,
-    config: &OrdinaryPotentialHodge1FormPriorConfig,
+    config: &HodgeMatern1FormPriorConfig,
 ) -> Result<SparseAnchorHodge1FormBranch, String> {
     let laplace = build_laplace_beltrami_0form(topology, metric);
     let system = build_matern_system_matrix_0form(&laplace, config.exact.kappa);
@@ -559,7 +598,7 @@ fn build_ordinary_potential_coexact_branch(
     coords: Option<&MeshCoords>,
     metric: &MeshLengths,
     mass_1form: &FeecCsr,
-    config: &OrdinaryPotentialHodge1FormPriorConfig,
+    config: &HodgeMatern1FormPriorConfig,
 ) -> Result<SparseAnchorHodge1FormBranch, String> {
     if topology.dim() < 2 {
         return Err("coexact 1-form branch requires a mesh dimension of at least 2".to_string());
@@ -1179,9 +1218,12 @@ fn max_abs_sparse_dense_product(sparse: &FeecCsr, dense: &FeecMatrix) -> f64 {
     product.iter().copied().map(f64::abs).fold(0.0, f64::max)
 }
 
-fn validate_config(config: &SparseAnchorHodge1FormPriorConfig) -> Result<(), String> {
+fn validate_spectrum_config(
+    config: &HodgeMatern1FormPriorConfig,
+    spectrum: HodgeMaternSpectrum,
+) -> Result<(), String> {
     if config.branches.is_empty() {
-        return Err("at least one sparse-anchor branch must be requested".to_string());
+        return Err("at least one Hodge-Matérn branch must be requested".to_string());
     }
     for branch in &config.branches {
         if config
@@ -1192,13 +1234,21 @@ fn validate_config(config: &SparseAnchorHodge1FormPriorConfig) -> Result<(), Str
             > 1
         {
             return Err(format!(
-                "sparse-anchor branch `{}` was requested more than once",
+                "Hodge-Matérn branch `{}` was requested more than once",
                 branch.as_str()
             ));
         }
     }
-    validate_branch_config("exact", config.exact)?;
-    validate_branch_config("coexact", config.coexact)?;
+    match spectrum {
+        HodgeMaternSpectrum::Potential => {
+            validate_positive_branch_config("exact", config.exact)?;
+            validate_positive_branch_config("coexact", config.coexact)?;
+        }
+        HodgeMaternSpectrum::Form => {
+            validate_form_spectrum_branch_config("exact", config.exact)?;
+            validate_form_spectrum_branch_config("coexact", config.coexact)?;
+        }
+    }
     if !config.harmonic_precision.is_finite() || config.harmonic_precision <= 0.0 {
         return Err("harmonic precision must be finite and positive".to_string());
     }
@@ -1261,11 +1311,14 @@ fn validate_ordinary_potential_config(
     Ok(())
 }
 
-fn validate_branch_config(name: &str, config: SparseAnchorBranchConfig) -> Result<(), String> {
+fn validate_form_spectrum_branch_config(
+    name: &str,
+    config: HodgeMaternBranchConfig,
+) -> Result<(), String> {
     validate_positive_branch_config(name, config)?;
     if config.alpha == MaternAlpha::Three {
         return Err(format!(
-            "{name} branch alpha=3 is not yet supported by spectrum-matched sparse-anchor precision"
+            "{name} branch alpha=3 is not yet supported by the form-spectrum construction"
         ));
     }
     Ok(())
@@ -1273,7 +1326,7 @@ fn validate_branch_config(name: &str, config: SparseAnchorBranchConfig) -> Resul
 
 fn validate_positive_branch_config(
     name: &str,
-    config: SparseAnchorBranchConfig,
+    config: HodgeMaternBranchConfig,
 ) -> Result<(), String> {
     if !config.kappa.is_finite() || config.kappa <= 0.0 {
         return Err(format!("{name} branch kappa must be finite and positive"));
@@ -1331,14 +1384,15 @@ mod tests {
         let mut harmonic_basis = FeecMatrix::zeros(topology.edges().len(), 1);
         harmonic_basis[(0, 0)] = 2.0;
 
-        let prior = build_sparse_anchor_hodge_1form_prior(
+        let prior = build_hodge_matern_1form_prior(
             &topology,
             &metric,
-            SparseAnchorHodge1FormPriorConfig {
+            HodgeMaternSpectrum::Form,
+            HodgeMatern1FormPriorConfig {
                 branches: vec![HodgeBranchKind::Harmonic],
                 harmonic_dim: Some(1),
                 harmonic_basis_override: Some(harmonic_basis.clone()),
-                ..SparseAnchorHodge1FormPriorConfig::default()
+                ..HodgeMatern1FormPriorConfig::default()
             },
         )
         .expect("harmonic branch with supplied basis should build");
@@ -1346,6 +1400,58 @@ mod tests {
         assert_eq!(prior.harmonic_basis, harmonic_basis);
         assert_eq!(prior.latent_to_ambient.ncols(), 1);
         assert_eq!(prior.latent_to_ambient.nrows(), topology.edges().len());
+    }
+
+    #[test]
+    fn potential_matern_alpha_two_matches_legacy_decomposed_exact_branch() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(2, 1, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let metric = coords.to_edge_lengths(&topology);
+        let legacy = crate::prior::hodge::build_hodge_1form_decomposed_prior(
+            &topology,
+            &metric,
+            crate::prior::hodge::Hodge1FormPriorConfig::branch(
+                1.25,
+                0.75,
+                HodgeBranchKind::Exact,
+                0,
+            ),
+        )
+        .expect("legacy decomposed exact prior should build");
+        let canonical = build_hodge_matern_1form_prior(
+            &topology,
+            &metric,
+            HodgeMaternSpectrum::Potential,
+            HodgeMatern1FormPriorConfig {
+                branches: vec![HodgeBranchKind::Exact],
+                exact: HodgeMaternBranchConfig {
+                    kappa: 1.25,
+                    tau: 0.75,
+                    alpha: MaternAlpha::Two,
+                },
+                harmonic_dim: Some(0),
+                ..HodgeMatern1FormPriorConfig::default()
+            },
+        )
+        .expect("canonical potential-spectrum exact prior should build");
+
+        assert_eq!(canonical.precision, legacy.precision);
+        assert_eq!(canonical.latent_to_ambient, legacy.latent_to_ambient);
+    }
+
+    #[test]
+    fn alpha_three_is_valid_for_potential_but_rejected_for_form_spectrum() {
+        let config = HodgeMatern1FormPriorConfig {
+            branches: vec![HodgeBranchKind::Exact],
+            exact: HodgeMaternBranchConfig {
+                alpha: MaternAlpha::Three,
+                ..HodgeMaternBranchConfig::default()
+            },
+            ..HodgeMatern1FormPriorConfig::default()
+        };
+
+        assert!(validate_spectrum_config(&config, HodgeMaternSpectrum::Potential).is_ok());
+        assert!(validate_spectrum_config(&config, HodgeMaternSpectrum::Form).is_err());
     }
 
     #[test]

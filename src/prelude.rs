@@ -10,10 +10,9 @@ pub use crate::diagnostics::{
 };
 pub use crate::error::{FeecGmrfError, Result};
 pub use crate::hodge::{
-    Hodge1FormPriorConfig, HodgeBranchKind, HodgeLinearGaussianModelBuilder,
-    HodgeOneFormMassInverse, HodgeOneFormPrior, HodgeOneFormPriorBuilder, HodgePosterior,
-    HodgeTwoFormMassInverse, HodgeZeroFormMassInverse, OrdinaryPotentialHodge1FormPriorConfig,
-    SparseAnchorBranchConfig, SparseAnchorHodge1FormPriorConfig,
+    HodgeBranchKind, HodgeLinearGaussianModelBuilder, HodgeMatern1FormPriorConfig,
+    HodgeMaternBranchConfig, HodgeMaternSpectrum, HodgeOneFormMassInverse, HodgeOneFormPrior,
+    HodgeOneFormPriorBuilder, HodgePosterior, HodgeTwoFormMassInverse, HodgeZeroFormMassInverse,
 };
 pub use crate::infer::{
     FactoredGaussianPrior, FactorizationDiagnostics, HutchinsonVarianceConfig,

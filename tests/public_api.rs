@@ -345,10 +345,19 @@ fn root_hodge_facade_builds_and_reports_branch_outputs() {
     let mesh = CartesianMeshInfo::new_unit_scaled(2, 1, 1.0);
     let (topology, coords) = mesh.compute_coord_complex();
     let metric = coords.to_edge_lengths(&topology);
-    let prior = HodgeOneFormPriorBuilder::decomposed(
+    let prior = HodgeOneFormPriorBuilder::potential_matern(
         &topology,
         &metric,
-        Hodge1FormPriorConfig::branch(1.0, 1.0, HodgeBranchKind::Exact, 0),
+        HodgeMatern1FormPriorConfig {
+            branches: vec![HodgeBranchKind::Exact],
+            exact: HodgeMaternBranchConfig {
+                kappa: 1.0,
+                tau: 1.0,
+                alpha: MaternAlpha::Two,
+            },
+            harmonic_dim: Some(0),
+            ..HodgeMatern1FormPriorConfig::default()
+        },
     )
     .with_coords(&coords)
     .build()

@@ -17,21 +17,18 @@ use rand::Rng;
 use std::collections::BTreeMap;
 
 pub use feg_core::HodgeBranchKind;
-pub use feg_infer::prior::hodge::Hodge1FormPriorConfig;
+pub use feg_infer::prior::hodge_matern::{
+    HodgeMatern1FormPriorConfig, HodgeMaternBranchConfig, HodgeMaternSpectrum,
+};
 pub use feg_infer::prior::matern::{
     one_form::MaternMassInverse as HodgeOneFormMassInverse,
     two_form::MaternMassInverse as HodgeTwoFormMassInverse,
     zero_form::MaternMassInverse as HodgeZeroFormMassInverse,
 };
-pub use feg_infer::prior::sparse_anchor_hodge::{
-    OrdinaryPotentialHodge1FormPriorConfig, SparseAnchorBranchConfig,
-    SparseAnchorHodge1FormPriorConfig,
-};
 
 enum HodgePriorConstruction {
-    Decomposed(Hodge1FormPriorConfig),
-    OrdinaryPotential(OrdinaryPotentialHodge1FormPriorConfig),
-    SparseAnchor(SparseAnchorHodge1FormPriorConfig),
+    PotentialMatern(HodgeMatern1FormPriorConfig),
+    FormMatern(HodgeMatern1FormPriorConfig),
 }
 
 /// Builder selecting one canonical sparse 1-form Hodge prior construction.
@@ -43,45 +40,47 @@ pub struct HodgeOneFormPriorBuilder<'a> {
 }
 
 impl<'a> HodgeOneFormPriorBuilder<'a> {
-    /// Build the ordinary decomposed Matérn construction.
-    pub fn decomposed(
+    /// Put the requested Matérn spectra on the exact/coexact potentials.
+    ///
+    /// If a potential eigenmode has Hodge--Laplacian eigenvalue `lambda`,
+    /// applying `d` or `delta` contributes a factor `lambda` to the ambient
+    /// 1-form covariance. Consequently an alpha-`a` potential spectrum gives
+    /// an ambient branch spectrum proportional to
+    /// `lambda * (kappa^2 + lambda)^(-a)`. Alpha one, two, and three are
+    /// supported.
+    pub fn potential_matern(
         topology: &'a Complex,
         metric: &'a MeshLengths,
-        config: Hodge1FormPriorConfig,
+        config: HodgeMatern1FormPriorConfig,
     ) -> Self {
         Self {
             topology,
             coords: None,
             metric,
-            construction: HodgePriorConstruction::Decomposed(config),
+            construction: HodgePriorConstruction::PotentialMatern(config),
         }
     }
 
-    /// Build the ordinary-potential exact/coexact diagnostic construction.
-    pub fn ordinary_potential(
+    /// Put the requested Matérn spectra on the synthesized 1-form branches.
+    ///
+    /// The latent potential precision compensates for the spectral factor
+    /// introduced by `d` or `delta`, so an ambient branch eigenmode has
+    /// covariance proportional to `(kappa^2 + lambda)^(-a)`. Sparse gauges
+    /// are selected internally only to make the potential representation
+    /// proper; they are not part of the statistical model's public identity.
+    /// Alpha one and two are supported; alpha three is rejected during
+    /// validation because its spectrum-matched sparse precision is not yet
+    /// implemented.
+    pub fn form_matern(
         topology: &'a Complex,
         metric: &'a MeshLengths,
-        config: OrdinaryPotentialHodge1FormPriorConfig,
+        config: HodgeMatern1FormPriorConfig,
     ) -> Self {
         Self {
             topology,
             coords: None,
             metric,
-            construction: HodgePriorConstruction::OrdinaryPotential(config),
-        }
-    }
-
-    /// Build the spectrum-matched sparse-anchor construction.
-    pub fn sparse_anchor(
-        topology: &'a Complex,
-        metric: &'a MeshLengths,
-        config: SparseAnchorHodge1FormPriorConfig,
-    ) -> Self {
-        Self {
-            topology,
-            coords: None,
-            metric,
-            construction: HodgePriorConstruction::SparseAnchor(config),
+            construction: HodgePriorConstruction::FormMatern(config),
         }
     }
 
@@ -93,83 +92,31 @@ impl<'a> HodgeOneFormPriorBuilder<'a> {
 
     /// Assemble the selected canonical lower-layer construction and wrap it.
     pub fn build(self) -> Result<HodgeOneFormPrior> {
-        match self.construction {
-            HodgePriorConstruction::Decomposed(config) => {
-                let lower = match self.coords {
-                    Some(coords) => {
-                        feg_infer::prior::hodge::build_hodge_1form_decomposed_prior_with_coords(
-                            self.topology,
-                            coords,
-                            self.metric,
-                            config,
-                        )
-                    }
-                    None => feg_infer::prior::hodge::build_hodge_1form_decomposed_prior(
-                        self.topology,
-                        self.metric,
-                        config,
-                    ),
-                }
-                .map_err(FeecGmrfError::Assembly)?;
-                let branches = lower
-                    .branches
-                    .iter()
-                    .map(|branch| {
-                        Ok((
-                            branch.kind,
-                            offset_transform(
-                                &branch.transform,
-                                branch.offset,
-                                lower.latent_dimension(),
-                            )?,
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
-                HodgeOneFormPrior::from_parts(
-                    lower.gaussian_prior_spec(),
-                    &lower.latent_to_ambient,
-                    branches,
+        let (spectrum, config) = match self.construction {
+            HodgePriorConstruction::PotentialMatern(config) => {
+                (HodgeMaternSpectrum::Potential, config)
+            }
+            HodgePriorConstruction::FormMatern(config) => (HodgeMaternSpectrum::Form, config),
+        };
+        let lower = match self.coords {
+            Some(coords) => {
+                feg_infer::prior::hodge_matern::build_hodge_matern_1form_prior_with_coords(
+                    self.topology,
+                    coords,
+                    self.metric,
+                    spectrum,
+                    config,
                 )
             }
-            HodgePriorConstruction::OrdinaryPotential(config) => {
-                let lower = match self.coords {
-                    Some(coords) => feg_infer::prior::sparse_anchor_hodge::
-                        build_ordinary_potential_hodge_1form_prior_with_coords(
-                            self.topology,
-                            coords,
-                            self.metric,
-                            config,
-                        ),
-                    None => feg_infer::prior::sparse_anchor_hodge::
-                        build_ordinary_potential_hodge_1form_prior(
-                            self.topology,
-                            self.metric,
-                            config,
-                        ),
-                }
-                .map_err(FeecGmrfError::Assembly)?;
-                wrap_sparse_anchor_prior(lower)
-            }
-            HodgePriorConstruction::SparseAnchor(config) => {
-                let lower = match self.coords {
-                    Some(coords) => feg_infer::prior::sparse_anchor_hodge::
-                        build_sparse_anchor_hodge_1form_prior_with_coords(
-                            self.topology,
-                            coords,
-                            self.metric,
-                            config,
-                        ),
-                    None => feg_infer::prior::sparse_anchor_hodge::
-                        build_sparse_anchor_hodge_1form_prior(
-                            self.topology,
-                            self.metric,
-                            config,
-                        ),
-                }
-                .map_err(FeecGmrfError::Assembly)?;
-                wrap_sparse_anchor_prior(lower)
-            }
+            None => feg_infer::prior::hodge_matern::build_hodge_matern_1form_prior(
+                self.topology,
+                self.metric,
+                spectrum,
+                config,
+            ),
         }
+        .map_err(FeecGmrfError::Assembly)?;
+        wrap_hodge_matern_prior(lower)
     }
 }
 
@@ -347,8 +294,8 @@ impl HodgePosterior {
     }
 }
 
-fn wrap_sparse_anchor_prior(
-    lower: feg_infer::prior::sparse_anchor_hodge::SparseAnchorHodge1FormPrior,
+fn wrap_hodge_matern_prior(
+    lower: feg_infer::prior::hodge_matern::HodgeMatern1FormPrior,
 ) -> Result<HodgeOneFormPrior> {
     let branches = lower
         .branches
