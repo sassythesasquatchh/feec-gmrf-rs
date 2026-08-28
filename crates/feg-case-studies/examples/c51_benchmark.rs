@@ -1,5 +1,5 @@
 use feg_case_studies::experimental::c51_benchmark::{
-    run_c51_benchmark, C51BenchmarkConfig, C51RunMetadata,
+    run_c51_benchmark, run_c51_spectral_rank_pilot, C51BenchmarkConfig, C51RunMetadata,
 };
 use std::error::Error;
 use std::path::PathBuf;
@@ -13,21 +13,32 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = match profile.as_str() {
         "smoke" => C51BenchmarkConfig::smoke(),
         "reference_ladder" => C51BenchmarkConfig::reference_ladder(),
+        "spectral_rank_pilot" => C51BenchmarkConfig::spectral_rank_pilot(),
         other => {
-            return Err(
-                format!("unknown C51 profile {other:?}; use smoke or reference_ladder").into(),
+            return Err(format!(
+                "unknown C51 profile {other:?}; use smoke, reference_ladder, or spectral_rank_pilot"
             )
+            .into())
         }
     };
     let output = arguments
         .next()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(format!("out/c51-benchmark-{profile}")));
+    let enabled_features = if profile == "spectral_rank_pilot" {
+        "experimental,external-solvers"
+    } else {
+        "experimental"
+    };
     let mut metadata = C51RunMetadata::smoke(format!(
-        "cargo run --release -p feg-case-studies --features experimental --example c51_benchmark -- {profile}"
+        "cargo run --release -p feg-case-studies --features {enabled_features} --example c51_benchmark -- {profile}"
     ));
     metadata.profile = profile;
-    let archive = run_c51_benchmark(&config, metadata)?;
+    let archive = if metadata.profile == "spectral_rank_pilot" {
+        run_c51_spectral_rank_pilot(&config, metadata)?
+    } else {
+        run_c51_benchmark(&config, metadata)?
+    };
     archive.write_directory(&output)?;
     println!(
         "wrote {} benchmark rows to {}",

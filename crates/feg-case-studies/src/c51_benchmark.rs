@@ -14,12 +14,17 @@
 //! never described as the same law. Tiny timings validate instrumentation
 //! only and are not evidence of a performance advantage.
 
+use common::linalg::nalgebra::CsrMatrix as FeecCsrMatrix;
 use feec_gmrf::prelude::{
     CholeskyOrderingKind, EssentialBoundaryConditions, EssentialBoundaryElimination,
     ExactFormOperators, ExactMaternPriorBuilder, FeecGmrfError, GaussianNoise, GaussianPrior,
     LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d, MaternAlpha,
     MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
     SupportedMaternPrior, SupportedMaternPriorBuilder, VarianceMethod,
+};
+#[cfg(feature = "external-solvers")]
+use feec_gmrf::spectral::{
+    partial_generalized_hodge_eigenbasis, PartialGeneralizedEigensolverOptions,
 };
 use feg_gp::{
     dense_reference_generalized_hodge_eigenbasis, DenseReferenceEigensolverOptions, EigenBasis,
@@ -38,7 +43,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v2";
+pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v3";
 pub const C51_STUDY_ID: &str = "c51/accuracy-resource";
 
 const EXACT_REFERENCE_MAXIMUM_DIMENSION: usize = 1_024;
@@ -215,13 +220,19 @@ pub struct C51BenchmarkConfig {
     pub repeated_data_counts: Vec<usize>,
     /// Add one dense, mesh-global observation row as a locality control.
     pub include_global_row: bool,
+    /// Retain coefficient selectors as a nonphysical locality control.
+    pub include_local_selectors: bool,
     /// Fixed physical region for the three volume-average magnetic QoIs.
     pub physical_qoi_region_lower: [f64; 3],
     pub physical_qoi_region_upper: [f64; 3],
     /// Requested truncated spectral ranks. Full rank is always added separately.
     pub spectral_low_ranks: Vec<usize>,
+    /// Additional ranks derived as fractions of the active state dimension.
+    pub spectral_rank_fractions: Vec<f64>,
     /// Explicit ceiling for the dense generalized eigensolver.
     pub spectral_reference_maximum_dimension: usize,
+    /// Explicit ceiling for materializing the exact marginal spectral operator.
+    pub spectral_operator_materialization_maximum_dimension: usize,
     /// Posterior samples included in each available full-UQ row.
     pub posterior_sample_count: usize,
     pub seed: u64,
@@ -242,10 +253,13 @@ impl C51BenchmarkConfig {
             local_sensor_density_targets: vec![0.02, 0.10],
             repeated_data_counts: vec![1, 2],
             include_global_row: true,
+            include_local_selectors: true,
             physical_qoi_region_lower: [0.25; 3],
             physical_qoi_region_upper: [0.75; 3],
             spectral_low_ranks: vec![8],
+            spectral_rank_fractions: Vec::new(),
             spectral_reference_maximum_dimension: 512,
+            spectral_operator_materialization_maximum_dimension: 512,
             posterior_sample_count: 4,
             seed: 0xC510_2026,
         }
@@ -259,9 +273,34 @@ impl C51BenchmarkConfig {
             local_sensor_density_targets: vec![0.02, 0.10],
             repeated_data_counts: vec![1, 10, 100],
             spectral_low_ranks: vec![8, 16, 32, 64],
+            spectral_rank_fractions: Vec::new(),
             spectral_reference_maximum_dimension: 1_024,
+            spectral_operator_materialization_maximum_dimension: 1_024,
             posterior_sample_count: 8,
             seed: 0xC511_2026,
+            ..Self::smoke()
+        }
+    }
+
+    /// Discovery-only large-rank pilot using one shared maximum partial basis.
+    ///
+    /// This profile is deliberately not a performance profile: exact k>0
+    /// marginal operator recovery and the shared maximum basis are charged and
+    /// archived, but excluded from method-performance comparisons.
+    pub fn spectral_rank_pilot() -> Self {
+        Self {
+            refinements: vec![8, 10],
+            local_sensor_counts: vec![32],
+            local_sensor_density_targets: vec![0.02, 0.10],
+            repeated_data_counts: vec![1, 10],
+            include_global_row: false,
+            include_local_selectors: false,
+            spectral_low_ranks: vec![32, 64, 128, 256, 512, 1_024, 2_000, 2_048, 4_096],
+            spectral_rank_fractions: vec![0.01, 0.025, 0.05, 0.10, 0.25, 0.50],
+            spectral_reference_maximum_dimension: 512,
+            spectral_operator_materialization_maximum_dimension: 6_000,
+            posterior_sample_count: 1,
+            seed: 0xC512_2026,
             ..Self::smoke()
         }
     }
@@ -303,9 +342,23 @@ impl C51BenchmarkConfig {
                 "C51 spectral low-rank grid must contain positive ranks".to_string(),
             ));
         }
+        if self
+            .spectral_rank_fractions
+            .iter()
+            .any(|fraction| !fraction.is_finite() || *fraction <= 0.0 || *fraction >= 1.0)
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 spectral rank fractions must lie in (0, 1)".to_string(),
+            ));
+        }
         if self.spectral_reference_maximum_dimension == 0 {
             return Err(FeecGmrfError::InvalidParameter(
                 "C51 spectral reference dimension cap must be positive".to_string(),
+            ));
+        }
+        if self.spectral_operator_materialization_maximum_dimension == 0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 spectral operator materialization cap must be positive".to_string(),
             ));
         }
         if self.posterior_sample_count == 0 {
@@ -346,6 +399,18 @@ pub struct C51BenchmarkRow {
     pub same_discrete_law_eligible: bool,
     pub matched_physical_qoi_eligible: bool,
     pub full_uq_workload_eligible: bool,
+    /// Whether the recorded construction/setup timings are eligible for a
+    /// method-performance comparison. Shared maximum-rank discovery bases are
+    /// explicitly ineligible even though their cost is archived.
+    pub method_performance_timing_eligible: bool,
+    /// Construction route for a spectral basis, or `not_applicable`.
+    pub spectral_basis_source: String,
+    /// Eigensolver backend for a spectral basis, or `not_applicable`.
+    pub spectral_eigensolver_backend: String,
+    /// External helper workspace retained for diagnosis, when applicable.
+    pub spectral_helper_workspace: String,
+    /// External helper binary used for the solve, when applicable.
+    pub spectral_helper_binary: String,
     pub refinement: usize,
     pub spatial_dimension: usize,
     pub form_degree: usize,
@@ -381,6 +446,15 @@ pub struct C51BenchmarkRow {
     pub spectral_state_feature_values: C51Measurement<usize>,
     pub spectral_observation_feature_values: C51Measurement<usize>,
     pub spectral_sampling_normal_dimension: C51Measurement<usize>,
+    pub spectral_rank_fraction: C51Measurement<f64>,
+    pub spectral_shared_maximum_basis_rank: C51Measurement<usize>,
+    pub spectral_partial_requested_rank: C51Measurement<usize>,
+    pub spectral_partial_converged_rank: C51Measurement<usize>,
+    pub spectral_partial_mass_nnz: C51Measurement<usize>,
+    pub spectral_partial_weak_hodge_laplacian_nnz: C51Measurement<usize>,
+    pub spectral_partial_input_nnz: C51Measurement<usize>,
+    pub spectral_partial_basis_storage_bytes: C51Measurement<usize>,
+    pub spectral_partial_clamped_negative_eigenvalues: C51Measurement<usize>,
     pub solver: String,
     pub ordering: String,
     pub feec_assembly_ns: C51Measurement<u128>,
@@ -495,6 +569,24 @@ impl C51BenchmarkArchive {
                             .to_string(),
                     ));
                 }
+                if !matches!(row.spectral_rank_fraction, C51Measurement::Measured(_)) {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "a spectral C51 row must record its actual rank fraction".to_string(),
+                    ));
+                }
+                if row.spectral_basis_source == "partial_shared_maximum_exact_marginal"
+                    && (row.method_performance_timing_eligible
+                        || !matches!(
+                            row.spectral_partial_converged_rank,
+                            C51Measurement::Measured(_)
+                        )
+                        || !matches!(row.spectral_partial_input_nnz, C51Measurement::Measured(_)))
+                {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "a shared-maximum partial spectral row must archive solver diagnostics and be timing-ineligible"
+                            .to_string(),
+                    ));
+                }
             } else {
                 if !matches!(row.factor_storage_nnz, C51Measurement::Measured(_)) {
                     return Err(FeecGmrfError::InvalidParameter(format!(
@@ -605,6 +697,11 @@ impl C51BenchmarkArchive {
         )?;
         writeln!(
             writer,
+            "  include_local_selectors: {}",
+            self.config.include_local_selectors
+        )?;
+        writeln!(
+            writer,
             "  physical_qoi_region_lower: {}",
             yaml_f64_list(&self.config.physical_qoi_region_lower)
         )?;
@@ -620,17 +717,58 @@ impl C51BenchmarkArchive {
         )?;
         writeln!(
             writer,
+            "  spectral_rank_fractions: {}",
+            yaml_f64_list(&self.config.spectral_rank_fractions)
+        )?;
+        writeln!(
+            writer,
             "  spectral_reference_maximum_dimension: {}",
             self.config.spectral_reference_maximum_dimension
+        )?;
+        writeln!(
+            writer,
+            "  spectral_operator_materialization_maximum_dimension: {}",
+            self.config
+                .spectral_operator_materialization_maximum_dimension
         )?;
         writeln!(
             writer,
             "  posterior_sample_count: {}",
             self.config.posterior_sample_count
         )?;
+        let mut observation_classes = vec!["local_physical_b"];
+        if self.config.include_local_selectors {
+            observation_classes.push("local_selectors");
+        }
+        if self.config.include_global_row {
+            observation_classes.push("global_row");
+        }
         writeln!(
             writer,
-            "  observation_classes: [\"local_physical_b\", \"local_selectors\", \"global_row\"]"
+            "  observation_classes: [{}]",
+            observation_classes
+                .into_iter()
+                .map(yaml_scalar)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )?;
+        writeln!(writer, "timing_interpretation:")?;
+        writeln!(
+            writer,
+            "  shared_maximum_partial_basis: discovery_only_not_method_performance"
+        )?;
+        writeln!(
+            writer,
+            "  exact_marginal_operator_materialization: bounded_not_scalable_baseline"
+        )?;
+        writeln!(writer, "spectral_operator_route:")?;
+        writeln!(
+            writer,
+            "  pilot: exact_marginal_weak_hodge_laplacian_materialized_under_explicit_cap"
+        )?;
+        writeln!(
+            writer,
+            "  scalable_production_status: blocked_on_typed_augmented_mixed_eigensolver_adapter"
         )?;
         writeln!(writer, "  seed: {}", self.config.seed)?;
         writeln!(writer, "hardware:")?;
@@ -695,11 +833,65 @@ pub fn run_c51_benchmark(
     Ok(archive)
 }
 
+/// Execute the discovery-only partial spectral-rank pilot.
+///
+/// This route requires PETSc/SLEPc. It uses the exact supported full-metric
+/// posterior as the reference and never substitutes the projected Whitney
+/// operator. The exact marginal Hodge operator is explicitly materialized
+/// below the configured cap, so its shared construction timing is archived but
+/// is not eligible for method-performance claims.
+#[cfg(feature = "external-solvers")]
+pub fn run_c51_spectral_rank_pilot(
+    config: &C51BenchmarkConfig,
+    metadata: C51RunMetadata,
+) -> Result<C51BenchmarkArchive> {
+    config.validate()?;
+    if config.alpha != MaternAlpha::Two {
+        return Err(FeecGmrfError::InvalidParameter(
+            "the C51 spectral-rank pilot is frozen to alpha=2".to_string(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for &refinement in &config.refinements {
+        rows.extend(run_partial_spectral_refinement(config, refinement)?);
+    }
+    let archive = C51BenchmarkArchive {
+        metadata,
+        config: config.clone(),
+        comparison_frames: [
+            C51ComparisonFrame::SameDiscreteLawRepresentation,
+            C51ComparisonFrame::MatchedPhysicalQoiMethod,
+        ],
+        rows,
+    };
+    archive.validate()?;
+    Ok(archive)
+}
+
+/// Typed failure for callers that select the pilot without external solvers.
+#[cfg(not(feature = "external-solvers"))]
+pub fn run_c51_spectral_rank_pilot(
+    _config: &C51BenchmarkConfig,
+    _metadata: C51RunMetadata,
+) -> Result<C51BenchmarkArchive> {
+    Err(FeecGmrfError::Unsupported(
+        "the C51 spectral_rank_pilot profile requires the feg-case-studies external-solvers feature and a working PETSc/SLEPc helper"
+            .to_string(),
+    ))
+}
+
 struct BuiltPriors {
     exact: GaussianPrior,
     compact: GaussianPrior,
     supported: SupportedMaternPrior,
     exact_build: Duration,
+    compact_build: Duration,
+    supported_build: Duration,
+}
+
+struct BuiltScalablePriors {
+    compact: GaussianPrior,
+    supported: SupportedMaternPrior,
     compact_build: Duration,
     supported_build: Duration,
 }
@@ -717,6 +909,35 @@ struct SpectralReference {
     operator_recovery: Duration,
     eigensolve: Duration,
     basis_storage_values: usize,
+    source: SpectralBasisSource,
+}
+
+struct ExactSpectralOperators {
+    mass: FeecCsrMatrix,
+    weak_hodge_laplacian: FeecCsrMatrix,
+    recovery: Duration,
+}
+
+#[derive(Clone)]
+enum SpectralBasisSource {
+    DenseChecked,
+    #[cfg(feature = "external-solvers")]
+    PartialSharedMaximum(PartialBasisDiagnostics),
+}
+
+#[cfg(feature = "external-solvers")]
+#[derive(Clone)]
+struct PartialBasisDiagnostics {
+    requested_rank: usize,
+    converged_rank: usize,
+    retained_rank: usize,
+    mass_nonzeros: usize,
+    weak_hodge_laplacian_nonzeros: usize,
+    input_nonzeros: usize,
+    basis_storage_bytes: usize,
+    clamped_negative_eigenvalues: usize,
+    workspace: String,
+    binary: String,
 }
 
 #[derive(Clone)]
@@ -744,7 +965,181 @@ struct AccuracyMeasurements {
     physical_mean: C51Measurement<f64>,
 }
 
+struct AssembledRefinement {
+    topology: Complex,
+    metric: manifold::geometry::metric::mesh::MeshLengths,
+    operators: ExactFormOperators,
+    problem: ProblemMaps,
+    designs: Vec<ObservationDesign>,
+    feec_assembly: Duration,
+}
+
 fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<C51BenchmarkRow>> {
+    let assembled = assemble_refinement(config, refinement)?;
+    let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
+    let priors = build_priors(
+        config,
+        &assembled.topology,
+        &assembled.metric,
+        &assembled.operators,
+        parameters,
+    )?;
+    let spectral = build_spectral_reference(config, &assembled.operators)?;
+    let mut rows = Vec::new();
+    for design in assembled.designs {
+        for &repeated_data_count in &config.repeated_data_counts {
+            let exact = run_spd_method(
+                C51MethodId::FullMetricDirect,
+                &priors.exact,
+                priors.exact_build,
+                assembled.feec_assembly,
+                config,
+                refinement,
+                &design,
+                repeated_data_count,
+                &assembled.problem,
+                None,
+            )?;
+            let reference = exact.1;
+            rows.push(exact.0);
+            rows.push(
+                run_supported_method(
+                    &priors.supported,
+                    priors.supported_build,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    Some(&reference),
+                )?
+                .0,
+            );
+            rows.push(
+                run_spd_method(
+                    C51MethodId::WhitneyCompact,
+                    &priors.compact,
+                    priors.compact_build,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    Some(&reference),
+                )?
+                .0,
+            );
+            rows.push(run_spectral_method(
+                C51MethodId::SpectralFullRank,
+                spectral.basis.len(),
+                &spectral,
+                assembled.feec_assembly,
+                config,
+                refinement,
+                &design,
+                repeated_data_count,
+                &assembled.problem,
+                &reference,
+            )?);
+            for rank in spectral_low_ranks(config, spectral.basis.len()) {
+                rows.push(run_spectral_method(
+                    C51MethodId::SpectralLowRank,
+                    rank,
+                    &spectral,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    &reference,
+                )?);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+#[cfg(feature = "external-solvers")]
+fn run_partial_spectral_refinement(
+    config: &C51BenchmarkConfig,
+    refinement: usize,
+) -> Result<Vec<C51BenchmarkRow>> {
+    let assembled = assemble_refinement(config, refinement)?;
+    let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
+    let priors = build_scalable_priors(
+        config,
+        &assembled.topology,
+        &assembled.metric,
+        &assembled.operators,
+        parameters,
+    )?;
+    let dimension = assembled.operators.state().dimension();
+    let ranks = spectral_low_ranks(config, dimension);
+    let maximum_rank = ranks.last().copied().ok_or_else(|| {
+        FeecGmrfError::InvalidParameter(format!(
+            "the C51 spectral-rank grid has no rank below active dimension {dimension}"
+        ))
+    })?;
+    let spectral = build_partial_spectral_reference(config, &assembled.operators, maximum_rank)?;
+    let mut rows = Vec::new();
+    for design in assembled.designs {
+        if design.class != C51ObservationClass::LocalPhysicalB {
+            continue;
+        }
+        for &repeated_data_count in &config.repeated_data_counts {
+            let (supported_row, reference) = run_supported_method(
+                &priors.supported,
+                priors.supported_build,
+                assembled.feec_assembly,
+                config,
+                refinement,
+                &design,
+                repeated_data_count,
+                &assembled.problem,
+                None,
+            )?;
+            rows.push(supported_row);
+            rows.push(
+                run_spd_method(
+                    C51MethodId::WhitneyCompact,
+                    &priors.compact,
+                    priors.compact_build,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    Some(&reference),
+                )?
+                .0,
+            );
+            for &rank in &ranks {
+                rows.push(run_spectral_method(
+                    C51MethodId::SpectralLowRank,
+                    rank,
+                    &spectral,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    &reference,
+                )?);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+fn assemble_refinement(
+    config: &C51BenchmarkConfig,
+    refinement: usize,
+) -> Result<AssembledRefinement> {
     let mesh = CartesianMeshInfo::new_unit_scaled(3, refinement, 1.0);
     let (topology, coordinates) = mesh.compute_coord_complex();
     let metric = coordinates.to_edge_lengths(&topology);
@@ -785,9 +1180,6 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
         .collect::<Result<Vec<_>>>()?;
     let physical_qoi = LinearMap::stack(&volume_average_components)?;
     let feec_assembly = assembly_start.elapsed();
-    let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
-    let priors = build_priors(config, &topology, &metric, &operators, parameters)?;
-    let spectral = build_spectral_reference(config, &operators)?;
     let problem = ProblemMaps {
         physical_qoi,
         physical_observation,
@@ -800,78 +1192,14 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
         operators.state().dimension(),
         &problem.physical_observation,
     )?;
-    let mut rows = Vec::new();
-    for design in designs {
-        for &repeated_data_count in &config.repeated_data_counts {
-            let exact = run_spd_method(
-                C51MethodId::FullMetricDirect,
-                &priors.exact,
-                priors.exact_build,
-                feec_assembly,
-                config,
-                refinement,
-                &design,
-                repeated_data_count,
-                &problem,
-                None,
-            )?;
-            let reference = exact.1;
-            rows.push(exact.0);
-            rows.push(run_supported_method(
-                &priors.supported,
-                priors.supported_build,
-                feec_assembly,
-                config,
-                refinement,
-                &design,
-                repeated_data_count,
-                &problem,
-                &reference,
-            )?);
-            rows.push(
-                run_spd_method(
-                    C51MethodId::WhitneyCompact,
-                    &priors.compact,
-                    priors.compact_build,
-                    feec_assembly,
-                    config,
-                    refinement,
-                    &design,
-                    repeated_data_count,
-                    &problem,
-                    Some(&reference),
-                )?
-                .0,
-            );
-            rows.push(run_spectral_method(
-                C51MethodId::SpectralFullRank,
-                spectral.basis.len(),
-                &spectral,
-                feec_assembly,
-                config,
-                refinement,
-                &design,
-                repeated_data_count,
-                &problem,
-                &reference,
-            )?);
-            for rank in spectral_low_ranks(config, spectral.basis.len()) {
-                rows.push(run_spectral_method(
-                    C51MethodId::SpectralLowRank,
-                    rank,
-                    &spectral,
-                    feec_assembly,
-                    config,
-                    refinement,
-                    &design,
-                    repeated_data_count,
-                    &problem,
-                    &reference,
-                )?);
-            }
-        }
-    }
-    Ok(rows)
+    Ok(AssembledRefinement {
+        topology,
+        metric,
+        operators,
+        problem,
+        designs,
+        feec_assembly,
+    })
 }
 
 fn build_priors(
@@ -888,6 +1216,37 @@ fn build_priors(
         .build()?;
     let exact_build = start.elapsed();
 
+    let scalable = build_scalable_priors(config, topology, metric, operators, parameters)?;
+    let BuiltScalablePriors {
+        compact,
+        supported,
+        compact_build,
+        supported_build,
+    } = scalable;
+    if compact.dimension() != exact.dimension() {
+        return Err(FeecGmrfError::Dimension(format!(
+            "compact dimension {} differs from exact reference dimension {}",
+            compact.dimension(),
+            exact.dimension()
+        )));
+    }
+    Ok(BuiltPriors {
+        exact,
+        compact,
+        supported,
+        exact_build,
+        compact_build,
+        supported_build,
+    })
+}
+
+fn build_scalable_priors(
+    config: &C51BenchmarkConfig,
+    topology: &manifold::topology::complex::Complex,
+    metric: &manifold::geometry::metric::mesh::MeshLengths,
+    operators: &ExactFormOperators,
+    parameters: MaternParameters,
+) -> Result<BuiltScalablePriors> {
     let start = Instant::now();
     let supported = SupportedMaternPriorBuilder::from_operators(operators.clone())
         .parameters(parameters)
@@ -904,18 +1263,16 @@ fn build_priors(
             )?)
             .build()?;
     let compact_build = start.elapsed();
-    if compact.dimension() != exact.dimension() {
+    if compact.dimension() != supported.state_dimension() {
         return Err(FeecGmrfError::Dimension(format!(
-            "compact dimension {} differs from exact reference dimension {}",
+            "compact dimension {} differs from exact supported dimension {}",
             compact.dimension(),
-            exact.dimension()
+            supported.state_dimension()
         )));
     }
-    Ok(BuiltPriors {
-        exact,
+    Ok(BuiltScalablePriors {
         compact,
         supported,
-        exact_build,
         compact_build,
         supported_build,
     })
@@ -935,25 +1292,15 @@ fn build_spectral_reference(
             maximum: config.spectral_reference_maximum_dimension,
         });
     }
-    let recovery_start = Instant::now();
-    let alpha_one = ExactMaternPriorBuilder::from_operators(operators.clone())
-        .parameters(MaternParameters::new(MaternAlpha::One, config.kappa, 1.0)?)
-        .maximum_materialized_dimension(config.spectral_reference_maximum_dimension)?
-        .build()?;
-    let mut weak_hodge = SparseMat::new(dimension, dimension);
-    for (row, col, value) in alpha_one.precision().triplet_iter() {
-        weak_hodge.push(row, col, value);
-    }
-    for (row, col, value) in operators.state().mass().triplet_iter() {
-        weak_hodge.push(row, col, -config.kappa.powi(2) * value);
-    }
-    let mass = feg_infer::sparse::core_triplet_to_feec_csr(operators.state().mass());
-    let weak_hodge = feg_infer::sparse::core_triplet_to_feec_csr(&weak_hodge);
-    let operator_recovery = recovery_start.elapsed();
+    let exact_operators = recover_exact_spectral_operators(
+        config,
+        operators,
+        config.spectral_reference_maximum_dimension,
+    )?;
     let eigensolve_start = Instant::now();
     let basis = dense_reference_generalized_hodge_eigenbasis(
-        &mass,
-        &weak_hodge,
+        &exact_operators.mass,
+        &exact_operators.weak_hodge_laplacian,
         DenseReferenceEigensolverOptions::new(config.spectral_reference_maximum_dimension),
     )
     .map_err(spectral_error)?;
@@ -967,21 +1314,105 @@ fn build_spectral_reference(
     }
     Ok(SpectralReference {
         basis,
-        operator_recovery,
+        operator_recovery: exact_operators.recovery,
         eigensolve,
         basis_storage_values: dimension * dimension + dimension,
+        source: SpectralBasisSource::DenseChecked,
+    })
+}
+
+fn recover_exact_spectral_operators(
+    config: &C51BenchmarkConfig,
+    operators: &ExactFormOperators,
+    maximum_dimension: usize,
+) -> Result<ExactSpectralOperators> {
+    let dimension = operators.state().dimension();
+    if dimension > maximum_dimension {
+        return Err(FeecGmrfError::ExactReferenceSizeExceeded {
+            dimension,
+            maximum: maximum_dimension,
+        });
+    }
+    let recovery_start = Instant::now();
+    let alpha_one = ExactMaternPriorBuilder::from_operators(operators.clone())
+        .parameters(MaternParameters::new(MaternAlpha::One, config.kappa, 1.0)?)
+        .maximum_materialized_dimension(maximum_dimension)?
+        .build()?;
+    let mut weak_hodge_laplacian = SparseMat::new(dimension, dimension);
+    for (row, col, value) in alpha_one.precision().triplet_iter() {
+        weak_hodge_laplacian.push(row, col, value);
+    }
+    for (row, col, value) in operators.state().mass().triplet_iter() {
+        weak_hodge_laplacian.push(row, col, -config.kappa.powi(2) * value);
+    }
+    Ok(ExactSpectralOperators {
+        mass: feg_infer::sparse::core_triplet_to_feec_csr(operators.state().mass()),
+        weak_hodge_laplacian: feg_infer::sparse::core_triplet_to_feec_csr(&weak_hodge_laplacian),
+        recovery: recovery_start.elapsed(),
+    })
+}
+
+#[cfg(feature = "external-solvers")]
+fn build_partial_spectral_reference(
+    config: &C51BenchmarkConfig,
+    operators: &ExactFormOperators,
+    maximum_rank: usize,
+) -> Result<SpectralReference> {
+    let exact_operators = recover_exact_spectral_operators(
+        config,
+        operators,
+        config.spectral_operator_materialization_maximum_dimension,
+    )?;
+    let eigensolve_start = Instant::now();
+    let partial = partial_generalized_hodge_eigenbasis(
+        &exact_operators.mass,
+        &exact_operators.weak_hodge_laplacian,
+        PartialGeneralizedEigensolverOptions::new(maximum_rank),
+    )
+    .map_err(spectral_error)?;
+    let eigensolve = eigensolve_start.elapsed();
+    let diagnostics = partial.diagnostics();
+    let archived = PartialBasisDiagnostics {
+        requested_rank: diagnostics.requested_rank,
+        converged_rank: diagnostics.converged_rank,
+        retained_rank: diagnostics.retained_rank,
+        mass_nonzeros: diagnostics.mass_nonzeros,
+        weak_hodge_laplacian_nonzeros: diagnostics.weak_hodge_laplacian_nonzeros,
+        input_nonzeros: diagnostics.input_nonzeros,
+        basis_storage_bytes: diagnostics.basis_storage_bytes,
+        clamped_negative_eigenvalues: diagnostics.clamped_negative_eigenvalues,
+        workspace: diagnostics.workspace.display().to_string(),
+        binary: diagnostics.binary.display().to_string(),
+    };
+    let basis_storage_values = diagnostics
+        .basis_storage_entries
+        .checked_add(diagnostics.retained_rank)
+        .ok_or_else(|| {
+            FeecGmrfError::Dimension("C51 spectral basis storage count overflow".to_string())
+        })?;
+    Ok(SpectralReference {
+        basis: partial.into_basis(),
+        operator_recovery: exact_operators.recovery,
+        eigensolve,
+        basis_storage_values,
+        source: SpectralBasisSource::PartialSharedMaximum(archived),
     })
 }
 
 fn spectral_low_ranks(config: &C51BenchmarkConfig, full_rank: usize) -> Vec<usize> {
-    config
+    let mut ranks = config
         .spectral_low_ranks
         .iter()
         .copied()
         .filter(|rank| *rank < full_rank)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
+        .collect::<BTreeSet<_>>();
+    for fraction in &config.spectral_rank_fractions {
+        let rank = (*fraction * full_rank as f64).ceil() as usize;
+        if rank > 0 && rank < full_rank {
+            ranks.insert(rank);
+        }
+    }
+    ranks.into_iter().collect()
 }
 
 // These arguments are the frozen method/problem/observation axes of one row;
@@ -1072,6 +1503,11 @@ fn run_spd_method(
         same_discrete_law_eligible: method == C51MethodId::FullMetricDirect,
         matched_physical_qoi_eligible: true,
         full_uq_workload_eligible: true,
+        method_performance_timing_eligible: true,
+        spectral_basis_source: "not_applicable".to_string(),
+        spectral_eigensolver_backend: "not_applicable".to_string(),
+        spectral_helper_workspace: String::new(),
+        spectral_helper_binary: String::new(),
         refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -1111,6 +1547,15 @@ fn run_spd_method(
         spectral_state_feature_values: C51Measurement::NotRecorded,
         spectral_observation_feature_values: C51Measurement::NotRecorded,
         spectral_sampling_normal_dimension: C51Measurement::NotRecorded,
+        spectral_rank_fraction: C51Measurement::NotRecorded,
+        spectral_shared_maximum_basis_rank: C51Measurement::NotRecorded,
+        spectral_partial_requested_rank: C51Measurement::NotRecorded,
+        spectral_partial_converged_rank: C51Measurement::NotRecorded,
+        spectral_partial_mass_nnz: C51Measurement::NotRecorded,
+        spectral_partial_weak_hodge_laplacian_nnz: C51Measurement::NotRecorded,
+        spectral_partial_input_nnz: C51Measurement::NotRecorded,
+        spectral_partial_basis_storage_bytes: C51Measurement::NotRecorded,
+        spectral_partial_clamped_negative_eigenvalues: C51Measurement::NotRecorded,
         solver: "sparse_cholesky".to_string(),
         ordering: ordering_name(factor.ordering).to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
@@ -1164,8 +1609,8 @@ fn run_supported_method(
     design: &ObservationDesign,
     repeated_data_count: usize,
     problem: &ProblemMaps,
-    reference: &ReferenceAnswers,
-) -> Result<C51BenchmarkRow> {
+    reference: Option<&ReferenceAnswers>,
+) -> Result<(C51BenchmarkRow, ReferenceAnswers)> {
     let values = repeated_observation_values(design.sensor_count, repeated_data_count, config.seed);
     let first_observation = LinearObservation::new(
         design.operator.clone(),
@@ -1208,8 +1653,8 @@ fn run_supported_method(
         physical_transformed_variances,
         physical_mean,
     };
-    let errors = errors_against(&answers, Some(reference))?;
-    Ok(C51BenchmarkRow {
+    let errors = errors_against(&answers, reference)?;
+    let row = C51BenchmarkRow {
         method: C51MethodId::FullMetricAugmented,
         available: true,
         unavailable_reason: String::new(),
@@ -1217,6 +1662,11 @@ fn run_supported_method(
         same_discrete_law_eligible: true,
         matched_physical_qoi_eligible: true,
         full_uq_workload_eligible: false,
+        method_performance_timing_eligible: true,
+        spectral_basis_source: "not_applicable".to_string(),
+        spectral_eigensolver_backend: "not_applicable".to_string(),
+        spectral_helper_workspace: String::new(),
+        spectral_helper_binary: String::new(),
         refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -1258,6 +1708,15 @@ fn run_supported_method(
         spectral_state_feature_values: C51Measurement::NotRecorded,
         spectral_observation_feature_values: C51Measurement::NotRecorded,
         spectral_sampling_normal_dimension: C51Measurement::NotRecorded,
+        spectral_rank_fraction: C51Measurement::NotRecorded,
+        spectral_shared_maximum_basis_rank: C51Measurement::NotRecorded,
+        spectral_partial_requested_rank: C51Measurement::NotRecorded,
+        spectral_partial_converged_rank: C51Measurement::NotRecorded,
+        spectral_partial_mass_nnz: C51Measurement::NotRecorded,
+        spectral_partial_weak_hodge_laplacian_nnz: C51Measurement::NotRecorded,
+        spectral_partial_input_nnz: C51Measurement::NotRecorded,
+        spectral_partial_basis_storage_bytes: C51Measurement::NotRecorded,
+        spectral_partial_clamped_negative_eigenvalues: C51Measurement::NotRecorded,
         solver: "sparse_lu_kkt".to_string(),
         ordering: "backend_partial_pivoting".to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
@@ -1297,7 +1756,8 @@ fn run_supported_method(
         physical_transformed_variance_negative_count: C51Measurement::Measured(negative_count(
             &answers.physical_transformed_variances,
         )),
-    })
+    };
+    Ok((row, answers))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1416,6 +1876,53 @@ fn run_spectral_method(
         physical_mean: output.mean,
     };
     let errors = errors_against(&answers, Some(reference))?;
+    let (
+        method_performance_timing_eligible,
+        spectral_basis_source,
+        spectral_eigensolver_backend,
+        spectral_helper_workspace,
+        spectral_helper_binary,
+        spectral_shared_maximum_basis_rank,
+        spectral_partial_requested_rank,
+        spectral_partial_converged_rank,
+        spectral_partial_mass_nnz,
+        spectral_partial_weak_hodge_laplacian_nnz,
+        spectral_partial_input_nnz,
+        spectral_partial_basis_storage_bytes,
+        spectral_partial_clamped_negative_eigenvalues,
+    ) = match &source.source {
+        SpectralBasisSource::DenseChecked => (
+            true,
+            "dense_full_reference".to_string(),
+            "dense_checked_generalized_eigensolver".to_string(),
+            String::new(),
+            String::new(),
+            C51Measurement::NotRecorded,
+            C51Measurement::NotRecorded,
+            C51Measurement::NotRecorded,
+            C51Measurement::NotRecorded,
+            C51Measurement::NotRecorded,
+            C51Measurement::NotRecorded,
+            C51Measurement::NotRecorded,
+            C51Measurement::NotRecorded,
+        ),
+        #[cfg(feature = "external-solvers")]
+        SpectralBasisSource::PartialSharedMaximum(partial) => (
+            false,
+            "partial_shared_maximum_exact_marginal".to_string(),
+            "petsc_slepc_partial_generalized_eigensolver".to_string(),
+            partial.workspace.clone(),
+            partial.binary.clone(),
+            C51Measurement::Measured(partial.retained_rank),
+            C51Measurement::Measured(partial.requested_rank),
+            C51Measurement::Measured(partial.converged_rank),
+            C51Measurement::Measured(partial.mass_nonzeros),
+            C51Measurement::Measured(partial.weak_hodge_laplacian_nonzeros),
+            C51Measurement::Measured(partial.input_nonzeros),
+            C51Measurement::Measured(partial.basis_storage_bytes),
+            C51Measurement::Measured(partial.clamped_negative_eigenvalues),
+        ),
+    };
     Ok(C51BenchmarkRow {
         method,
         available: true,
@@ -1428,6 +1935,11 @@ fn run_spectral_method(
         same_discrete_law_eligible: method == C51MethodId::SpectralFullRank,
         matched_physical_qoi_eligible: true,
         full_uq_workload_eligible: true,
+        method_performance_timing_eligible,
+        spectral_basis_source,
+        spectral_eigensolver_backend,
+        spectral_helper_workspace,
+        spectral_helper_binary,
         refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -1477,6 +1989,17 @@ fn run_spectral_method(
         spectral_sampling_normal_dimension: C51Measurement::Measured(
             diagnostics.sampling_standard_normal_dimension,
         ),
+        spectral_rank_fraction: C51Measurement::Measured(
+            rank as f64 / diagnostics.ambient_dimension as f64,
+        ),
+        spectral_shared_maximum_basis_rank,
+        spectral_partial_requested_rank,
+        spectral_partial_converged_rank,
+        spectral_partial_mass_nnz,
+        spectral_partial_weak_hodge_laplacian_nnz,
+        spectral_partial_input_nnz,
+        spectral_partial_basis_storage_bytes,
+        spectral_partial_clamped_negative_eigenvalues,
         solver: match diagnostics.conditioning_strategy {
             LowRankConditioningStrategy::ObservationSpace => {
                 "spectral_observation_space_dense_cholesky"
@@ -1543,12 +2066,14 @@ fn observation_designs(
             operator: physical_observation.select_outputs(&physical_rows)?,
             sensor_count: physical_sensor_count,
         });
-        let indices = evenly_spaced_indices(dimension, sensor_count);
-        designs.push(ObservationDesign {
-            class: C51ObservationClass::LocalSelectors,
-            operator: LinearMap::selector(dimension, &indices)?,
-            sensor_count,
-        });
+        if config.include_local_selectors {
+            let indices = evenly_spaced_indices(dimension, sensor_count);
+            designs.push(ObservationDesign {
+                class: C51ObservationClass::LocalSelectors,
+                operator: LinearMap::selector(dimension, &indices)?,
+                sensor_count,
+            });
+        }
     }
     if config.include_global_row {
         let scale = 1.0 / (dimension as f64).sqrt();
@@ -1801,6 +2326,11 @@ fn csv_header() -> String {
         "same_discrete_law_eligible",
         "matched_physical_qoi_eligible",
         "full_uq_workload_eligible",
+        "method_performance_timing_eligible",
+        "spectral_basis_source",
+        "spectral_eigensolver_backend",
+        "spectral_helper_workspace",
+        "spectral_helper_binary",
         "refinement",
         "spatial_dimension",
         "form_degree",
@@ -1837,7 +2367,7 @@ fn csv_header() -> String {
         .join(",")
 }
 
-fn measurement_field_names() -> [&'static str; 42] {
+fn measurement_field_names() -> [&'static str; 51] {
     [
         "prior_precision_nnz",
         "observation_update_nnz",
@@ -1856,6 +2386,15 @@ fn measurement_field_names() -> [&'static str; 42] {
         "spectral_state_feature_values",
         "spectral_observation_feature_values",
         "spectral_sampling_normal_dimension",
+        "spectral_rank_fraction",
+        "spectral_shared_maximum_basis_rank",
+        "spectral_partial_requested_rank",
+        "spectral_partial_converged_rank",
+        "spectral_partial_mass_nnz",
+        "spectral_partial_weak_hodge_laplacian_nnz",
+        "spectral_partial_input_nnz",
+        "spectral_partial_basis_storage_bytes",
+        "spectral_partial_clamped_negative_eigenvalues",
         "feec_assembly_ns",
         "prior_build_ns",
         "spectral_operator_recovery_ns",
@@ -1895,6 +2434,11 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         row.same_discrete_law_eligible.to_string(),
         row.matched_physical_qoi_eligible.to_string(),
         row.full_uq_workload_eligible.to_string(),
+        row.method_performance_timing_eligible.to_string(),
+        row.spectral_basis_source.clone(),
+        row.spectral_eigensolver_backend.clone(),
+        row.spectral_helper_workspace.clone(),
+        row.spectral_helper_binary.clone(),
         row.refinement.to_string(),
         row.spatial_dimension.to_string(),
         row.form_degree.to_string(),
@@ -1933,6 +2477,18 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
     push_measurement(&mut fields, &row.spectral_state_feature_values);
     push_measurement(&mut fields, &row.spectral_observation_feature_values);
     push_measurement(&mut fields, &row.spectral_sampling_normal_dimension);
+    push_measurement(&mut fields, &row.spectral_rank_fraction);
+    push_measurement(&mut fields, &row.spectral_shared_maximum_basis_rank);
+    push_measurement(&mut fields, &row.spectral_partial_requested_rank);
+    push_measurement(&mut fields, &row.spectral_partial_converged_rank);
+    push_measurement(&mut fields, &row.spectral_partial_mass_nnz);
+    push_measurement(&mut fields, &row.spectral_partial_weak_hodge_laplacian_nnz);
+    push_measurement(&mut fields, &row.spectral_partial_input_nnz);
+    push_measurement(&mut fields, &row.spectral_partial_basis_storage_bytes);
+    push_measurement(
+        &mut fields,
+        &row.spectral_partial_clamped_negative_eigenvalues,
+    );
     push_measurement(&mut fields, &row.feec_assembly_ns);
     push_measurement(&mut fields, &row.prior_build_ns);
     push_measurement(&mut fields, &row.spectral_operator_recovery_ns);
@@ -2072,7 +2628,8 @@ mod tests {
         let archive = run_c51_benchmark(&config, C51RunMetadata::smoke("test"))
             .expect("C51 smoke benchmark should run");
         let dimension = archive.rows[0].ambient_dimension;
-        let designs = 2 * local_sensor_targets(&config, dimension).len()
+        let local_class_count = 1 + usize::from(config.include_local_selectors);
+        let designs = local_class_count * local_sensor_targets(&config, dimension).len()
             + usize::from(config.include_global_row);
         let method_count = 4 + spectral_low_ranks(&config, dimension).len();
         assert_eq!(
@@ -2188,6 +2745,70 @@ mod tests {
         assert_eq!(config.local_sensor_density_targets, vec![0.02, 0.10]);
         assert!(!config.spectral_low_ranks.contains(&0));
         assert_eq!(spectral_low_ranks(&config, 16), vec![8]);
+    }
+
+    #[test]
+    fn spectral_rank_pilot_filters_and_deduplicates_fixed_and_fractional_ranks() {
+        let config = C51BenchmarkConfig::spectral_rank_pilot();
+        config.validate().unwrap();
+        assert_eq!(config.refinements, vec![8, 10]);
+        assert_eq!(config.repeated_data_counts, vec![1, 10]);
+        assert!(!config.include_local_selectors);
+        assert!(!config.include_global_row);
+        let ranks = spectral_low_ranks(&config, 2_500);
+        assert!(ranks.windows(2).all(|window| window[0] < window[1]));
+        assert!(ranks.contains(&25));
+        assert!(ranks.contains(&63));
+        assert!(ranks.contains(&1_250));
+        assert!(ranks.contains(&2_000));
+        assert!(ranks.contains(&2_048));
+        assert!(!ranks.contains(&2_500));
+        assert!(!ranks.contains(&4_096));
+    }
+
+    #[cfg(not(feature = "external-solvers"))]
+    #[test]
+    fn spectral_rank_pilot_fails_typed_without_external_solvers() {
+        let error = run_c51_spectral_rank_pilot(
+            &C51BenchmarkConfig::spectral_rank_pilot(),
+            C51RunMetadata::smoke("test"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, FeecGmrfError::Unsupported(_)));
+        assert!(error.to_string().contains("PETSc/SLEPc"));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    #[ignore = "requires an installed PETSc/SLEPc helper; run explicitly as a bounded adapter pilot"]
+    fn bounded_partial_spectral_rank_pilot_archives_helper_diagnostics() {
+        let mut config = C51BenchmarkConfig::spectral_rank_pilot();
+        config.refinements = vec![2];
+        config.local_sensor_counts = vec![4];
+        config.local_sensor_density_targets = vec![0.5];
+        config.repeated_data_counts = vec![1];
+        config.spectral_low_ranks = vec![2, 4];
+        config.spectral_rank_fractions.clear();
+        config.spectral_operator_materialization_maximum_dimension = 64;
+        let archive =
+            run_c51_spectral_rank_pilot(&config, C51RunMetadata::smoke("bounded-partial-pilot"))
+                .unwrap();
+        assert!(archive.rows.iter().any(|row| {
+            row.method == C51MethodId::SpectralLowRank
+                && !row.method_performance_timing_eligible
+                && row.spectral_basis_source == "partial_shared_maximum_exact_marginal"
+                && matches!(
+                    row.spectral_partial_converged_rank,
+                    C51Measurement::Measured(_)
+                )
+        }));
+        assert!(archive.rows.iter().any(|row| {
+            row.method == C51MethodId::WhitneyCompact
+                && matches!(
+                    &row.physical_variance_relative_error,
+                    C51Measurement::Measured(value) if value.is_finite()
+                )
+        }));
     }
 
     fn measured_f64(measurement: &C51Measurement<f64>) -> f64 {

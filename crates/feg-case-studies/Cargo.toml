@@ -13,6 +13,7 @@ description = "Maintained report-backed FEEC-GMRF scientific workflows"
 [features]
 default = []
 experimental = []
+external-solvers = ["feec-gmrf/external-solvers"]
 heavy-tests = []
 external-reference-tests = ["heavy-tests"]
 publication-regression-tests = ["heavy-tests"]
