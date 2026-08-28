@@ -6,6 +6,8 @@
 
 pub mod annulus_baselines;
 pub mod annulus_h_formulation;
+#[cfg(feature = "experimental")]
+pub mod c51_exact_supported_pilot;
 pub mod cube_mass_inverse_variance;
 #[cfg(feature = "experimental")]
 pub mod cube_voids_coexact_transform;
@@ -100,6 +102,7 @@ pub mod experimental {
     //! These modules provide numerical investigations that do not have
     //! maintained study profiles.
 
+    pub use crate::c51_exact_supported_pilot;
     pub use crate::cube_voids_coexact_transform;
     pub use crate::cube_zero_form_kernel_validation;
     pub use crate::derham_ladder;
