@@ -155,6 +155,9 @@ impl EigenBasis {
                 cols: eigenvectors.ncols(),
             });
         }
+        if let Some(&value) = eigenvalues.iter().find(|value| !value.is_finite()) {
+            return Err(GpError::NonFiniteEigenvalue { value });
+        }
         Ok(Self {
             eigenvalues,
             eigenvectors,
@@ -265,7 +268,10 @@ impl SpectralMaternGp {
         config: SpectralMaternConfig,
     ) -> Result<Self, GpError> {
         validate_config(config)?;
-        let basis = basis.truncate_largest(config.k)?;
+        // Matérn covariance weights decrease monotonically with the unshifted
+        // Hodge--Laplacian eigenvalue. A rank-k approximation therefore retains
+        // the smallest eigenvalues (equivalently, the largest covariance weights).
+        let basis = basis.truncate_smallest(config.k)?;
         Self::from_truncated_basis(basis, config)
     }
 
@@ -1142,6 +1148,45 @@ mod tests {
         assert!(diff <= tol, "expected {left} to be within {tol} of {right}");
     }
 
+    fn assert_matrix_close(left: &Mat<f64>, right: &Mat<f64>, tol: f64) {
+        assert_eq!(left.nrows(), right.nrows());
+        assert_eq!(left.ncols(), right.ncols());
+        for row in 0..left.nrows() {
+            for col in 0..left.ncols() {
+                assert_close(left[(row, col)], right[(row, col)], tol);
+            }
+        }
+    }
+
+    fn dense_product(left: &Mat<f64>, right: &Mat<f64>) -> Mat<f64> {
+        assert_eq!(left.ncols(), right.nrows());
+        let mut product = Mat::zeros(left.nrows(), right.ncols());
+        matmul(
+            &mut product,
+            Accum::Replace,
+            left.as_ref(),
+            right.as_ref(),
+            1.0,
+            Par::Seq,
+        );
+        product
+    }
+
+    fn dense_transpose(matrix: &Mat<f64>) -> Mat<f64> {
+        Mat::from_fn(matrix.ncols(), matrix.nrows(), |row, col| {
+            matrix[(col, row)]
+        })
+    }
+
+    fn spd_inverse(matrix: &Mat<f64>) -> Mat<f64> {
+        let factor = matrix
+            .llt(Side::Lower)
+            .expect("test matrix should be positive definite");
+        let mut inverse = Mat::identity(matrix.nrows(), matrix.ncols());
+        factor.solve_in_place(inverse.as_mut());
+        inverse
+    }
+
     #[test]
     fn covariance_matches_weighted_identity_basis() {
         let mut eigenvectors = Mat::zeros(2, 2);
@@ -1168,7 +1213,7 @@ mod tests {
     }
 
     #[test]
-    fn truncation_keeps_largest_eigenvalues() {
+    fn matern_truncation_keeps_smallest_unshifted_eigenvalues() {
         let mut eigenvectors = Mat::zeros(3, 3);
         eigenvectors[(0, 0)] = 1.0;
         eigenvectors[(1, 1)] = 1.0;
@@ -1185,9 +1230,106 @@ mod tests {
         let gp = SpectralMaternGp::from_eigenbasis(basis, config).unwrap();
 
         assert_eq!(gp.k(), 2);
-        assert!(gp.eigenvalues()[0] >= gp.eigenvalues()[1]);
-        assert_close(gp.eigenvalues()[0], 10.0, 1e-12);
+        assert!(gp.eigenvalues()[0] <= gp.eigenvalues()[1]);
+        assert_close(gp.eigenvalues()[0], 1.0, 1e-12);
         assert_close(gp.eigenvalues()[1], 5.0, 1e-12);
+    }
+
+    #[test]
+    fn eigenbasis_rejects_nonfinite_values_before_ordering() {
+        let eigenvectors = Mat::identity(3, 3);
+        let error = EigenBasis::new(vec![1.0, f64::NAN, 2.0], eigenvectors).unwrap_err();
+        assert!(matches!(error, GpError::NonFiniteEigenvalue { value } if value.is_nan()));
+    }
+
+    #[test]
+    fn full_rank_generalized_spectrum_matches_matern_precision_for_alpha_one_to_three() {
+        // Choose a nonorthogonal eigenvector matrix V, then construct
+        // M = V^{-T} V^{-1} and L = V^{-T} Lambda V^{-1}. Consequently,
+        // V^T M V = I and L V = M V Lambda exactly up to roundoff.
+        let eigenvectors = Mat::from_fn(3, 3, |row, col| {
+            const VALUES: [[f64; 3]; 3] = [[1.0, 0.5, 0.0], [0.0, 1.0, 1.0 / 3.0], [0.0, 0.0, 1.0]];
+            VALUES[row][col]
+        });
+        let eigenvector_inverse = Mat::from_fn(3, 3, |row, col| {
+            const VALUES: [[f64; 3]; 3] = [
+                [1.0, -0.5, 1.0 / 6.0],
+                [0.0, 1.0, -1.0 / 3.0],
+                [0.0, 0.0, 1.0],
+            ];
+            VALUES[row][col]
+        });
+        let eigenvalues = [0.25, 2.0, 7.0];
+        let inverse_transpose = dense_transpose(&eigenvector_inverse);
+        let mass = dense_product(&inverse_transpose, &eigenvector_inverse);
+        let weighted_inverse = Mat::from_fn(3, 3, |row, col| {
+            eigenvalues[row] * eigenvector_inverse[(row, col)]
+        });
+        let laplacian = dense_product(&inverse_transpose, &weighted_inverse);
+
+        assert!(
+            mass[(0, 1)].abs() > 0.1,
+            "mass fixture must be non-diagonal"
+        );
+        assert!(
+            eigenvectors[(0, 1)].abs() > 0.1,
+            "basis fixture must be non-diagonal"
+        );
+        let gram = dense_product(
+            &dense_product(&dense_transpose(&eigenvectors), &mass),
+            &eigenvectors,
+        );
+        assert_matrix_close(&gram, &Mat::identity(3, 3), 2e-14);
+        let generalized_left = dense_product(&laplacian, &eigenvectors);
+        let mass_times_basis = dense_product(&mass, &eigenvectors);
+        let generalized_right = Mat::from_fn(3, 3, |row, col| {
+            mass_times_basis[(row, col)] * eigenvalues[col]
+        });
+        assert_matrix_close(&generalized_left, &generalized_right, 2e-14);
+
+        let kappa = 1.3;
+        let tau = 0.7;
+        let system = Mat::from_fn(3, 3, |row, col| {
+            kappa * kappa * mass[(row, col)] + laplacian[(row, col)]
+        });
+        let mass_inverse = spd_inverse(&mass);
+
+        // Present the eigenpairs out of order so this also exercises the
+        // constructor's smallest-eigenvalue ordering at full rank.
+        let permutation = [2, 0, 1];
+        let unordered_values = permutation
+            .iter()
+            .map(|&col| eigenvalues[col])
+            .collect::<Vec<_>>();
+        let unordered_vectors =
+            Mat::from_fn(3, 3, |row, col| eigenvectors[(row, permutation[col])]);
+
+        let mut unscaled_precision = system.clone();
+        for alpha in 1..=3 {
+            if alpha > 1 {
+                unscaled_precision =
+                    dense_product(&dense_product(&unscaled_precision, &mass_inverse), &system);
+            }
+            let precision =
+                Mat::from_fn(3, 3, |row, col| tau * tau * unscaled_precision[(row, col)]);
+            let precision_covariance = spd_inverse(&precision);
+
+            let basis = EigenBasis::new(unordered_values.clone(), unordered_vectors.clone())
+                .expect("finite generalized eigenbasis should be valid");
+            let spectral = SpectralMaternGp::from_eigenbasis(
+                basis,
+                SpectralMaternConfig {
+                    kappa,
+                    alpha: f64::from(alpha),
+                    tau,
+                    k: 3,
+                },
+            )
+            .expect("full-rank spectral Matérn model should be valid");
+
+            assert_eq!(spectral.eigenvalues(), &eigenvalues);
+            assert_matrix_close(&spectral.covariance_matrix(), &precision_covariance, 2e-12);
+        }
     }
 
     #[test]
@@ -1227,10 +1369,11 @@ mod tests {
         let z = vec![2.0, -4.0];
         let sample = gp.sample_from_standard_normal(&z).unwrap();
 
-        let w0 = matern_weight(3.0, config).unwrap();
-        let w1 = matern_weight(1.0, config).unwrap();
-        assert_close(sample[0], w0.sqrt() * z[0], 1e-12);
-        assert_close(sample[1], w1.sqrt() * z[1], 1e-12);
+        let weight_for_first_coordinate = matern_weight(3.0, config).unwrap();
+        let weight_for_second_coordinate = matern_weight(1.0, config).unwrap();
+        assert_eq!(gp.eigenvalues(), &[1.0, 3.0]);
+        assert_close(sample[0], weight_for_first_coordinate.sqrt() * z[1], 1e-12);
+        assert_close(sample[1], weight_for_second_coordinate.sqrt() * z[0], 1e-12);
     }
 
     #[test]
