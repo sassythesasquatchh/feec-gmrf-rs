@@ -24,7 +24,8 @@ use feec_gmrf::prelude::{
 };
 #[cfg(feature = "external-solvers")]
 use feec_gmrf::spectral::{
-    partial_generalized_hodge_eigenbasis, PartialGeneralizedEigensolverOptions,
+    partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative,
+    PartialMixedGeneralizedEigensolverOptions,
 };
 use feg_gp::{
     dense_reference_generalized_hodge_eigenbasis, DenseReferenceEigensolverOptions, EigenBasis,
@@ -55,6 +56,8 @@ const KKT_FILL_UNAVAILABLE_REASON: &str =
     "faer 0.21.9 does not expose sparse LU numeric factor storage";
 const SPECTRAL_SPARSE_PRECISION_REASON: &str =
     "a spectral feature model does not assemble a sparse coefficient precision";
+const MIXED_MARGINAL_NNZ_UNAVAILABLE_REASON: &str =
+    "the sparse mixed shell applies the marginal weak Hodge operator without materializing it";
 const RESOURCE_ACCURACY_UNAVAILABLE_REASON: &str =
     "resource-only method process does not construct an accuracy reference";
 
@@ -418,7 +421,9 @@ pub struct C51BenchmarkConfig {
     pub spectral_rank_fractions: Vec<f64>,
     /// Explicit ceiling for the dense generalized eigensolver.
     pub spectral_reference_maximum_dimension: usize,
-    /// Explicit ceiling for materializing the exact marginal spectral operator.
+    /// Explicit ceiling for materializing the exact marginal spectral operator
+    /// in bounded dense-reference routes. The mixed spectral-rank pilot does
+    /// not consult this cap.
     pub spectral_operator_materialization_maximum_dimension: usize,
     /// Posterior samples included in each available full-UQ row.
     pub posterior_sample_count: usize,
@@ -471,9 +476,10 @@ impl C51BenchmarkConfig {
 
     /// Discovery-only large-rank pilot using one shared maximum partial basis.
     ///
-    /// This profile is deliberately not a performance profile: exact k>0
-    /// marginal operator recovery and the shared maximum basis are charged and
-    /// archived, but excluded from method-performance comparisons.
+    /// This profile is deliberately not a performance profile: one shared
+    /// maximum basis is charged and archived, but excluded from
+    /// method-performance comparisons. The basis is computed through the
+    /// sparse mixed shell without materializing the k>0 marginal operator.
     pub fn spectral_rank_pilot() -> Self {
         Self {
             refinements: vec![8, 10],
@@ -765,13 +771,19 @@ impl C51BenchmarkArchive {
                         "a spectral C51 row must record its actual rank fraction".to_string(),
                     ));
                 }
-                if row.spectral_basis_source == "partial_shared_maximum_exact_marginal"
+                if row.spectral_basis_source == "partial_shared_maximum_mixed_shell"
                     && (row.method_performance_timing_eligible
                         || !matches!(
                             row.spectral_partial_converged_rank,
                             C51Measurement::Measured(_)
                         )
-                        || !matches!(row.spectral_partial_input_nnz, C51Measurement::Measured(_)))
+                        || !matches!(row.spectral_partial_mass_nnz, C51Measurement::Measured(_))
+                        || !matches!(row.spectral_partial_input_nnz, C51Measurement::Measured(_))
+                        || !matches!(
+                            &row.spectral_partial_weak_hodge_laplacian_nnz,
+                            C51Measurement::Unavailable { reason }
+                                if reason == MIXED_MARGINAL_NNZ_UNAVAILABLE_REASON
+                        ))
                 {
                     return Err(FeecGmrfError::InvalidParameter(
                         "a shared-maximum partial spectral row must archive solver diagnostics and be timing-ineligible"
@@ -950,16 +962,16 @@ impl C51BenchmarkArchive {
         )?;
         writeln!(
             writer,
-            "  exact_marginal_operator_materialization: bounded_not_scalable_baseline"
+            "  exact_marginal_operator_materialization: dense_reference_routes_only"
         )?;
         writeln!(writer, "spectral_operator_route:")?;
         writeln!(
             writer,
-            "  pilot: exact_marginal_weak_hodge_laplacian_materialized_under_explicit_cap"
+            "  pilot: sparse_mixed_shell_without_marginal_materialization"
         )?;
         writeln!(
             writer,
-            "  scalable_production_status: blocked_on_typed_augmented_mixed_eigensolver_adapter"
+            "  scalable_production_status: typed_mixed_eigensolver_adapter_available"
         )?;
         writeln!(writer, "  seed: {}", self.config.seed)?;
         writeln!(writer, "hardware:")?;
@@ -1266,9 +1278,10 @@ pub fn run_c51_resource(
 ///
 /// This route requires PETSc/SLEPc. It uses the exact supported full-metric
 /// posterior as the reference and never substitutes the projected Whitney
-/// operator. The exact marginal Hodge operator is explicitly materialized
-/// below the configured cap, so its shared construction timing is archived but
-/// is not eligible for method-performance claims.
+/// operator. The shared maximum basis is computed through the sparse mixed
+/// Hodge shell without materializing the exact marginal Hodge operator. Its
+/// construction timing is archived but is not eligible for method-performance
+/// claims.
 #[cfg(feature = "external-solvers")]
 pub fn run_c51_spectral_rank_pilot(
     config: &C51BenchmarkConfig,
@@ -1351,7 +1364,7 @@ struct ExactSpectralOperators {
 enum SpectralBasisSource {
     DenseChecked,
     #[cfg(feature = "external-solvers")]
-    PartialSharedMaximum(PartialBasisDiagnostics),
+    PartialSharedMaximumMixed(PartialBasisDiagnostics),
 }
 
 #[cfg(feature = "external-solvers")]
@@ -1361,7 +1374,6 @@ struct PartialBasisDiagnostics {
     converged_rank: usize,
     retained_rank: usize,
     mass_nonzeros: usize,
-    weak_hodge_laplacian_nonzeros: usize,
     input_nonzeros: usize,
     basis_storage_bytes: usize,
     clamped_negative_eigenvalues: usize,
@@ -1506,13 +1518,13 @@ fn run_partial_spectral_refinement(
         parameters,
     )?;
     let dimension = assembled.operators.state().dimension();
-    let ranks = spectral_low_ranks(config, dimension);
-    let maximum_rank = ranks.last().copied().ok_or_else(|| {
-        FeecGmrfError::InvalidParameter(format!(
-            "the C51 spectral-rank grid has no rank below active dimension {dimension}"
-        ))
-    })?;
-    let spectral = build_partial_spectral_reference(config, &assembled.operators, maximum_rank)?;
+    let (ranks, maximum_rank) = partial_spectral_rank_plan(config, dimension)?;
+    let spectral = build_partial_spectral_reference(
+        config,
+        &assembled.topology,
+        &assembled.metric,
+        maximum_rank,
+    )?;
     let mut rows = Vec::new();
     for design in assembled.designs {
         if design.class != C51ObservationClass::LocalPhysicalB {
@@ -1819,19 +1831,16 @@ fn recover_exact_spectral_operators(
 #[cfg(feature = "external-solvers")]
 fn build_partial_spectral_reference(
     config: &C51BenchmarkConfig,
-    operators: &ExactFormOperators,
+    topology: &Complex,
+    metric: &manifold::geometry::metric::mesh::MeshLengths,
     maximum_rank: usize,
 ) -> Result<SpectralReference> {
-    let exact_operators = recover_exact_spectral_operators(
-        config,
-        operators,
-        config.spectral_operator_materialization_maximum_dimension,
-    )?;
     let eigensolve_start = Instant::now();
-    let partial = partial_generalized_hodge_eigenbasis(
-        &exact_operators.mass,
-        &exact_operators.weak_hodge_laplacian,
-        PartialGeneralizedEigensolverOptions::new(maximum_rank),
+    let partial = partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
+        topology,
+        metric,
+        config.form_degree,
+        PartialMixedGeneralizedEigensolverOptions::new(maximum_rank),
     )
     .map_err(spectral_error)?;
     let eigensolve = eigensolve_start.elapsed();
@@ -1840,8 +1849,7 @@ fn build_partial_spectral_reference(
         requested_rank: diagnostics.requested_rank,
         converged_rank: diagnostics.converged_rank,
         retained_rank: diagnostics.retained_rank,
-        mass_nonzeros: diagnostics.mass_nonzeros,
-        weak_hodge_laplacian_nonzeros: diagnostics.weak_hodge_laplacian_nonzeros,
+        mass_nonzeros: diagnostics.mk_nonzeros,
         input_nonzeros: diagnostics.input_nonzeros,
         basis_storage_bytes: diagnostics.basis_storage_bytes,
         clamped_negative_eigenvalues: diagnostics.clamped_negative_eigenvalues,
@@ -1856,11 +1864,25 @@ fn build_partial_spectral_reference(
         })?;
     Ok(SpectralReference {
         basis: partial.into_basis(),
-        operator_recovery: exact_operators.recovery,
+        operator_recovery: Duration::ZERO,
         eigensolve,
         basis_storage_values,
-        source: SpectralBasisSource::PartialSharedMaximum(archived),
+        source: SpectralBasisSource::PartialSharedMaximumMixed(archived),
     })
+}
+
+#[cfg(feature = "external-solvers")]
+fn partial_spectral_rank_plan(
+    config: &C51BenchmarkConfig,
+    dimension: usize,
+) -> Result<(Vec<usize>, usize)> {
+    let ranks = spectral_low_ranks(config, dimension);
+    let maximum_rank = ranks.last().copied().ok_or_else(|| {
+        FeecGmrfError::InvalidParameter(format!(
+            "the C51 spectral-rank grid has no rank below active dimension {dimension}"
+        ))
+    })?;
+    Ok((ranks, maximum_rank))
 }
 
 fn spectral_low_ranks(config: &C51BenchmarkConfig, full_rank: usize) -> Vec<usize> {
@@ -2808,17 +2830,17 @@ fn run_spectral_method(
             C51Measurement::NotRecorded,
         ),
         #[cfg(feature = "external-solvers")]
-        SpectralBasisSource::PartialSharedMaximum(partial) => (
+        SpectralBasisSource::PartialSharedMaximumMixed(partial) => (
             false,
-            "partial_shared_maximum_exact_marginal".to_string(),
-            "petsc_slepc_partial_generalized_eigensolver".to_string(),
+            "partial_shared_maximum_mixed_shell".to_string(),
+            "petsc_slepc_mixed_reduced_generalized_eigensolver".to_string(),
             partial.workspace.clone(),
             partial.binary.clone(),
             C51Measurement::Measured(partial.retained_rank),
             C51Measurement::Measured(partial.requested_rank),
             C51Measurement::Measured(partial.converged_rank),
             C51Measurement::Measured(partial.mass_nonzeros),
-            C51Measurement::Measured(partial.weak_hodge_laplacian_nonzeros),
+            C51Measurement::unavailable(MIXED_MARGINAL_NNZ_UNAVAILABLE_REASON),
             C51Measurement::Measured(partial.input_nonzeros),
             C51Measurement::Measured(partial.basis_storage_bytes),
             C51Measurement::Measured(partial.clamped_negative_eigenvalues),
@@ -3667,6 +3689,23 @@ mod tests {
         assert!(!ranks.contains(&4_096));
     }
 
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn spectral_rank_pilot_n10_plan_does_not_consult_marginal_materialization_cap() {
+        let mut config = C51BenchmarkConfig::spectral_rank_pilot();
+        // The current n=10 full-relative Whitney 1-form space has N=6130,
+        // which exceeded the former exact-marginal materialization cap.
+        let n10_dimension = 6_130;
+        assert!(n10_dimension > config.spectral_operator_materialization_maximum_dimension);
+        config.spectral_operator_materialization_maximum_dimension = 1;
+
+        let (ranks, maximum_rank) = partial_spectral_rank_plan(&config, n10_dimension).unwrap();
+        assert_eq!(maximum_rank, 4_096);
+        assert!(ranks.contains(&2_000));
+        assert!(ranks.contains(&2_048));
+        assert!(ranks.contains(&4_096));
+    }
+
     #[cfg(not(feature = "external-solvers"))]
     #[test]
     fn spectral_rank_pilot_fails_typed_without_external_solvers() {
@@ -3797,17 +3836,24 @@ mod tests {
         config.repeated_data_counts = vec![1];
         config.spectral_low_ranks = vec![2, 4];
         config.spectral_rank_fractions.clear();
-        config.spectral_operator_materialization_maximum_dimension = 64;
+        config.spectral_operator_materialization_maximum_dimension = 1;
         let archive =
             run_c51_spectral_rank_pilot(&config, C51RunMetadata::smoke("bounded-partial-pilot"))
                 .unwrap();
         assert!(archive.rows.iter().any(|row| {
             row.method == C51MethodId::SpectralLowRank
                 && !row.method_performance_timing_eligible
-                && row.spectral_basis_source == "partial_shared_maximum_exact_marginal"
+                && row.spectral_basis_source == "partial_shared_maximum_mixed_shell"
+                && row.spectral_eigensolver_backend
+                    == "petsc_slepc_mixed_reduced_generalized_eigensolver"
                 && matches!(
                     row.spectral_partial_converged_rank,
                     C51Measurement::Measured(_)
+                )
+                && matches!(
+                    &row.spectral_partial_weak_hodge_laplacian_nnz,
+                    C51Measurement::Unavailable { reason }
+                        if reason == MIXED_MARGINAL_NNZ_UNAVAILABLE_REASON
                 )
         }));
         assert!(archive.rows.iter().any(|row| {
