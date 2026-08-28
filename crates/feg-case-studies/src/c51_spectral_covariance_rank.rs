@@ -385,7 +385,7 @@ pub struct C51SpectralCovarianceRankArchive {
     pub rows: Vec<C51SpectralCovarianceRankRow>,
     pub covariances: Vec<C51OutputCovarianceRecord>,
     pub sensor_banks: Vec<C51SensorBankAudit>,
-    pub plumbing_gate: C51FullRankPlumbingGate,
+    pub plumbing_gates: Vec<C51FullRankPlumbingGate>,
 }
 
 impl C51SpectralCovarianceRankArchive {
@@ -435,21 +435,22 @@ impl C51SpectralCovarianceRankArchive {
                 ));
             }
         }
-        if self.plumbing_gate.refinement != 2
-            || self.plumbing_gate.rank != self.plumbing_gate.state_dimension
-            || self.plumbing_gate.direct_supported_prior_primary_error
-                > self.plumbing_gate.tolerance
-            || self.plumbing_gate.direct_supported_posterior_primary_error
-                > self.plumbing_gate.tolerance
-            || self.plumbing_gate.spectral_supported_prior_primary_error
-                > self.plumbing_gate.tolerance
-            || self
-                .plumbing_gate
-                .spectral_supported_posterior_primary_error
-                > self.plumbing_gate.tolerance
+        if self
+            .plumbing_gates
+            .iter()
+            .map(|gate| gate.refinement)
+            .collect::<Vec<_>>()
+            != [2, 4]
+            || self.plumbing_gates.iter().any(|gate| {
+                gate.rank != gate.state_dimension
+                    || gate.direct_supported_prior_primary_error > gate.tolerance
+                    || gate.direct_supported_posterior_primary_error > gate.tolerance
+                    || gate.spectral_supported_prior_primary_error > gate.tolerance
+                    || gate.spectral_supported_posterior_primary_error > gate.tolerance
+            })
         {
             return Err(invalid(
-                "C51 full-rank n=2 same-law plumbing gate is missing or failed",
+                "C51 full-rank n=2/n=4 same-law plumbing gates are missing or failed",
             ));
         }
         for row in &self.rows {
@@ -807,41 +808,34 @@ impl C51SpectralCovarianceRankArchive {
         )?;
         writeln!(writer, "resource_cap_scope: retained_basis_preflight_only")?;
         writeln!(writer, "external_process_caps_required: true")?;
-        writeln!(writer, "full_rank_plumbing_gate:")?;
-        writeln!(writer, "  evidence_tier: bounded_n2_smoke_only")?;
-        writeln!(
-            writer,
-            "  publication_n4_gate_status: not_run_required_before_evidence"
-        )?;
-        writeln!(writer, "  refinement: {}", self.plumbing_gate.refinement)?;
-        writeln!(
-            writer,
-            "  state_dimension: {}",
-            self.plumbing_gate.state_dimension
-        )?;
-        writeln!(writer, "  rank: {}", self.plumbing_gate.rank)?;
-        writeln!(
-            writer,
-            "  direct_supported_prior_primary_error: {:.17e}",
-            self.plumbing_gate.direct_supported_prior_primary_error
-        )?;
-        writeln!(
-            writer,
-            "  direct_supported_posterior_primary_error: {:.17e}",
-            self.plumbing_gate.direct_supported_posterior_primary_error
-        )?;
-        writeln!(
-            writer,
-            "  spectral_supported_prior_primary_error: {:.17e}",
-            self.plumbing_gate.spectral_supported_prior_primary_error
-        )?;
-        writeln!(
-            writer,
-            "  spectral_supported_posterior_primary_error: {:.17e}",
-            self.plumbing_gate
-                .spectral_supported_posterior_primary_error
-        )?;
-        writeln!(writer, "  tolerance: {:.17e}", self.plumbing_gate.tolerance)?;
+        writeln!(writer, "full_rank_plumbing_gates:")?;
+        for gate in &self.plumbing_gates {
+            writeln!(writer, "  - refinement: {}", gate.refinement)?;
+            writeln!(writer, "    evidence_tier: bounded_same_law_certificate")?;
+            writeln!(writer, "    state_dimension: {}", gate.state_dimension)?;
+            writeln!(writer, "    rank: {}", gate.rank)?;
+            writeln!(
+                writer,
+                "    direct_supported_prior_primary_error: {:.17e}",
+                gate.direct_supported_prior_primary_error
+            )?;
+            writeln!(
+                writer,
+                "    direct_supported_posterior_primary_error: {:.17e}",
+                gate.direct_supported_posterior_primary_error
+            )?;
+            writeln!(
+                writer,
+                "    spectral_supported_prior_primary_error: {:.17e}",
+                gate.spectral_supported_prior_primary_error
+            )?;
+            writeln!(
+                writer,
+                "    spectral_supported_posterior_primary_error: {:.17e}",
+                gate.spectral_supported_posterior_primary_error
+            )?;
+            writeln!(writer, "    tolerance: {:.17e}", gate.tolerance)?;
+        }
         writeln!(writer, "rows_csv: rows.csv")?;
         writeln!(writer, "covariances_csv: covariances.csv")?;
         writeln!(writer, "basis_attempts_csv: basis_attempts.csv")?;
@@ -857,7 +851,10 @@ pub fn run_c51_spectral_covariance_rank(
     metadata: C51SpectralCovarianceRankMetadata,
 ) -> Result<C51SpectralCovarianceRankArchive> {
     config.validate()?;
-    let plumbing_gate = run_full_rank_plumbing_gate(config)?;
+    let plumbing_gates = [2, 4]
+        .into_iter()
+        .map(|refinement| run_full_rank_plumbing_gate(config, refinement))
+        .collect::<Result<Vec<_>>>()?;
     let mut archive = C51SpectralCovarianceRankArchive {
         metadata,
         config: config.clone(),
@@ -865,7 +862,7 @@ pub fn run_c51_spectral_covariance_rank(
         rows: Vec::new(),
         covariances: Vec::new(),
         sensor_banks: Vec::new(),
-        plumbing_gate,
+        plumbing_gates,
     };
     for &refinement in &config.refinements {
         run_refinement(config, refinement, &mut archive)?;
@@ -888,10 +885,13 @@ pub fn run_c51_spectral_covariance_rank(
 #[cfg(feature = "external-solvers")]
 fn run_full_rank_plumbing_gate(
     config: &C51SpectralCovarianceRankConfig,
+    refinement: usize,
 ) -> Result<C51FullRankPlumbingGate> {
-    const REFINEMENT: usize = 2;
     const TOLERANCE: f64 = 1.0e-8;
-    let mesh = CartesianMeshInfo::new_unit_scaled(3, REFINEMENT, 1.0);
+    if ![2, 4].contains(&refinement) {
+        return Err(invalid("C51 full-rank plumbing refinement must be 2 or 4"));
+    }
+    let mesh = CartesianMeshInfo::new_unit_scaled(3, refinement, 1.0);
     let (topology, coordinates) = mesh.compute_coord_complex();
     let metric = coordinates.to_edge_lengths(&topology);
     let operators = ExactFormOperators::from_feec_homogeneous_full_relative(&topology, &metric, 1)?;
@@ -905,7 +905,7 @@ fn run_full_rank_plumbing_gate(
     .map_err(spectral_error)?;
     if partial.diagnostics().retained_rank != state_dimension {
         return Err(FeecGmrfError::Inference(format!(
-            "C51 n=2 plumbing gate retained {} of {state_dimension} modes",
+            "C51 n={refinement} plumbing gate retained {} of {state_dimension} modes",
             partial.diagnostics().retained_rank
         )));
     }
@@ -984,11 +984,11 @@ fn run_full_rank_plumbing_gate(
     .any(|error| error > TOLERANCE)
     {
         return Err(FeecGmrfError::Inference(format!(
-            "C51 full-rank n=2 same-law plumbing gate failed: direct/support prior {direct_supported_prior_error:.6e}, direct/support posterior {direct_supported_posterior_error:.6e}, spectral/support prior {spectral_supported_prior_error:.6e}, spectral/support posterior {spectral_supported_posterior_error:.6e}, tolerance {TOLERANCE:.6e}"
+            "C51 full-rank n={refinement} same-law plumbing gate failed: direct/support prior {direct_supported_prior_error:.6e}, direct/support posterior {direct_supported_posterior_error:.6e}, spectral/support prior {spectral_supported_prior_error:.6e}, spectral/support posterior {spectral_supported_posterior_error:.6e}, tolerance {TOLERANCE:.6e}"
         )));
     }
     Ok(C51FullRankPlumbingGate {
-        refinement: REFINEMENT,
+        refinement,
         state_dimension,
         rank: state_dimension,
         direct_supported_prior_primary_error: direct_supported_prior_error,
@@ -2430,16 +2430,19 @@ mod tests {
                     overlapping_kernel_pairs: Vec::new(),
                 })
                 .collect(),
-            plumbing_gate: C51FullRankPlumbingGate {
-                refinement: 2,
-                state_dimension: 10,
-                rank: 10,
-                direct_supported_prior_primary_error: 1.0e-12,
-                direct_supported_posterior_primary_error: 1.0e-12,
-                spectral_supported_prior_primary_error: 1.0e-12,
-                spectral_supported_posterior_primary_error: 1.0e-12,
-                tolerance: 1.0e-8,
-            },
+            plumbing_gates: [2, 4]
+                .into_iter()
+                .map(|refinement| C51FullRankPlumbingGate {
+                    refinement,
+                    state_dimension: 10,
+                    rank: 10,
+                    direct_supported_prior_primary_error: 1.0e-12,
+                    direct_supported_posterior_primary_error: 1.0e-12,
+                    spectral_supported_prior_primary_error: 1.0e-12,
+                    spectral_supported_posterior_primary_error: 1.0e-12,
+                    tolerance: 1.0e-8,
+                })
+                .collect(),
         };
         append_censored_rows(
             &mut archive,
