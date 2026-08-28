@@ -10,6 +10,7 @@ from pathlib import Path
 
 THRESHOLDS = (0.10, 0.05, 0.02)
 GROUP_COLUMNS = ("refinement", "alpha", "design")
+DECISION_KEY_COLUMNS = (*GROUP_COLUMNS, "threshold")
 
 
 def load_rows(path: Path) -> list[dict[str, str]]:
@@ -99,6 +100,63 @@ def analyze(rows: list[dict[str, str]]) -> list[dict[str, str]]:
     ]
 
 
+def load_summary(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        rows = list(csv.DictReader(handle))
+    required = {
+        *DECISION_KEY_COLUMNS,
+        "evidence_tier",
+        "maximum_tested_rank",
+        "locked_rank",
+        "heldout_error_at_locked_rank",
+        "status",
+        "reason",
+    }
+    missing = required.difference(rows[0] if rows else ())
+    if missing:
+        raise ValueError(f"summary CSV is empty or missing columns: {sorted(missing)}")
+    return rows
+
+
+def merge_primary_extension(
+    primary_rows: list[dict[str, str]], extension_rows: list[dict[str, str]]
+) -> list[dict[str, str]]:
+    """Merge a preregistered extension without retuning a primary held-out decision."""
+    primary = {
+        tuple(row[column] for column in DECISION_KEY_COLUMNS): row for row in primary_rows
+    }
+    merged = []
+    for extension in extension_rows:
+        key = tuple(extension[column] for column in DECISION_KEY_COLUMNS)
+        if key not in primary:
+            raise ValueError(f"extension decision has no matching primary decision: {key}")
+        original = primary[key]
+        if original["evidence_tier"] != "rank_discovery":
+            raise ValueError("primary summary must contain rank_discovery evidence")
+        if extension["evidence_tier"] != "rank_extension":
+            raise ValueError("extension summary must contain rank_extension evidence")
+
+        unresolved = original["status"].startswith("required_rank_gt_")
+        decision = dict(extension if unresolved else original)
+        decision["decision_source_tier"] = (
+            "rank_extension" if unresolved else "rank_discovery"
+        )
+        decision["primary_status"] = original["status"]
+        decision["extension_status"] = extension["status"]
+        decision["extension_maximum_tested_rank"] = extension["maximum_tested_rank"]
+        decision["post_primary_candidate_rank"] = extension["locked_rank"]
+        decision["post_primary_candidate_heldout_error"] = extension[
+            "heldout_error_at_locked_rank"
+        ]
+        if original["status"] == "heldout_failed":
+            decision["reason"] = (
+                f"{original['reason']}; the post-primary extension is descriptive only "
+                "and does not retune the locked rank"
+            )
+        merged.append(decision)
+    return sorted(merged, key=lambda row: tuple(row[column] for column in DECISION_KEY_COLUMNS))
+
+
 def write_summary(path: Path, rows: list[dict[str, str]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", newline="", encoding="utf-8") as handle:
@@ -111,10 +169,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_directory", type=Path)
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--primary-summary",
+        type=Path,
+        help="merge an extension with its frozen primary decisions without held-out retuning",
+    )
     arguments = parser.parse_args()
     input_path = arguments.run_directory / "rows.csv"
-    output_path = arguments.output or arguments.run_directory / "rank_threshold_summary.csv"
+    default_name = (
+        "combined_rank_threshold_summary.csv"
+        if arguments.primary_summary
+        else "rank_threshold_summary.csv"
+    )
+    output_path = arguments.output or arguments.run_directory / default_name
     summary = analyze(load_rows(input_path))
+    if arguments.primary_summary:
+        summary = merge_primary_extension(load_summary(arguments.primary_summary), summary)
     write_summary(output_path, summary)
     print(f"wrote {len(summary)} threshold decisions to {output_path}")
     return 0

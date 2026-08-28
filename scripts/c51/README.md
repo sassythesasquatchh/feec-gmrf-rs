@@ -112,6 +112,13 @@ unattained `n=10` threshold is reported against the actual maximum tested rank
 4,096, never against the primary cap 2,048. Resource-censored attempts remain
 computationally unavailable rather than rank lower bounds.
 
+When reporting the primary and extension together, pass the original summary
+to the analyzer with `--primary-summary`. The resulting
+`combined_rank_threshold_summary.csv` preserves every already-attained primary
+rank and any primary held-out failure; the extension can resolve only a primary
+`required_rank_gt_*` censor. In particular, a later rank whose held-out value
+was already inspected cannot be used to retune a failed primary lock.
+
 The child starts in a fresh process group. The runner samples the summed RSS of
 that process tree, wall time, and all file sizes in the attempt directory. It
 terminates the entire group when any cap is exceeded. Defaults are six hours,

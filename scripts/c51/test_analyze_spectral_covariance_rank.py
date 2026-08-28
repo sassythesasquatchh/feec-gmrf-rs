@@ -24,6 +24,22 @@ def row(rank, selection, heldout, status="measured", evidence_tier="rank_discove
     }
 
 
+def decision(status, rank, evidence_tier, threshold="5.00000000000000028e-02"):
+    return {
+        "refinement": "8",
+        "alpha": "2",
+        "design": "density_0.10",
+        "threshold": threshold,
+        "evidence_tier": evidence_tier,
+        "maximum_tested_rank": "2048" if evidence_tier == "rank_discovery" else "3032",
+        "locked_rank": str(rank) if rank else "",
+        "selection_error_at_locked_rank": "0.04" if rank else "",
+        "heldout_error_at_locked_rank": "0.051" if rank else "",
+        "status": status,
+        "reason": f"{status} reason",
+    }
+
+
 class RankAnalyzerTests(unittest.TestCase):
     def test_selects_smallest_sustained_prefix(self):
         rows = [
@@ -72,6 +88,32 @@ class RankAnalyzerTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(ValueError, "mix evidence tiers"):
             MODULE.analyze_group(rows, 0.05)
+
+    def test_extension_does_not_retune_primary_heldout_failure(self):
+        primary = decision("heldout_failed", 2000, "rank_discovery")
+        extension = decision("attained", 2048, "rank_extension")
+        merged = MODULE.merge_primary_extension([primary], [extension])[0]
+        self.assertEqual(merged["status"], "heldout_failed")
+        self.assertEqual(merged["locked_rank"], "2000")
+        self.assertEqual(merged["decision_source_tier"], "rank_discovery")
+        self.assertEqual(merged["post_primary_candidate_rank"], "2048")
+        self.assertIn("does not retune", merged["reason"])
+
+    def test_extension_resolves_only_primary_rank_censor(self):
+        primary = decision("required_rank_gt_2048", None, "rank_discovery")
+        extension = decision("attained", 2560, "rank_extension")
+        merged = MODULE.merge_primary_extension([primary], [extension])[0]
+        self.assertEqual(merged["status"], "attained")
+        self.assertEqual(merged["locked_rank"], "2560")
+        self.assertEqual(merged["decision_source_tier"], "rank_extension")
+        self.assertEqual(merged["primary_status"], "required_rank_gt_2048")
+
+    def test_extension_preserves_already_attained_primary_rank(self):
+        primary = decision("attained", 1280, "rank_discovery")
+        extension = decision("attained", 2048, "rank_extension")
+        merged = MODULE.merge_primary_extension([primary], [extension])[0]
+        self.assertEqual(merged["locked_rank"], "1280")
+        self.assertEqual(merged["decision_source_tier"], "rank_discovery")
 
 
 if __name__ == "__main__":
