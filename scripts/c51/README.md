@@ -71,3 +71,43 @@ phase, then writes measured setup RSS only to
 `query_external_peak_rss_bytes`. Accuracy fields are typed unavailable because
 no reference model is constructed. The ordinary all-method mode remains an
 archive-process discovery measurement and is never row-attributed.
+
+## Spectral covariance-rank discovery guard
+
+The dedicated rank-discovery study has a separate capped runner:
+
+```text
+python3 scripts/c51/run_spectral_covariance_rank.py \
+  --refinement 8 \
+  --maximum-rank 2048 \
+  --output out/c51/spectral-rank-n8-r2048
+```
+
+It first builds `c51_spectral_covariance_rank` with the locked release profile,
+outside scientific measurement. It then executes the release binary directly
+with the immutable `publication-discovery-v1` profile and exactly one requested
+refinement and maximum rank. The attempt directory must not already exist.
+
+The child starts in a fresh process group. The runner samples the summed RSS of
+that process tree, wall time, and all file sizes in the attempt directory. It
+terminates the entire group when any cap is exceeded. Defaults are six hours,
+16 GiB sampled RSS, 10 GiB output, one thread, and a one-second sample period;
+override them explicitly with `--wall-time-limit-seconds`, `--rss-cap-bytes`,
+`--disk-cap-bytes`, `--threads`, and `--sample-interval-seconds`.
+
+Every started attempt retains `attempt_manifest.json`, including failures and
+cap terminations. It records commands, caps, timestamps, exit/signal status,
+peak sampled process-tree RSS, maximum output bytes, root and submodule Git
+state, platform data, and available tool versions. Build and scientific stdout
+and stderr are kept separately. Preview a run without building or creating the
+output directory:
+
+```text
+python3 scripts/c51/run_spectral_covariance_rank.py --dry-run \
+  --refinement 8 --maximum-rank 2048 \
+  --output out/c51/spectral-rank-n8-r2048
+```
+
+The monitor uses `/proc` on Linux and the platform `ps` command on macOS. If it
+cannot sample the process tree, it fails closed and terminates the child rather
+than continuing without enforcing the RSS cap.
