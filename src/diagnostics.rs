@@ -381,6 +381,69 @@ mod tests {
     }
 
     #[test]
+    fn relative_precision_certificate_handles_noncommuting_precisions() {
+        let reference = SparseMat::from_triplets(
+            2,
+            2,
+            vec![
+                SparseTriplet {
+                    row: 0,
+                    col: 0,
+                    value: 2.0,
+                },
+                SparseTriplet {
+                    row: 0,
+                    col: 1,
+                    value: 0.5,
+                },
+                SparseTriplet {
+                    row: 1,
+                    col: 0,
+                    value: 0.5,
+                },
+                SparseTriplet {
+                    row: 1,
+                    col: 1,
+                    value: 1.5,
+                },
+            ],
+        );
+        let candidate = SparseMat::from_triplets(
+            2,
+            2,
+            vec![
+                SparseTriplet {
+                    row: 0,
+                    col: 0,
+                    value: 3.0,
+                },
+                SparseTriplet {
+                    row: 0,
+                    col: 1,
+                    value: 0.2,
+                },
+                SparseTriplet {
+                    row: 1,
+                    col: 0,
+                    value: 0.2,
+                },
+                SparseTriplet {
+                    row: 1,
+                    col: 1,
+                    value: 1.0,
+                },
+            ],
+        );
+        let certificate = relative_precision_certificate(&candidate, &reference, 2).unwrap();
+        let discriminant = 7.13_f64.sqrt();
+        let expected_minimum_ratio = (6.3 - discriminant) / 5.5;
+        let expected_maximum_ratio = (6.3 + discriminant) / 5.5;
+        assert!((certificate.minimum_precision_ratio - expected_minimum_ratio).abs() <= 1.0e-13);
+        assert!((certificate.maximum_precision_ratio - expected_maximum_ratio).abs() <= 1.0e-13);
+        assert!(certificate.has_unit_relative_envelope());
+    }
+
+    #[test]
     fn relative_precision_certificate_enforces_dimension_guard() {
         let matrix = SparseMat::diagonal(3, 1.0);
         let error = relative_precision_certificate(&matrix, &matrix, 2).unwrap_err();
