@@ -631,6 +631,7 @@ def build_release_example(
     output_directory: pathlib.Path,
     environment: Mapping[str, str],
     cargo: str,
+    features: str,
 ) -> dict[str, Any]:
     command = [
         cargo,
@@ -640,7 +641,7 @@ def build_release_example(
         "-p",
         "feg-case-studies",
         "--features",
-        "experimental",
+        features,
         "--example",
         "c51_benchmark",
     ]
@@ -678,6 +679,12 @@ def build_release_example(
             "stderr": file_record(stderr_path),
         },
     }
+
+
+def build_features(selection: Mapping[str, Any] | None) -> str:
+    if selection is not None and selection["method"] == "spectral_low_rank":
+        return "experimental,external-solvers"
+    return "experimental"
 
 
 def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | None:
@@ -868,6 +875,7 @@ def attach_peak_rss_to_resource_row(
 
 def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
     selection = requested_resource_selection(args)
+    features = build_features(selection)
     thread_env = thread_environment(args.threads)
     environment = os.environ.copy()
     environment.update(thread_env)
@@ -896,7 +904,7 @@ def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
             "-p",
             "feg-case-studies",
             "--features",
-            "experimental",
+            features,
             "--example",
             "c51_benchmark",
         ],
@@ -979,7 +987,13 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
             "shell_exit_status": 0,
         }
     else:
-        build = build_release_example(repository, output, environment, args.cargo)
+        build = build_release_example(
+            repository,
+            output,
+            environment,
+            args.cargo,
+            build_features(selection),
+        )
 
     try:
         binary = release_example_path(repository, environment)

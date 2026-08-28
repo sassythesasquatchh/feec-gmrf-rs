@@ -123,6 +123,17 @@ class FreshProcessRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.thread_environment(0)
 
+    def test_low_rank_resource_build_requires_external_solver_feature(self):
+        spectral = self.resource_selection(method="spectral_low_rank")
+        spectral["spectral_rank"] = 2048
+        self.assertEqual(
+            runner.build_features(spectral), "experimental,external-solvers"
+        )
+        self.assertEqual(
+            runner.build_features(self.resource_selection()), "experimental"
+        )
+        self.assertEqual(runner.build_features(None), "experimental")
+
     def test_method_phase_rss_attaches_to_exactly_one_matching_row(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "rows.csv"

@@ -30,6 +30,8 @@ use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 use std::cmp::Ordering;
 #[cfg(feature = "external-solvers")]
 use std::path::PathBuf;
+#[cfg(feature = "external-solvers")]
+use std::time::Duration;
 use thiserror::Error;
 
 #[cfg(feature = "external-solvers")]
@@ -177,6 +179,19 @@ pub enum GpError {
     #[cfg(feature = "external-solvers")]
     #[error("mixed generalized Hodge eigenbasis has empty active {space} space")]
     EmptyMixedGeneralizedEigenbasisSpace { space: &'static str },
+    #[cfg(feature = "external-solvers")]
+    #[error(
+        "exact-request mixed eigenbasis invariant failed: requested {requested}, solver requested {solver_requested}, converged {converged}, retained {retained}"
+    )]
+    ExactRequestedMixedEigenbasisInvariant {
+        requested: usize,
+        solver_requested: usize,
+        converged: usize,
+        retained: usize,
+    },
+    #[cfg(feature = "external-solvers")]
+    #[error("mixed generalized eigenpair {mode} produced invalid normalized residual {value}")]
+    InvalidMixedGeneralizedEigenbasisResidual { mode: usize, value: f64 },
     #[cfg(feature = "external-solvers")]
     #[error("failed to assemble homogeneous full-relative FEEC operators: {message}")]
     MixedGeneralizedEigenbasisAssembly { message: String },
@@ -361,7 +376,7 @@ impl PartialMixedGeneralizedEigensolverOptions {
 /// Auditable dimensions, sparsity, storage, and process provenance for one
 /// sparse mixed Hodge eigensolve.
 #[cfg(feature = "external-solvers")]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PartialMixedGeneralizedEigenbasisDiagnostics {
     pub sigma_dimension: usize,
     pub u_dimension: usize,
@@ -376,9 +391,24 @@ pub struct PartialMixedGeneralizedEigenbasisDiagnostics {
     pub input_nonzeros: usize,
     pub which: GhiepWhich,
     pub mass_solve: GhiepReducedSolve,
+    pub eigensolver_tolerance: f64,
     pub basis_storage_entries: usize,
     pub basis_storage_bytes: usize,
     pub clamped_negative_eigenvalues: usize,
+    /// Maximum normalized residual over every converged pair returned by the
+    /// helper. Both mixed equations are checked in coefficient two-norm. The
+    /// denominator includes the `M_k u` action so harmonic modes have a
+    /// nonzero scale even when `lambda = 0`.
+    pub maximum_relative_mixed_residual: f64,
+    /// Maximum entrywise defect of the normalized Gram matrix
+    /// `V^T M_k V - I` over every converged pair, computed as part of the
+    /// existing normalization pass before exact-rank truncation.
+    pub maximum_mass_orthogonality_defect: f64,
+    pub mass_orthogonality_tolerance: f64,
+    pub eigenvalue_negative_tolerance: f64,
+    /// Wall time of the streamed mixed-equation residual certificate. This is
+    /// part of the charged eigensolver adapter cost, not subtracted from it.
+    pub residual_validation_duration: Duration,
     pub workspace: PathBuf,
     pub binary: PathBuf,
 }
@@ -650,14 +680,15 @@ pub fn partial_mixed_generalized_hodge_eigenbasis(
     let c = restrict_mixed_operator(&codif_u_full, sigma_layout, u_layout);
     let l = restrict_mixed_operator(&codifdif_u_full, u_layout, u_layout);
     let mk = restrict_mixed_operator(&mass_u_full, u_layout, u_layout);
+    let reduced_operators = GhepReducedOperators {
+        l: &l,
+        d: &d,
+        c: &c,
+        mkm1: &mkm1,
+        mk: &mk,
+    };
     let result = try_petsc_ghep_reduced_with_which(
-        GhepReducedOperators {
-            l: &l,
-            d: &d,
-            c: &c,
-            mkm1: &mkm1,
-            mk: &mk,
-        },
+        reduced_operators,
         options.requested_rank,
         GhiepWhich::Smallest,
         options.mass_solve,
@@ -675,22 +706,32 @@ pub fn partial_mixed_generalized_hodge_eigenbasis(
         input_nonzeros,
         which,
         mass_solve,
+        eigensolver_tolerance,
         workspace,
         binary,
     } = result.diagnostics;
 
+    let residual_validation_start = std::time::Instant::now();
+    let maximum_relative_mixed_residual = maximum_relative_mixed_residual(
+        reduced_operators,
+        &result.eigenvalues,
+        &result.sigma_eigenvectors,
+        &result.u_eigenvectors,
+    )?;
+    let residual_validation_duration = residual_validation_start.elapsed();
     let mut eigenvalues = result.eigenvalues;
     let clamped_negative_eigenvalues = validate_and_clamp_generalized_eigenvalues(
         &mut eigenvalues,
         options.eigenvalue_negative_tolerance,
     )?;
-    let basis = EigenBasis::from_generalized_hodge_laplace_eigenpairs(
-        eigenvalues,
-        result.u_eigenvectors,
-        &mk,
-        options.mass_orthogonality_tolerance,
-    )?
-    .truncate_smallest(options.requested_rank)?;
+    let (basis, maximum_mass_orthogonality_defect) =
+        generalized_hodge_basis_with_mass_orthogonality_certificate(
+            eigenvalues,
+            result.u_eigenvectors,
+            &mk,
+            options.mass_orthogonality_tolerance,
+        )?;
+    let basis = basis.truncate_smallest(options.requested_rank)?;
     let basis_storage_entries =
         u_dimension
             .checked_mul(basis.len())
@@ -718,14 +759,56 @@ pub fn partial_mixed_generalized_hodge_eigenbasis(
             input_nonzeros,
             which,
             mass_solve,
+            eigensolver_tolerance,
             basis_storage_entries,
             basis_storage_bytes,
             clamped_negative_eigenvalues,
+            maximum_relative_mixed_residual,
+            maximum_mass_orthogonality_defect,
+            mass_orthogonality_tolerance: options.mass_orthogonality_tolerance,
+            eigenvalue_negative_tolerance: options.eigenvalue_negative_tolerance,
+            residual_validation_duration,
             workspace,
             binary,
         },
         basis,
     })
+}
+
+/// Assemble and solve one sparse mixed FEEC eigenproblem for exactly the
+/// requested retained rank.
+///
+/// This production-oriented name makes the resource contract explicit: one
+/// call performs one independently requested solve, retains exactly that many
+/// smallest modes, never materializes the marginal Hodge operator, and never
+/// falls back to a dense eigensolver. The helper may converge extra Ritz pairs;
+/// their count and validation cost remain visible in the diagnostics.
+#[cfg(feature = "external-solvers")]
+pub fn exact_requested_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
+    topology: &Complex,
+    geometry: &MeshLengths,
+    degree: usize,
+    options: PartialMixedGeneralizedEigensolverOptions,
+) -> Result<PartialMixedGeneralizedEigenbasis, GpError> {
+    let requested = options.requested_rank;
+    let result = partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
+        topology, geometry, degree, options,
+    )?;
+    let diagnostics = result.diagnostics();
+    if diagnostics.requested_rank != requested
+        || diagnostics.converged_rank < requested
+        || diagnostics.retained_rank != requested
+        || diagnostics.which != GhiepWhich::Smallest
+        || diagnostics.mass_solve != options.mass_solve
+    {
+        return Err(GpError::ExactRequestedMixedEigenbasisInvariant {
+            requested,
+            solver_requested: diagnostics.requested_rank,
+            converged: diagnostics.converged_rank,
+            retained: diagnostics.retained_rank,
+        });
+    }
+    Ok(result)
 }
 
 /// Assemble homogeneous full-relative degree-`k-1` and degree-`k` layouts,
@@ -809,22 +892,17 @@ impl EigenBasis {
     /// Matérn precision recurrence.
     pub fn from_generalized_hodge_laplace_eigenpairs(
         eigenvalues: NaVector,
-        mut eigenvectors: NaMatrix,
+        eigenvectors: NaMatrix,
         mass: &CsrMatrix,
         orthogonality_tolerance: f64,
     ) -> Result<Self, GpError> {
-        if mass.nrows() != eigenvectors.nrows() || mass.ncols() != eigenvectors.nrows() {
-            return Err(GpError::EigenvectorMassDimensionMismatch {
-                rows: mass.nrows(),
-                cols: mass.ncols(),
-                dimension: eigenvectors.nrows(),
-            });
-        }
-        if !orthogonality_tolerance.is_finite() || orthogonality_tolerance < 0.0 {
-            return Err(GpError::InvalidMassOrthogonalityTolerance);
-        }
-        mass_normalize_and_validate_eigenvectors(mass, &mut eigenvectors, orthogonality_tolerance)?;
-        Self::from_hodge_laplace_eigenpairs(eigenvalues, eigenvectors)
+        generalized_hodge_basis_with_mass_orthogonality_certificate(
+            eigenvalues,
+            eigenvectors,
+            mass,
+            orthogonality_tolerance,
+        )
+        .map(|(basis, _)| basis)
     }
 
     pub fn nrows(&self) -> usize {
@@ -2430,11 +2508,71 @@ fn nalgebra_matrix_to_faer(matrix: &NaMatrix) -> Mat<f64> {
 /// for every pair of modes, `O(nnz(M) r^2)`.  Peak workspace here is one
 /// explicit `N x r` product and one `r x r` Gram matrix; no copy of `V` is
 /// made for the dense product.
+fn generalized_hodge_basis_with_mass_orthogonality_certificate(
+    eigenvalues: NaVector,
+    mut eigenvectors: NaMatrix,
+    mass: &CsrMatrix,
+    orthogonality_tolerance: f64,
+) -> Result<(EigenBasis, f64), GpError> {
+    if mass.nrows() != eigenvectors.nrows() || mass.ncols() != eigenvectors.nrows() {
+        return Err(GpError::EigenvectorMassDimensionMismatch {
+            rows: mass.nrows(),
+            cols: mass.ncols(),
+            dimension: eigenvectors.nrows(),
+        });
+    }
+    if !orthogonality_tolerance.is_finite() || orthogonality_tolerance < 0.0 {
+        return Err(GpError::InvalidMassOrthogonalityTolerance);
+    }
+    let maximum_defect =
+        mass_normalize_and_validate_eigenvectors(mass, &mut eigenvectors, orthogonality_tolerance)?;
+    let basis = EigenBasis::from_hodge_laplace_eigenpairs(eigenvalues, eigenvectors)?;
+    Ok((basis, maximum_defect))
+}
+
+#[cfg(feature = "external-solvers")]
+fn maximum_relative_mixed_residual(
+    operators: GhepReducedOperators<'_>,
+    eigenvalues: &NaVector,
+    sigma_eigenvectors: &NaMatrix,
+    u_eigenvectors: &NaMatrix,
+) -> Result<f64, GpError> {
+    let mut maximum = 0.0_f64;
+    for mode in 0..eigenvalues.len() {
+        let sigma = sigma_eigenvectors.column(mode).into_owned();
+        let u = u_eigenvectors.column(mode).into_owned();
+        let mass_sigma = operators.mkm1 * &sigma;
+        let c_u = operators.c * &u;
+        let l_u = operators.l * &u;
+        let d_sigma = operators.d * &sigma;
+        let mass_u = operators.mk * &u;
+        let lower_residual = &mass_sigma - &c_u;
+        let upper_action = &l_u + &d_sigma;
+        let upper_rhs = &mass_u * eigenvalues[mode];
+        let upper_residual = &upper_action - &upper_rhs;
+        let numerator = (lower_residual.norm_squared() + upper_residual.norm_squared()).sqrt();
+        let denominator = mass_sigma.norm()
+            + c_u.norm()
+            + l_u.norm()
+            + d_sigma.norm()
+            + (1.0 + eigenvalues[mode].abs()) * mass_u.norm();
+        let residual = numerator / denominator;
+        if !residual.is_finite() || residual < 0.0 {
+            return Err(GpError::InvalidMixedGeneralizedEigenbasisResidual {
+                mode,
+                value: residual,
+            });
+        }
+        maximum = maximum.max(residual);
+    }
+    Ok(maximum)
+}
+
 fn mass_normalize_and_validate_eigenvectors(
     mass: &CsrMatrix,
     eigenvectors: &mut NaMatrix,
     tolerance: f64,
-) -> Result<(), GpError> {
+) -> Result<f64, GpError> {
     let row_count = eigenvectors.nrows();
     let rank = eigenvectors.ncols();
     let mass_times_eigenvectors = apply_mass_to_eigenvectors(mass, eigenvectors);
@@ -2473,6 +2611,11 @@ fn mass_normalize_and_validate_eigenvectors(
         }
     }
 
+    let mut maximum_defect = 0.0_f64;
+    for col in 0..rank {
+        maximum_defect =
+            maximum_defect.max((gram[(idx(col), idx(col))] * scales[col].powi(2) - 1.0).abs());
+    }
     for left in 0..rank {
         for right in (left + 1)..rank {
             let value = gram[(idx(left), idx(right))] * scales[left] * scales[right];
@@ -2484,9 +2627,10 @@ fn mass_normalize_and_validate_eigenvectors(
                     tolerance,
                 });
             }
+            maximum_defect = maximum_defect.max(value.abs());
         }
     }
-    Ok(())
+    Ok(maximum_defect)
 }
 
 /// Preserve the normalize-only semantics of the legacy mesh constructor while
@@ -3475,6 +3619,34 @@ mod tests {
             validate_and_clamp_generalized_eigenvalues(&mut values, 1.0e-10),
             Err(GpError::NonFiniteEigenvalue { .. })
         ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn mixed_residual_certificate_detects_a_perturbed_auxiliary_mode() {
+        let identity = CsrMatrix::identity(2);
+        let mut l_coo = CooMatrix::new(2, 2);
+        l_coo.push(0, 0, 2.0);
+        l_coo.push(1, 1, 5.0);
+        let l = CsrMatrix::from(&l_coo);
+        let eigenvalues = NaVector::from_vec(vec![3.0, 6.0]);
+        let u = NaMatrix::identity(2, 2);
+        let sigma = u.clone();
+        let operators = GhepReducedOperators {
+            l: &l,
+            d: &identity,
+            c: &identity,
+            mkm1: &identity,
+            mk: &identity,
+        };
+        let exact = maximum_relative_mixed_residual(operators, &eigenvalues, &sigma, &u).unwrap();
+        assert!(exact <= f64::EPSILON);
+
+        let mut perturbed = sigma;
+        perturbed[(0, 0)] += 0.1;
+        let residual =
+            maximum_relative_mixed_residual(operators, &eigenvalues, &perturbed, &u).unwrap();
+        assert!(residual > 1.0e-3);
     }
 
     #[cfg(feature = "external-solvers")]

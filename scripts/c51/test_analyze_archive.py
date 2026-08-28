@@ -38,6 +38,9 @@ def base_row(
         "matched_physical_qoi_eligible": "true",
         "full_uq_workload_eligible": "true",
         "method_performance_timing_eligible": "true",
+        "method_performance_timing_ineligibility_reason": "",
+        "spectral_basis_source": "not_applicable",
+        "spectral_feec_assembly_reuse": "not_applicable",
         "refinement": str(refinement),
         "spatial_dimension": "3",
         "form_degree": "1",
@@ -309,10 +312,13 @@ row_count: 1
         self.assertAlmostEqual(joint.smallest_eligible_rank_fraction, 0.25)
         self.assertEqual(joint.bracket_status, "bracketed")
 
-    def test_v3_shared_basis_timing_is_not_aggregated(self) -> None:
+    def test_v4_shared_basis_timing_is_not_aggregated(self) -> None:
         rows = synthetic_rows()
         spectral = next(value for value in rows if value["method"] == "spectral_r")
         spectral["method_performance_timing_eligible"] = "false"
+        spectral["method_performance_timing_ineligibility_reason"] = (
+            "shared maximum-rank basis"
+        )
         result = c51.analyze(manifest("smoke", len(rows)), rows, c51.GateConfig())
         row_number = rows.index(spectral) + 2
         self.assertFalse(

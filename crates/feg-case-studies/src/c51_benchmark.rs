@@ -24,6 +24,7 @@ use feec_gmrf::prelude::{
 };
 #[cfg(feature = "external-solvers")]
 use feec_gmrf::spectral::{
+    exact_requested_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative,
     partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative,
     PartialMixedGeneralizedEigensolverOptions,
 };
@@ -44,8 +45,8 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v3";
-pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v1";
+pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v4";
+pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v2";
 pub const C51_STUDY_ID: &str = "c51/accuracy-resource";
 
 const EXACT_REFERENCE_MAXIMUM_DIMENSION: usize = 1_024;
@@ -60,6 +61,10 @@ const MIXED_MARGINAL_NNZ_UNAVAILABLE_REASON: &str =
     "the sparse mixed shell applies the marginal weak Hodge operator without materializing it";
 const RESOURCE_ACCURACY_UNAVAILABLE_REASON: &str =
     "resource-only method process does not construct an accuracy reference";
+const EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE: f64 = 1.0e-8;
+const EXACT_REQUESTED_MIXED_EIGENSOLVER_TOLERANCE: f64 = 1.0e-10;
+const EXACT_REQUESTED_MIXED_MASS_ORTHOGONALITY_TOLERANCE: f64 = 1.0e-8;
+const EXACT_REQUESTED_MIXED_EIGENVALUE_NEGATIVE_TOLERANCE: f64 = 1.0e-10;
 
 /// A resource or accuracy quantity with explicit availability semantics.
 #[derive(Debug, Clone, PartialEq)]
@@ -600,6 +605,8 @@ pub struct C51BenchmarkRow {
     /// method-performance comparison. Shared maximum-rank discovery bases are
     /// explicitly ineligible even though their cost is archived.
     pub method_performance_timing_eligible: bool,
+    /// Empty for eligible rows; otherwise the first failed timing invariant.
+    pub method_performance_timing_ineligibility_reason: String,
     /// Construction route for a spectral basis, or `not_applicable`.
     pub spectral_basis_source: String,
     /// Eigensolver backend for a spectral basis, or `not_applicable`.
@@ -608,6 +615,11 @@ pub struct C51BenchmarkRow {
     pub spectral_helper_workspace: String,
     /// External helper binary used for the solve, when applicable.
     pub spectral_helper_binary: String,
+    /// Whether the spectral solve reused the FEEC assembly already charged in
+    /// `feec_assembly_ns`, or explicitly reassembled compatible mixed blocks.
+    pub spectral_feec_assembly_reuse: String,
+    pub spectral_partial_which: String,
+    pub spectral_partial_mass_solve: String,
     pub refinement: usize,
     pub spatial_dimension: usize,
     pub form_degree: usize,
@@ -647,11 +659,23 @@ pub struct C51BenchmarkRow {
     pub spectral_shared_maximum_basis_rank: C51Measurement<usize>,
     pub spectral_partial_requested_rank: C51Measurement<usize>,
     pub spectral_partial_converged_rank: C51Measurement<usize>,
+    pub spectral_partial_retained_rank: C51Measurement<usize>,
+    pub spectral_partial_l_nnz: C51Measurement<usize>,
+    pub spectral_partial_d_nnz: C51Measurement<usize>,
+    pub spectral_partial_c_nnz: C51Measurement<usize>,
+    pub spectral_partial_mkm1_nnz: C51Measurement<usize>,
+    pub spectral_partial_mk_nnz: C51Measurement<usize>,
     pub spectral_partial_mass_nnz: C51Measurement<usize>,
     pub spectral_partial_weak_hodge_laplacian_nnz: C51Measurement<usize>,
     pub spectral_partial_input_nnz: C51Measurement<usize>,
     pub spectral_partial_basis_storage_bytes: C51Measurement<usize>,
     pub spectral_partial_clamped_negative_eigenvalues: C51Measurement<usize>,
+    pub spectral_partial_maximum_relative_mixed_residual: C51Measurement<f64>,
+    pub spectral_partial_maximum_mass_orthogonality_defect: C51Measurement<f64>,
+    pub spectral_partial_mass_orthogonality_tolerance: C51Measurement<f64>,
+    pub spectral_partial_eigenvalue_negative_tolerance: C51Measurement<f64>,
+    pub spectral_partial_eigensolver_tolerance: C51Measurement<f64>,
+    pub spectral_partial_residual_validation_ns: C51Measurement<u128>,
     pub solver: String,
     pub ordering: String,
     pub feec_assembly_ns: C51Measurement<u128>,
@@ -713,6 +737,15 @@ impl C51BenchmarkArchive {
             ));
         }
         for row in &self.rows {
+            if row.method_performance_timing_eligible
+                != row
+                    .method_performance_timing_ineligibility_reason
+                    .is_empty()
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "C51 timing eligibility and its ineligibility reason disagree".to_string(),
+                ));
+            }
             if !row.available || row.latent_dimension == 0 || row.observation_nnz == 0 {
                 return Err(FeecGmrfError::InvalidParameter(format!(
                     "available C51 method {} has an incomplete row",
@@ -787,6 +820,32 @@ impl C51BenchmarkArchive {
                 {
                     return Err(FeecGmrfError::InvalidParameter(
                         "a shared-maximum partial spectral row must archive solver diagnostics and be timing-ineligible"
+                            .to_string(),
+                    ));
+                }
+                if row.spectral_basis_source == "partial_exact_requested_mixed_shell"
+                    && (!matches!(
+                        row.spectral_partial_retained_rank,
+                        C51Measurement::Measured(_)
+                    ) || !matches!(
+                        row.spectral_partial_maximum_relative_mixed_residual,
+                        C51Measurement::Measured(_)
+                    ) || !matches!(
+                        row.spectral_partial_maximum_mass_orthogonality_defect,
+                        C51Measurement::Measured(_)
+                    ) || [
+                        &row.spectral_partial_l_nnz,
+                        &row.spectral_partial_d_nnz,
+                        &row.spectral_partial_c_nnz,
+                        &row.spectral_partial_mkm1_nnz,
+                        &row.spectral_partial_mk_nnz,
+                    ]
+                    .into_iter()
+                    .any(|measurement| !matches!(measurement, C51Measurement::Measured(_)))
+                        || row.spectral_feec_assembly_reuse == "unclassified")
+                {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "an exact-request mixed spectral row must archive rank, certificate, and assembly diagnostics"
                             .to_string(),
                     ));
                 }
@@ -971,7 +1030,31 @@ impl C51BenchmarkArchive {
         )?;
         writeln!(
             writer,
-            "  scalable_production_status: typed_mixed_eigensolver_adapter_available"
+            "  scalable_production_status: exact_requested_mixed_resource_route_available"
+        )?;
+        writeln!(
+            writer,
+            "  exact_requested_residual_tolerance: {}",
+            EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE
+        )?;
+        writeln!(
+            writer,
+            "  exact_requested_eigensolver_tolerance: {}",
+            EXACT_REQUESTED_MIXED_EIGENSOLVER_TOLERANCE
+        )?;
+        writeln!(
+            writer,
+            "  exact_requested_mass_orthogonality_tolerance: {}",
+            EXACT_REQUESTED_MIXED_MASS_ORTHOGONALITY_TOLERANCE
+        )?;
+        writeln!(
+            writer,
+            "  exact_requested_eigenvalue_negative_tolerance: {}",
+            EXACT_REQUESTED_MIXED_EIGENVALUE_NEGATIVE_TOLERANCE
+        )?;
+        writeln!(
+            writer,
+            "  mixed_adapter_assembly_reuse: false_reassembly_is_charged_and_archived"
         )?;
         writeln!(writer, "  seed: {}", self.config.seed)?;
         writeln!(writer, "hardware:")?;
@@ -1046,6 +1129,33 @@ impl C51ResourceArchive {
                 "C51 resource sensor target resolves to {expected_sensor_count}, but the selected observation has {} rows",
                 self.row.sensor_count
             )));
+        }
+        if selection.method == C51MethodId::SpectralLowRank {
+            let selected_rank = selection
+                .spectral_rank
+                .expect("validated low-rank resource selection");
+            if self.row.spectral_basis_source != "partial_exact_requested_mixed_shell"
+                || self.row.spectral_rank != C51Measurement::Measured(selected_rank)
+                || self.row.spectral_partial_requested_rank
+                    != C51Measurement::Measured(selected_rank)
+                || self.row.spectral_partial_retained_rank
+                    != C51Measurement::Measured(selected_rank)
+                || self.row.spectral_shared_maximum_basis_rank != C51Measurement::NotRecorded
+                || [
+                    &self.row.spectral_partial_l_nnz,
+                    &self.row.spectral_partial_d_nnz,
+                    &self.row.spectral_partial_c_nnz,
+                    &self.row.spectral_partial_mkm1_nnz,
+                    &self.row.spectral_partial_mk_nnz,
+                ]
+                .into_iter()
+                .any(|measurement| !matches!(measurement, C51Measurement::Measured(_)))
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "a low-rank C51 resource row must come from one exact-request mixed solve at the selected rank"
+                        .to_string(),
+                ));
+            }
         }
         for measurement in [
             &self.row.posterior_mean_relative_error,
@@ -1149,6 +1259,47 @@ impl C51ResourceArchive {
             "accuracy_status: {}",
             yaml_scalar(RESOURCE_ACCURACY_UNAVAILABLE_REASON)
         )?;
+        writeln!(writer, "spectral_route:")?;
+        writeln!(
+            writer,
+            "  basis_source: {}",
+            yaml_scalar(&self.row.spectral_basis_source)
+        )?;
+        writeln!(
+            writer,
+            "  feec_assembly_reuse: {}",
+            yaml_scalar(&self.row.spectral_feec_assembly_reuse)
+        )?;
+        writeln!(
+            writer,
+            "  timing_eligible: {}",
+            self.row.method_performance_timing_eligible
+        )?;
+        writeln!(
+            writer,
+            "  timing_ineligibility_reason: {}",
+            yaml_scalar(&self.row.method_performance_timing_ineligibility_reason)
+        )?;
+        writeln!(
+            writer,
+            "  mixed_residual_tolerance: {}",
+            EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE
+        )?;
+        writeln!(
+            writer,
+            "  eigensolver_tolerance: {}",
+            EXACT_REQUESTED_MIXED_EIGENSOLVER_TOLERANCE
+        )?;
+        writeln!(
+            writer,
+            "  mass_orthogonality_tolerance: {}",
+            EXACT_REQUESTED_MIXED_MASS_ORTHOGONALITY_TOLERANCE
+        )?;
+        writeln!(
+            writer,
+            "  eigenvalue_negative_tolerance: {}",
+            EXACT_REQUESTED_MIXED_EIGENVALUE_NEGATIVE_TOLERANCE
+        )?;
         writeln!(writer, "rows_csv: rows.csv")?;
         writeln!(writer, "row_count: 1")?;
         writer.flush()?;
@@ -1243,15 +1394,37 @@ pub fn run_c51_resource(
                 selection,
             )?
         }
-        C51MethodId::SpectralFullRank | C51MethodId::SpectralLowRank => {
+        C51MethodId::SpectralFullRank => {
             let spectral = build_spectral_reference(&benchmark, &assembled.operators)?;
-            let rank = match selection.method {
-                C51MethodId::SpectralFullRank => spectral.basis.len(),
-                C51MethodId::SpectralLowRank => selection
-                    .spectral_rank
-                    .expect("validated low-rank resource selection"),
-                _ => unreachable!(),
-            };
+            run_selected_spectral_resource(
+                selection.method,
+                spectral.basis.len(),
+                &spectral,
+                assembled.feec_assembly,
+                &benchmark,
+                design,
+                &assembled.problem,
+                selection,
+            )?
+        }
+        C51MethodId::SpectralLowRank => {
+            #[cfg(feature = "external-solvers")]
+            let rank = selection
+                .spectral_rank
+                .expect("validated low-rank resource selection");
+            #[cfg(feature = "external-solvers")]
+            let spectral = build_exact_requested_mixed_spectral_reference(
+                &benchmark,
+                &assembled.topology,
+                &assembled.metric,
+                rank,
+            )?;
+            #[cfg(not(feature = "external-solvers"))]
+            return Err(FeecGmrfError::InvalidParameter(
+                "a C51 low-rank spectral resource row requires the external-solvers feature; the resource path has no dense or shared-basis fallback"
+                    .to_string(),
+            ));
+            #[cfg(feature = "external-solvers")]
             run_selected_spectral_resource(
                 selection.method,
                 rank,
@@ -1365,6 +1538,8 @@ enum SpectralBasisSource {
     DenseChecked,
     #[cfg(feature = "external-solvers")]
     PartialSharedMaximumMixed(PartialBasisDiagnostics),
+    #[cfg(feature = "external-solvers")]
+    PartialExactRequestedMixed(PartialBasisDiagnostics),
 }
 
 #[cfg(feature = "external-solvers")]
@@ -1373,10 +1548,24 @@ struct PartialBasisDiagnostics {
     requested_rank: usize,
     converged_rank: usize,
     retained_rank: usize,
+    which: String,
+    mass_solve: String,
+    l_nonzeros: usize,
+    d_nonzeros: usize,
+    c_nonzeros: usize,
+    mkm1_nonzeros: usize,
+    mk_nonzeros: usize,
     mass_nonzeros: usize,
     input_nonzeros: usize,
     basis_storage_bytes: usize,
     clamped_negative_eigenvalues: usize,
+    maximum_relative_mixed_residual: f64,
+    maximum_mass_orthogonality_defect: f64,
+    mass_orthogonality_tolerance: f64,
+    eigenvalue_negative_tolerance: f64,
+    eigensolver_tolerance: f64,
+    residual_validation: Duration,
+    feec_assembly_reused: bool,
     workspace: String,
     binary: String,
 }
@@ -1849,10 +2038,24 @@ fn build_partial_spectral_reference(
         requested_rank: diagnostics.requested_rank,
         converged_rank: diagnostics.converged_rank,
         retained_rank: diagnostics.retained_rank,
+        which: format!("{:?}", diagnostics.which).to_ascii_lowercase(),
+        mass_solve: format!("{:?}", diagnostics.mass_solve).to_ascii_lowercase(),
+        l_nonzeros: diagnostics.l_nonzeros,
+        d_nonzeros: diagnostics.d_nonzeros,
+        c_nonzeros: diagnostics.c_nonzeros,
+        mkm1_nonzeros: diagnostics.mkm1_nonzeros,
+        mk_nonzeros: diagnostics.mk_nonzeros,
         mass_nonzeros: diagnostics.mk_nonzeros,
         input_nonzeros: diagnostics.input_nonzeros,
         basis_storage_bytes: diagnostics.basis_storage_bytes,
         clamped_negative_eigenvalues: diagnostics.clamped_negative_eigenvalues,
+        maximum_relative_mixed_residual: diagnostics.maximum_relative_mixed_residual,
+        maximum_mass_orthogonality_defect: diagnostics.maximum_mass_orthogonality_defect,
+        mass_orthogonality_tolerance: diagnostics.mass_orthogonality_tolerance,
+        eigenvalue_negative_tolerance: diagnostics.eigenvalue_negative_tolerance,
+        eigensolver_tolerance: diagnostics.eigensolver_tolerance,
+        residual_validation: diagnostics.residual_validation_duration,
+        feec_assembly_reused: false,
         workspace: diagnostics.workspace.display().to_string(),
         binary: diagnostics.binary.display().to_string(),
     };
@@ -1869,6 +2072,225 @@ fn build_partial_spectral_reference(
         basis_storage_values,
         source: SpectralBasisSource::PartialSharedMaximumMixed(archived),
     })
+}
+
+#[cfg(feature = "external-solvers")]
+fn build_exact_requested_mixed_spectral_reference(
+    config: &C51BenchmarkConfig,
+    topology: &Complex,
+    metric: &manifold::geometry::metric::mesh::MeshLengths,
+    requested_rank: usize,
+) -> Result<SpectralReference> {
+    let eigensolve_start = Instant::now();
+    let partial =
+        exact_requested_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
+            topology,
+            metric,
+            config.form_degree,
+            PartialMixedGeneralizedEigensolverOptions::new(requested_rank),
+        )
+        .map_err(spectral_error)?;
+    let eigensolve = eigensolve_start.elapsed();
+    let diagnostics = partial.diagnostics();
+    let archived = PartialBasisDiagnostics {
+        requested_rank: diagnostics.requested_rank,
+        converged_rank: diagnostics.converged_rank,
+        retained_rank: diagnostics.retained_rank,
+        which: format!("{:?}", diagnostics.which).to_ascii_lowercase(),
+        mass_solve: format!("{:?}", diagnostics.mass_solve).to_ascii_lowercase(),
+        l_nonzeros: diagnostics.l_nonzeros,
+        d_nonzeros: diagnostics.d_nonzeros,
+        c_nonzeros: diagnostics.c_nonzeros,
+        mkm1_nonzeros: diagnostics.mkm1_nonzeros,
+        mk_nonzeros: diagnostics.mk_nonzeros,
+        mass_nonzeros: diagnostics.mk_nonzeros,
+        input_nonzeros: diagnostics.input_nonzeros,
+        basis_storage_bytes: diagnostics.basis_storage_bytes,
+        clamped_negative_eigenvalues: diagnostics.clamped_negative_eigenvalues,
+        maximum_relative_mixed_residual: diagnostics.maximum_relative_mixed_residual,
+        maximum_mass_orthogonality_defect: diagnostics.maximum_mass_orthogonality_defect,
+        mass_orthogonality_tolerance: diagnostics.mass_orthogonality_tolerance,
+        eigenvalue_negative_tolerance: diagnostics.eigenvalue_negative_tolerance,
+        eigensolver_tolerance: diagnostics.eigensolver_tolerance,
+        residual_validation: diagnostics.residual_validation_duration,
+        // The convenience adapter currently reassembles full-relative layouts
+        // and mixed Galerkin blocks. The elapsed eigensolve adapter time and
+        // this flag make that duplicate work visible rather than subtracting it.
+        feec_assembly_reused: false,
+        workspace: diagnostics.workspace.display().to_string(),
+        binary: diagnostics.binary.display().to_string(),
+    };
+    let basis_storage_values = diagnostics
+        .basis_storage_entries
+        .checked_add(diagnostics.retained_rank)
+        .ok_or_else(|| {
+            FeecGmrfError::Dimension("C51 spectral basis storage count overflow".to_string())
+        })?;
+    Ok(SpectralReference {
+        basis: partial.into_basis(),
+        operator_recovery: Duration::ZERO,
+        eigensolve,
+        basis_storage_values,
+        source: SpectralBasisSource::PartialExactRequestedMixed(archived),
+    })
+}
+
+fn apply_spectral_source_metadata(
+    row: &mut C51BenchmarkRow,
+    source: &SpectralReference,
+    selected_rank: usize,
+) {
+    match &source.source {
+        SpectralBasisSource::DenseChecked => {
+            row.method_performance_timing_eligible = source.basis.len() == selected_rank;
+            row.method_performance_timing_ineligibility_reason =
+                if row.method_performance_timing_eligible {
+                    String::new()
+                } else {
+                    "dense checked basis rank does not match the selected rank".to_string()
+                };
+            row.spectral_basis_source = "dense_full_reference".to_string();
+            row.spectral_eigensolver_backend = "dense_checked_generalized_eigensolver".to_string();
+            row.spectral_feec_assembly_reuse = "recovered_from_exact_form_operators".to_string();
+        }
+        #[cfg(feature = "external-solvers")]
+        SpectralBasisSource::PartialSharedMaximumMixed(partial) => {
+            row.method_performance_timing_eligible = false;
+            row.method_performance_timing_ineligibility_reason =
+                "one shared maximum-rank discovery basis cannot support method-owned timing"
+                    .to_string();
+            apply_partial_spectral_diagnostics(row, partial, "partial_shared_maximum_mixed_shell");
+            row.spectral_shared_maximum_basis_rank =
+                C51Measurement::Measured(partial.retained_rank);
+        }
+        #[cfg(feature = "external-solvers")]
+        SpectralBasisSource::PartialExactRequestedMixed(partial) => {
+            apply_partial_spectral_diagnostics(row, partial, "partial_exact_requested_mixed_shell");
+            let failure = exact_requested_mixed_timing_ineligibility_reason(
+                partial,
+                selected_rank,
+                source.basis.len(),
+            );
+            row.method_performance_timing_eligible = failure.is_none();
+            row.method_performance_timing_ineligibility_reason = failure.unwrap_or_default();
+        }
+    }
+}
+
+#[cfg(feature = "external-solvers")]
+fn apply_partial_spectral_diagnostics(
+    row: &mut C51BenchmarkRow,
+    partial: &PartialBasisDiagnostics,
+    source_label: &str,
+) {
+    row.spectral_basis_source = source_label.to_string();
+    row.spectral_eigensolver_backend =
+        "petsc_slepc_mixed_reduced_generalized_eigensolver".to_string();
+    row.spectral_helper_workspace = partial.workspace.clone();
+    row.spectral_helper_binary = partial.binary.clone();
+    row.spectral_feec_assembly_reuse = if partial.feec_assembly_reused {
+        "reused".to_string()
+    } else {
+        "not_reused_reassembled_full_relative_layouts_and_mixed_blocks_charged_in_eigensolve"
+            .to_string()
+    };
+    row.spectral_partial_which = partial.which.clone();
+    row.spectral_partial_mass_solve = partial.mass_solve.clone();
+    row.spectral_partial_requested_rank = C51Measurement::Measured(partial.requested_rank);
+    row.spectral_partial_converged_rank = C51Measurement::Measured(partial.converged_rank);
+    row.spectral_partial_retained_rank = C51Measurement::Measured(partial.retained_rank);
+    row.spectral_partial_l_nnz = C51Measurement::Measured(partial.l_nonzeros);
+    row.spectral_partial_d_nnz = C51Measurement::Measured(partial.d_nonzeros);
+    row.spectral_partial_c_nnz = C51Measurement::Measured(partial.c_nonzeros);
+    row.spectral_partial_mkm1_nnz = C51Measurement::Measured(partial.mkm1_nonzeros);
+    row.spectral_partial_mk_nnz = C51Measurement::Measured(partial.mk_nonzeros);
+    row.spectral_partial_mass_nnz = C51Measurement::Measured(partial.mass_nonzeros);
+    row.spectral_partial_weak_hodge_laplacian_nnz =
+        C51Measurement::unavailable(MIXED_MARGINAL_NNZ_UNAVAILABLE_REASON);
+    row.spectral_partial_input_nnz = C51Measurement::Measured(partial.input_nonzeros);
+    row.spectral_partial_basis_storage_bytes =
+        C51Measurement::Measured(partial.basis_storage_bytes);
+    row.spectral_partial_clamped_negative_eigenvalues =
+        C51Measurement::Measured(partial.clamped_negative_eigenvalues);
+    row.spectral_partial_maximum_relative_mixed_residual =
+        C51Measurement::Measured(partial.maximum_relative_mixed_residual);
+    row.spectral_partial_maximum_mass_orthogonality_defect =
+        C51Measurement::Measured(partial.maximum_mass_orthogonality_defect);
+    row.spectral_partial_mass_orthogonality_tolerance =
+        C51Measurement::Measured(partial.mass_orthogonality_tolerance);
+    row.spectral_partial_eigenvalue_negative_tolerance =
+        C51Measurement::Measured(partial.eigenvalue_negative_tolerance);
+    row.spectral_partial_eigensolver_tolerance =
+        C51Measurement::Measured(partial.eigensolver_tolerance);
+    row.spectral_partial_residual_validation_ns = duration_measurement(partial.residual_validation);
+}
+
+#[cfg(feature = "external-solvers")]
+fn exact_requested_mixed_timing_ineligibility_reason(
+    partial: &PartialBasisDiagnostics,
+    selected_rank: usize,
+    basis_rank: usize,
+) -> Option<String> {
+    if partial.requested_rank != selected_rank
+        || partial.retained_rank != selected_rank
+        || basis_rank != selected_rank
+        || partial.converged_rank < selected_rank
+    {
+        return Some(format!(
+            "rank invariant failed: selected={selected_rank}, requested={}, converged={}, retained={}, basis={basis_rank}",
+            partial.requested_rank, partial.converged_rank, partial.retained_rank
+        ));
+    }
+    if partial.which != "smallest" {
+        return Some(format!(
+            "eigensolver requested {:?} modes instead of smallest",
+            partial.which
+        ));
+    }
+    if partial.mass_solve != "direct" {
+        return Some(format!(
+            "lower-mass solve policy {:?} is not the frozen direct policy",
+            partial.mass_solve
+        ));
+    }
+    if partial.eigensolver_tolerance != EXACT_REQUESTED_MIXED_EIGENSOLVER_TOLERANCE {
+        return Some(format!(
+            "eigensolver tolerance {} does not match the frozen tolerance {}",
+            partial.eigensolver_tolerance, EXACT_REQUESTED_MIXED_EIGENSOLVER_TOLERANCE
+        ));
+    }
+    if partial.mass_orthogonality_tolerance != EXACT_REQUESTED_MIXED_MASS_ORTHOGONALITY_TOLERANCE {
+        return Some(format!(
+            "mass-orthogonality tolerance {} does not match the frozen tolerance {}",
+            partial.mass_orthogonality_tolerance,
+            EXACT_REQUESTED_MIXED_MASS_ORTHOGONALITY_TOLERANCE
+        ));
+    }
+    if partial.eigenvalue_negative_tolerance != EXACT_REQUESTED_MIXED_EIGENVALUE_NEGATIVE_TOLERANCE
+    {
+        return Some(format!(
+            "negative-eigenvalue tolerance {} does not match the frozen tolerance {}",
+            partial.eigenvalue_negative_tolerance,
+            EXACT_REQUESTED_MIXED_EIGENVALUE_NEGATIVE_TOLERANCE
+        ));
+    }
+    if !partial.maximum_relative_mixed_residual.is_finite()
+        || partial.maximum_relative_mixed_residual > EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE
+    {
+        return Some(format!(
+            "maximum mixed residual {} exceeds the frozen tolerance {}",
+            partial.maximum_relative_mixed_residual, EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE
+        ));
+    }
+    if !partial.maximum_mass_orthogonality_defect.is_finite()
+        || partial.maximum_mass_orthogonality_defect > partial.mass_orthogonality_tolerance
+    {
+        return Some(format!(
+            "mass-orthogonality defect {} exceeds tolerance {}",
+            partial.maximum_mass_orthogonality_defect, partial.mass_orthogonality_tolerance
+        ));
+    }
+    None
 }
 
 #[cfg(feature = "external-solvers")]
@@ -1982,10 +2404,14 @@ fn base_resource_row(
         full_uq_workload_eligible: selection.phase == C51ResourcePhase::QueryFullUq
             && method != C51MethodId::FullMetricAugmented,
         method_performance_timing_eligible: true,
+        method_performance_timing_ineligibility_reason: String::new(),
         spectral_basis_source: "not_applicable".to_string(),
         spectral_eigensolver_backend: "not_applicable".to_string(),
         spectral_helper_workspace: String::new(),
         spectral_helper_binary: String::new(),
+        spectral_feec_assembly_reuse: "not_applicable".to_string(),
+        spectral_partial_which: "not_applicable".to_string(),
+        spectral_partial_mass_solve: "not_applicable".to_string(),
         refinement: selection.refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -2025,11 +2451,23 @@ fn base_resource_row(
         spectral_shared_maximum_basis_rank: C51Measurement::NotRecorded,
         spectral_partial_requested_rank: C51Measurement::NotRecorded,
         spectral_partial_converged_rank: C51Measurement::NotRecorded,
+        spectral_partial_retained_rank: C51Measurement::NotRecorded,
+        spectral_partial_l_nnz: C51Measurement::NotRecorded,
+        spectral_partial_d_nnz: C51Measurement::NotRecorded,
+        spectral_partial_c_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mkm1_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mk_nnz: C51Measurement::NotRecorded,
         spectral_partial_mass_nnz: C51Measurement::NotRecorded,
         spectral_partial_weak_hodge_laplacian_nnz: C51Measurement::NotRecorded,
         spectral_partial_input_nnz: C51Measurement::NotRecorded,
         spectral_partial_basis_storage_bytes: C51Measurement::NotRecorded,
         spectral_partial_clamped_negative_eigenvalues: C51Measurement::NotRecorded,
+        spectral_partial_maximum_relative_mixed_residual: C51Measurement::NotRecorded,
+        spectral_partial_maximum_mass_orthogonality_defect: C51Measurement::NotRecorded,
+        spectral_partial_mass_orthogonality_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigenvalue_negative_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigensolver_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_residual_validation_ns: C51Measurement::NotRecorded,
         solver: "not_executed".to_string(),
         ordering: "not_applicable".to_string(),
         feec_assembly_ns: resource_phase_not_executed(),
@@ -2246,7 +2684,7 @@ fn run_selected_spectral_resource(
     selection: &C51ResourceSelection,
 ) -> Result<C51BenchmarkRow> {
     if selection.phase == C51ResourcePhase::QueryFullUq {
-        let mut row = run_spectral_method(
+        let row = run_spectral_method(
             method,
             rank,
             source,
@@ -2258,10 +2696,6 @@ fn run_selected_spectral_resource(
             problem,
             None,
         )?;
-        // The current isolated spectral route still materializes exact marginal
-        // L and is therefore resource-attributable but not a scalable method
-        // timing baseline.
-        row.method_performance_timing_eligible = false;
         return Ok(row);
     }
     let gp_start = Instant::now();
@@ -2293,9 +2727,7 @@ fn run_selected_spectral_resource(
         diagnostics.ambient_dimension,
         0,
     );
-    row.method_performance_timing_eligible = false;
-    row.spectral_basis_source = "dense_full_reference".to_string();
-    row.spectral_eigensolver_backend = "dense_checked_generalized_eigensolver".to_string();
+    apply_spectral_source_metadata(&mut row, source, rank);
     row.spectral_rank = C51Measurement::Measured(rank);
     row.spectral_basis_storage_values = C51Measurement::Measured(source.basis_storage_values);
     row.spectral_gp_storage_values =
@@ -2427,10 +2859,14 @@ fn run_spd_method(
         matched_physical_qoi_eligible: true,
         full_uq_workload_eligible: true,
         method_performance_timing_eligible: true,
+        method_performance_timing_ineligibility_reason: String::new(),
         spectral_basis_source: "not_applicable".to_string(),
         spectral_eigensolver_backend: "not_applicable".to_string(),
         spectral_helper_workspace: String::new(),
         spectral_helper_binary: String::new(),
+        spectral_feec_assembly_reuse: "not_applicable".to_string(),
+        spectral_partial_which: "not_applicable".to_string(),
+        spectral_partial_mass_solve: "not_applicable".to_string(),
         refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -2474,11 +2910,23 @@ fn run_spd_method(
         spectral_shared_maximum_basis_rank: C51Measurement::NotRecorded,
         spectral_partial_requested_rank: C51Measurement::NotRecorded,
         spectral_partial_converged_rank: C51Measurement::NotRecorded,
+        spectral_partial_retained_rank: C51Measurement::NotRecorded,
+        spectral_partial_l_nnz: C51Measurement::NotRecorded,
+        spectral_partial_d_nnz: C51Measurement::NotRecorded,
+        spectral_partial_c_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mkm1_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mk_nnz: C51Measurement::NotRecorded,
         spectral_partial_mass_nnz: C51Measurement::NotRecorded,
         spectral_partial_weak_hodge_laplacian_nnz: C51Measurement::NotRecorded,
         spectral_partial_input_nnz: C51Measurement::NotRecorded,
         spectral_partial_basis_storage_bytes: C51Measurement::NotRecorded,
         spectral_partial_clamped_negative_eigenvalues: C51Measurement::NotRecorded,
+        spectral_partial_maximum_relative_mixed_residual: C51Measurement::NotRecorded,
+        spectral_partial_maximum_mass_orthogonality_defect: C51Measurement::NotRecorded,
+        spectral_partial_mass_orthogonality_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigenvalue_negative_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigensolver_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_residual_validation_ns: C51Measurement::NotRecorded,
         solver: "sparse_cholesky".to_string(),
         ordering: ordering_name(factor.ordering).to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
@@ -2586,10 +3034,14 @@ fn run_supported_method(
         matched_physical_qoi_eligible: true,
         full_uq_workload_eligible: false,
         method_performance_timing_eligible: true,
+        method_performance_timing_ineligibility_reason: String::new(),
         spectral_basis_source: "not_applicable".to_string(),
         spectral_eigensolver_backend: "not_applicable".to_string(),
         spectral_helper_workspace: String::new(),
         spectral_helper_binary: String::new(),
+        spectral_feec_assembly_reuse: "not_applicable".to_string(),
+        spectral_partial_which: "not_applicable".to_string(),
+        spectral_partial_mass_solve: "not_applicable".to_string(),
         refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -2635,11 +3087,23 @@ fn run_supported_method(
         spectral_shared_maximum_basis_rank: C51Measurement::NotRecorded,
         spectral_partial_requested_rank: C51Measurement::NotRecorded,
         spectral_partial_converged_rank: C51Measurement::NotRecorded,
+        spectral_partial_retained_rank: C51Measurement::NotRecorded,
+        spectral_partial_l_nnz: C51Measurement::NotRecorded,
+        spectral_partial_d_nnz: C51Measurement::NotRecorded,
+        spectral_partial_c_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mkm1_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mk_nnz: C51Measurement::NotRecorded,
         spectral_partial_mass_nnz: C51Measurement::NotRecorded,
         spectral_partial_weak_hodge_laplacian_nnz: C51Measurement::NotRecorded,
         spectral_partial_input_nnz: C51Measurement::NotRecorded,
         spectral_partial_basis_storage_bytes: C51Measurement::NotRecorded,
         spectral_partial_clamped_negative_eigenvalues: C51Measurement::NotRecorded,
+        spectral_partial_maximum_relative_mixed_residual: C51Measurement::NotRecorded,
+        spectral_partial_maximum_mass_orthogonality_defect: C51Measurement::NotRecorded,
+        spectral_partial_mass_orthogonality_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigenvalue_negative_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigensolver_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_residual_validation_ns: C51Measurement::NotRecorded,
         solver: "sparse_lu_kkt".to_string(),
         ordering: "backend_partial_pivoting".to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
@@ -2799,54 +3263,7 @@ fn run_spectral_method(
         physical_mean: output.mean,
     };
     let errors = errors_against(&answers, reference)?;
-    let (
-        method_performance_timing_eligible,
-        spectral_basis_source,
-        spectral_eigensolver_backend,
-        spectral_helper_workspace,
-        spectral_helper_binary,
-        spectral_shared_maximum_basis_rank,
-        spectral_partial_requested_rank,
-        spectral_partial_converged_rank,
-        spectral_partial_mass_nnz,
-        spectral_partial_weak_hodge_laplacian_nnz,
-        spectral_partial_input_nnz,
-        spectral_partial_basis_storage_bytes,
-        spectral_partial_clamped_negative_eigenvalues,
-    ) = match &source.source {
-        SpectralBasisSource::DenseChecked => (
-            true,
-            "dense_full_reference".to_string(),
-            "dense_checked_generalized_eigensolver".to_string(),
-            String::new(),
-            String::new(),
-            C51Measurement::NotRecorded,
-            C51Measurement::NotRecorded,
-            C51Measurement::NotRecorded,
-            C51Measurement::NotRecorded,
-            C51Measurement::NotRecorded,
-            C51Measurement::NotRecorded,
-            C51Measurement::NotRecorded,
-            C51Measurement::NotRecorded,
-        ),
-        #[cfg(feature = "external-solvers")]
-        SpectralBasisSource::PartialSharedMaximumMixed(partial) => (
-            false,
-            "partial_shared_maximum_mixed_shell".to_string(),
-            "petsc_slepc_mixed_reduced_generalized_eigensolver".to_string(),
-            partial.workspace.clone(),
-            partial.binary.clone(),
-            C51Measurement::Measured(partial.retained_rank),
-            C51Measurement::Measured(partial.requested_rank),
-            C51Measurement::Measured(partial.converged_rank),
-            C51Measurement::Measured(partial.mass_nonzeros),
-            C51Measurement::unavailable(MIXED_MARGINAL_NNZ_UNAVAILABLE_REASON),
-            C51Measurement::Measured(partial.input_nonzeros),
-            C51Measurement::Measured(partial.basis_storage_bytes),
-            C51Measurement::Measured(partial.clamped_negative_eigenvalues),
-        ),
-    };
-    Ok(C51BenchmarkRow {
+    let mut row = C51BenchmarkRow {
         method,
         available: true,
         unavailable_reason: String::new(),
@@ -2858,11 +3275,16 @@ fn run_spectral_method(
         same_discrete_law_eligible: method == C51MethodId::SpectralFullRank,
         matched_physical_qoi_eligible: true,
         full_uq_workload_eligible: true,
-        method_performance_timing_eligible,
-        spectral_basis_source,
-        spectral_eigensolver_backend,
-        spectral_helper_workspace,
-        spectral_helper_binary,
+        method_performance_timing_eligible: false,
+        method_performance_timing_ineligibility_reason:
+            "spectral source metadata has not been classified".to_string(),
+        spectral_basis_source: "unclassified".to_string(),
+        spectral_eigensolver_backend: "unclassified".to_string(),
+        spectral_helper_workspace: String::new(),
+        spectral_helper_binary: String::new(),
+        spectral_feec_assembly_reuse: "unclassified".to_string(),
+        spectral_partial_which: "not_recorded".to_string(),
+        spectral_partial_mass_solve: "not_recorded".to_string(),
         refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -2915,14 +3337,26 @@ fn run_spectral_method(
         spectral_rank_fraction: C51Measurement::Measured(
             rank as f64 / diagnostics.ambient_dimension as f64,
         ),
-        spectral_shared_maximum_basis_rank,
-        spectral_partial_requested_rank,
-        spectral_partial_converged_rank,
-        spectral_partial_mass_nnz,
-        spectral_partial_weak_hodge_laplacian_nnz,
-        spectral_partial_input_nnz,
-        spectral_partial_basis_storage_bytes,
-        spectral_partial_clamped_negative_eigenvalues,
+        spectral_shared_maximum_basis_rank: C51Measurement::NotRecorded,
+        spectral_partial_requested_rank: C51Measurement::NotRecorded,
+        spectral_partial_converged_rank: C51Measurement::NotRecorded,
+        spectral_partial_retained_rank: C51Measurement::NotRecorded,
+        spectral_partial_l_nnz: C51Measurement::NotRecorded,
+        spectral_partial_d_nnz: C51Measurement::NotRecorded,
+        spectral_partial_c_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mkm1_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mk_nnz: C51Measurement::NotRecorded,
+        spectral_partial_mass_nnz: C51Measurement::NotRecorded,
+        spectral_partial_weak_hodge_laplacian_nnz: C51Measurement::NotRecorded,
+        spectral_partial_input_nnz: C51Measurement::NotRecorded,
+        spectral_partial_basis_storage_bytes: C51Measurement::NotRecorded,
+        spectral_partial_clamped_negative_eigenvalues: C51Measurement::NotRecorded,
+        spectral_partial_maximum_relative_mixed_residual: C51Measurement::NotRecorded,
+        spectral_partial_maximum_mass_orthogonality_defect: C51Measurement::NotRecorded,
+        spectral_partial_mass_orthogonality_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigenvalue_negative_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_eigensolver_tolerance: C51Measurement::NotRecorded,
+        spectral_partial_residual_validation_ns: C51Measurement::NotRecorded,
         solver: match diagnostics.conditioning_strategy {
             LowRankConditioningStrategy::ObservationSpace => {
                 "spectral_observation_space_dense_cholesky"
@@ -2968,7 +3402,9 @@ fn run_spectral_method(
         physical_transformed_variance_negative_count: C51Measurement::Measured(negative_count(
             &answers.physical_transformed_variances,
         )),
-    })
+    };
+    apply_spectral_source_metadata(&mut row, source, rank);
+    Ok(row)
 }
 
 fn observation_designs(
@@ -3250,10 +3686,14 @@ fn csv_header() -> String {
         "matched_physical_qoi_eligible",
         "full_uq_workload_eligible",
         "method_performance_timing_eligible",
+        "method_performance_timing_ineligibility_reason",
         "spectral_basis_source",
         "spectral_eigensolver_backend",
         "spectral_helper_workspace",
         "spectral_helper_binary",
+        "spectral_feec_assembly_reuse",
+        "spectral_partial_which",
+        "spectral_partial_mass_solve",
         "refinement",
         "spatial_dimension",
         "form_degree",
@@ -3290,7 +3730,7 @@ fn csv_header() -> String {
         .join(",")
 }
 
-fn measurement_field_names() -> [&'static str; 51] {
+fn measurement_field_names() -> [&'static str; 63] {
     [
         "prior_precision_nnz",
         "observation_update_nnz",
@@ -3313,11 +3753,23 @@ fn measurement_field_names() -> [&'static str; 51] {
         "spectral_shared_maximum_basis_rank",
         "spectral_partial_requested_rank",
         "spectral_partial_converged_rank",
+        "spectral_partial_retained_rank",
+        "spectral_partial_l_nnz",
+        "spectral_partial_d_nnz",
+        "spectral_partial_c_nnz",
+        "spectral_partial_mkm1_nnz",
+        "spectral_partial_mk_nnz",
         "spectral_partial_mass_nnz",
         "spectral_partial_weak_hodge_laplacian_nnz",
         "spectral_partial_input_nnz",
         "spectral_partial_basis_storage_bytes",
         "spectral_partial_clamped_negative_eigenvalues",
+        "spectral_partial_maximum_relative_mixed_residual",
+        "spectral_partial_maximum_mass_orthogonality_defect",
+        "spectral_partial_mass_orthogonality_tolerance",
+        "spectral_partial_eigenvalue_negative_tolerance",
+        "spectral_partial_eigensolver_tolerance",
+        "spectral_partial_residual_validation_ns",
         "feec_assembly_ns",
         "prior_build_ns",
         "spectral_operator_recovery_ns",
@@ -3358,10 +3810,14 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         row.matched_physical_qoi_eligible.to_string(),
         row.full_uq_workload_eligible.to_string(),
         row.method_performance_timing_eligible.to_string(),
+        row.method_performance_timing_ineligibility_reason.clone(),
         row.spectral_basis_source.clone(),
         row.spectral_eigensolver_backend.clone(),
         row.spectral_helper_workspace.clone(),
         row.spectral_helper_binary.clone(),
+        row.spectral_feec_assembly_reuse.clone(),
+        row.spectral_partial_which.clone(),
+        row.spectral_partial_mass_solve.clone(),
         row.refinement.to_string(),
         row.spatial_dimension.to_string(),
         row.form_degree.to_string(),
@@ -3404,6 +3860,12 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
     push_measurement(&mut fields, &row.spectral_shared_maximum_basis_rank);
     push_measurement(&mut fields, &row.spectral_partial_requested_rank);
     push_measurement(&mut fields, &row.spectral_partial_converged_rank);
+    push_measurement(&mut fields, &row.spectral_partial_retained_rank);
+    push_measurement(&mut fields, &row.spectral_partial_l_nnz);
+    push_measurement(&mut fields, &row.spectral_partial_d_nnz);
+    push_measurement(&mut fields, &row.spectral_partial_c_nnz);
+    push_measurement(&mut fields, &row.spectral_partial_mkm1_nnz);
+    push_measurement(&mut fields, &row.spectral_partial_mk_nnz);
     push_measurement(&mut fields, &row.spectral_partial_mass_nnz);
     push_measurement(&mut fields, &row.spectral_partial_weak_hodge_laplacian_nnz);
     push_measurement(&mut fields, &row.spectral_partial_input_nnz);
@@ -3412,6 +3874,24 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         &mut fields,
         &row.spectral_partial_clamped_negative_eigenvalues,
     );
+    push_measurement(
+        &mut fields,
+        &row.spectral_partial_maximum_relative_mixed_residual,
+    );
+    push_measurement(
+        &mut fields,
+        &row.spectral_partial_maximum_mass_orthogonality_defect,
+    );
+    push_measurement(
+        &mut fields,
+        &row.spectral_partial_mass_orthogonality_tolerance,
+    );
+    push_measurement(
+        &mut fields,
+        &row.spectral_partial_eigenvalue_negative_tolerance,
+    );
+    push_measurement(&mut fields, &row.spectral_partial_eigensolver_tolerance);
+    push_measurement(&mut fields, &row.spectral_partial_residual_validation_ns);
     push_measurement(&mut fields, &row.feec_assembly_ns);
     push_measurement(&mut fields, &row.prior_build_ns);
     push_measurement(&mut fields, &row.spectral_operator_recovery_ns);
@@ -3804,7 +4284,6 @@ mod tests {
             (C51MethodId::FullMetricAugmented, None),
             (C51MethodId::WhitneyCompact, None),
             (C51MethodId::SpectralFullRank, None),
-            (C51MethodId::SpectralLowRank, Some(4)),
         ] {
             let selection = C51ResourceSelection {
                 refinement: 2,
@@ -3823,6 +4302,156 @@ mod tests {
             assert_eq!(archive.row.method, method);
             assert_eq!(archive.config.selection.phase, C51ResourcePhase::ColdSetup);
         }
+    }
+
+    #[cfg(not(feature = "external-solvers"))]
+    #[test]
+    fn low_rank_resource_fails_closed_without_sparse_mixed_solver() {
+        let selection = C51ResourceSelection {
+            refinement: 2,
+            observation_class: C51ObservationClass::LocalPhysicalB,
+            sensor_target: C51ResourceSensorTarget::Count(4),
+            repeated_data_count: 1,
+            method: C51MethodId::SpectralLowRank,
+            spectral_rank: Some(4),
+            phase: C51ResourcePhase::ColdSetup,
+        };
+        let error = run_c51_resource(
+            &C51ResourceConfig::smoke(selection),
+            C51RunMetadata::smoke("resource-test"),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("requires the external-solvers feature"));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn exact_requested_source_classification_fails_closed() {
+        let valid = PartialBasisDiagnostics {
+            requested_rank: 4,
+            converged_rank: 5,
+            retained_rank: 4,
+            which: "smallest".to_string(),
+            mass_solve: "direct".to_string(),
+            l_nonzeros: 3,
+            d_nonzeros: 5,
+            c_nonzeros: 5,
+            mkm1_nonzeros: 10,
+            mk_nonzeros: 10,
+            mass_nonzeros: 10,
+            input_nonzeros: 50,
+            basis_storage_bytes: 128,
+            clamped_negative_eigenvalues: 0,
+            maximum_relative_mixed_residual: 1.0e-11,
+            maximum_mass_orthogonality_defect: 1.0e-12,
+            mass_orthogonality_tolerance: 1.0e-8,
+            eigenvalue_negative_tolerance: 1.0e-10,
+            eigensolver_tolerance: 1.0e-10,
+            residual_validation: Duration::from_nanos(1),
+            feec_assembly_reused: false,
+            workspace: "workspace".to_string(),
+            binary: "binary".to_string(),
+        };
+        assert!(exact_requested_mixed_timing_ineligibility_reason(&valid, 4, 4).is_none());
+
+        let mut mismatched_rank = valid.clone();
+        mismatched_rank.retained_rank = 3;
+        assert!(
+            exact_requested_mixed_timing_ineligibility_reason(&mismatched_rank, 4, 4).is_some()
+        );
+
+        let mut wrong_source_target = valid.clone();
+        wrong_source_target.which = "largest".to_string();
+        assert!(
+            exact_requested_mixed_timing_ineligibility_reason(&wrong_source_target, 4, 4).is_some()
+        );
+
+        let mut failed_residual = valid.clone();
+        failed_residual.maximum_relative_mixed_residual =
+            EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE * 2.0;
+        assert!(
+            exact_requested_mixed_timing_ineligibility_reason(&failed_residual, 4, 4).is_some()
+        );
+
+        let mut relaxed_orthogonality = valid.clone();
+        relaxed_orthogonality.mass_orthogonality_tolerance = 1.0e-6;
+        assert!(
+            exact_requested_mixed_timing_ineligibility_reason(&relaxed_orthogonality, 4, 4)
+                .is_some()
+        );
+
+        let mut relaxed_negative_eigenvalue = valid;
+        relaxed_negative_eigenvalue.eigenvalue_negative_tolerance = 1.0e-6;
+        assert!(exact_requested_mixed_timing_ineligibility_reason(
+            &relaxed_negative_eigenvalue,
+            4,
+            4
+        )
+        .is_some());
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    #[ignore = "requires an installed PETSc/SLEPc helper; run explicitly as a bounded exact-request integration test"]
+    fn bounded_exact_requested_resource_archives_certified_source() {
+        let selection = C51ResourceSelection {
+            refinement: 2,
+            observation_class: C51ObservationClass::LocalPhysicalB,
+            sensor_target: C51ResourceSensorTarget::Count(4),
+            repeated_data_count: 1,
+            method: C51MethodId::SpectralLowRank,
+            spectral_rank: Some(4),
+            phase: C51ResourcePhase::ColdSetup,
+        };
+        let archive = run_c51_resource(
+            &C51ResourceConfig::smoke(selection),
+            C51RunMetadata::smoke("exact-request-resource-test"),
+        )
+        .unwrap();
+        assert_eq!(
+            archive.row.spectral_basis_source,
+            "partial_exact_requested_mixed_shell"
+        );
+        assert_eq!(
+            archive.row.spectral_partial_requested_rank,
+            C51Measurement::Measured(4)
+        );
+        assert_eq!(
+            archive.row.spectral_partial_retained_rank,
+            C51Measurement::Measured(4)
+        );
+        let mixed_block_nnz = [
+            &archive.row.spectral_partial_l_nnz,
+            &archive.row.spectral_partial_d_nnz,
+            &archive.row.spectral_partial_c_nnz,
+            &archive.row.spectral_partial_mkm1_nnz,
+            &archive.row.spectral_partial_mk_nnz,
+        ]
+        .map(|measurement| match measurement {
+            C51Measurement::Measured(value) => *value,
+            other => panic!("expected measured mixed-block nnz, got {other:?}"),
+        });
+        assert!(mixed_block_nnz.iter().all(|value| *value > 0));
+        assert_eq!(
+            archive.row.spectral_partial_input_nnz,
+            C51Measurement::Measured(mixed_block_nnz.into_iter().sum())
+        );
+        assert_eq!(
+            archive.row.spectral_partial_mass_nnz,
+            archive.row.spectral_partial_mk_nnz
+        );
+        assert!(matches!(
+            archive.row.spectral_partial_maximum_relative_mixed_residual,
+            C51Measurement::Measured(value) if value <= EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE
+        ));
+        assert!(archive.row.method_performance_timing_eligible);
+        assert!(archive
+            .row
+            .method_performance_timing_ineligibility_reason
+            .is_empty());
+        assert_ne!(archive.row.spectral_feec_assembly_reuse, "reused");
     }
 
     #[cfg(feature = "external-solvers")]

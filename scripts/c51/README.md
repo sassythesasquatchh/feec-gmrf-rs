@@ -40,6 +40,17 @@ The runner first builds the `c51_benchmark` example with `--locked --release`,
 then executes the binary directly so compilation is not included in scientific
 timing. It refuses to overwrite an existing run directory.
 
+A `spectral_low_rank` resource selection is built with
+`experimental,external-solvers` and performs one independently requested
+sparse mixed PETSc/SLEPc solve at exactly `--spectral-rank`. It has no dense or
+shared-maximum fallback. The row records requested, converged, and retained
+ranks, mixed-block nonzeros, the smallest-mode/direct-mass policy, a streamed
+mixed-equation residual certificate, the `M_k`-orthogonality defect, validation
+time, and helper provenance. Timing eligibility fails closed when any invariant
+or certificate fails. The present convenience adapter reassembles compatible
+full-relative layouts and mixed blocks; that duplication is recorded and its
+time remains charged to the eigensolve rather than being silently subtracted.
+
 Useful checks:
 
 ```text
