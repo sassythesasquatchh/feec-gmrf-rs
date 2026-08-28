@@ -1463,6 +1463,19 @@ impl SpectralMaternGp {
         diagonal_from_feature_matrix(&self.feature_matrix())
     }
 
+    /// Apply the prior coefficient covariance without materializing it.
+    pub fn prior_covariance_action(&self, input: &[f64]) -> Result<Vec<f64>, GpError> {
+        if input.len() != self.basis.eigenvectors.nrows() {
+            return Err(GpError::StateVectorDimensionMismatch {
+                expected: self.basis.eigenvectors.nrows(),
+                got: input.len(),
+            });
+        }
+        let features = self.feature_matrix();
+        let latent_input = dense_transpose_times_vector(&features, input);
+        Ok(dense_matrix_times_vector(&features, &latent_input))
+    }
+
     /// Prior covariance after a sparse output map.
     ///
     /// Only the requested output covariance is materialized. The ambient
@@ -3966,6 +3979,23 @@ mod tests {
             .map(|index| 0.25 - 0.3 * index as f64)
             .collect::<Vec<_>>();
         let covariance = gp.covariance_matrix();
+        let prior_state_input = [0.3, -0.6, 0.2, 1.1];
+        let prior_state_action = gp
+            .prior_covariance_action(&prior_state_input)
+            .unwrap();
+        for row in 0..4 {
+            let expected = (0..4)
+                .map(|column| covariance[(idx(row), idx(column))] * prior_state_input[column])
+                .sum::<f64>();
+            assert_close(prior_state_action[row], expected, 4.0e-13);
+        }
+        assert!(matches!(
+            gp.prior_covariance_action(&[1.0]),
+            Err(GpError::StateVectorDimensionMismatch {
+                expected: 4,
+                got: 1
+            })
+        ));
         let dense = condition_full_covariance_with_covariance(
             &covariance,
             observation_indices,
