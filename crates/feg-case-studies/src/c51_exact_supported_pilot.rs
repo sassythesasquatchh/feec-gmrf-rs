@@ -2,13 +2,13 @@
 //!
 //! This experiment compares the eliminated full-metric reference with the
 //! sparse supported graph on tiny Cartesian meshes. Timings are retained only
-//! to validate instrumentation for E19. They are not performance claims: in
-//! particular, the two public APIs currently expose different query
-//! granularities, recorded by [`PilotQueryKind`].
+//! to validate like-for-like build, factor, and covariance-action
+//! instrumentation for E19. These tiny, single-run timings are not performance
+//! claims.
 
 use feec_gmrf::prelude::{
-    ExactFormOperators, ExactMaternPriorBuilder, FeecGmrfError, LinearMap, MaternAlpha,
-    MaternParameters, Result, SupportedMaternPriorBuilder,
+    ExactFormOperators, ExactMaternPriorBuilder, FeecGmrfError, MaternAlpha, MaternParameters,
+    Result, SupportedMaternPriorBuilder,
 };
 use manifold::gen::cartesian::CartesianMeshInfo;
 use std::time::{Duration, Instant};
@@ -67,15 +67,6 @@ impl Default for ExactSupportedPilotConfig {
     }
 }
 
-/// Public query used for a timing field.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PilotQueryKind {
-    /// Materialize the covariance of the identity pushforward.
-    FullStateCovariance,
-    /// Apply the selected state covariance to one deterministic vector.
-    StateCovarianceAction,
-}
-
 /// One correctness and instrumentation row for a dimension, degree, and alpha.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExactSupportedPilotRow {
@@ -102,13 +93,13 @@ pub struct ExactSupportedPilotRow {
     pub feec_operator_build_wall_time: Duration,
     pub eliminated_build_wall_time: Duration,
     pub eliminated_factor_wall_time: Duration,
+    /// One covariance action for the shared deterministic probe.
     pub eliminated_query_wall_time: Duration,
     pub supported_build_wall_time: Duration,
     pub supported_factor_wall_time: Duration,
+    /// One covariance action for the same deterministic probe.
     pub supported_query_wall_time: Duration,
-    pub eliminated_query_kind: PilotQueryKind,
-    pub supported_query_kind: PilotQueryKind,
-    /// False until the eliminated façade exposes a covariance-action query.
+    /// Both queries are covariance actions, but these are unreplicated tiny-pilot timings.
     pub query_wall_times_are_comparable: bool,
 }
 
@@ -197,9 +188,7 @@ fn run_row(case: &PilotCase<'_>, alpha: MaternAlpha) -> Result<ExactSupportedPil
 
     let rhs = deterministic_probe(case.state_dimension);
     let eliminated_query_start = Instant::now();
-    let eliminated_covariance =
-        eliminated_factor.pushforward_covariance(&LinearMap::identity(case.state_dimension))?;
-    let eliminated_action = apply_dense(&eliminated_covariance, &rhs)?;
+    let eliminated_action = eliminated_factor.covariance_action(&rhs)?;
     let eliminated_query_wall_time = eliminated_query_start.elapsed();
 
     let supported_query_start = Instant::now();
@@ -240,9 +229,7 @@ fn run_row(case: &PilotCase<'_>, alpha: MaternAlpha) -> Result<ExactSupportedPil
         supported_build_wall_time,
         supported_factor_wall_time,
         supported_query_wall_time,
-        eliminated_query_kind: PilotQueryKind::FullStateCovariance,
-        supported_query_kind: PilotQueryKind::StateCovarianceAction,
-        query_wall_times_are_comparable: false,
+        query_wall_times_are_comparable: true,
     })
 }
 
@@ -253,23 +240,6 @@ fn deterministic_probe(dimension: usize) -> Vec<f64> {
             (0.73 * coordinate).sin() + (0.19 * coordinate).cos()
         })
         .collect()
-}
-
-fn apply_dense(matrix: &[Vec<f64>], rhs: &[f64]) -> Result<Vec<f64>> {
-    if matrix.len() != rhs.len() || matrix.iter().any(|row| row.len() != rhs.len()) {
-        return Err(FeecGmrfError::Dimension(
-            "pilot covariance matrix and probe dimensions do not match".to_string(),
-        ));
-    }
-    Ok(matrix
-        .iter()
-        .map(|row| {
-            row.iter()
-                .zip(rhs)
-                .map(|(entry, value)| entry * value)
-                .sum()
-        })
-        .collect())
 }
 
 fn l2_norm(values: &[f64]) -> f64 {
@@ -339,7 +309,21 @@ mod tests {
                 row.alpha,
                 row.covariance_action_relative_error
             );
-            assert!(!row.query_wall_times_are_comparable);
+            assert!(row.query_wall_times_are_comparable);
+            for elapsed in [
+                row.feec_operator_build_wall_time,
+                row.eliminated_build_wall_time,
+                row.eliminated_factor_wall_time,
+                row.eliminated_query_wall_time,
+                row.supported_build_wall_time,
+                row.supported_factor_wall_time,
+                row.supported_query_wall_time,
+            ] {
+                assert!(
+                    !elapsed.is_zero(),
+                    "each pilot stage must record a nonzero wall time"
+                );
+            }
         }
     }
 }
