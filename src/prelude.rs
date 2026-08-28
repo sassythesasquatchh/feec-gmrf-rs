@@ -65,3 +65,18 @@ pub use crate::report::{
     TopCellVtuBuilder, VectorLayout3,
 };
 pub use crate::spacetime::{SpacetimePrior, SpacetimePriorBuilder, TimeDiscretization};
+
+#[cfg(feature = "spectral")]
+pub use crate::spectral::{
+    dense_reference_generalized_hodge_eigenbasis, DenseReferenceEigensolverOptions, EigenBasis,
+    GpError, SpectralMaternConfig, SpectralMaternGp,
+};
+
+#[cfg(feature = "external-solvers")]
+pub use crate::spectral::{
+    partial_generalized_hodge_eigenbasis, partial_mixed_generalized_hodge_eigenbasis,
+    partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative,
+    PartialGeneralizedEigenbasis, PartialGeneralizedEigenbasisDiagnostics,
+    PartialGeneralizedEigensolverOptions, PartialMixedGeneralizedEigenbasis,
+    PartialMixedGeneralizedEigenbasisDiagnostics, PartialMixedGeneralizedEigensolverOptions,
+};

@@ -3,10 +3,14 @@
 #[cfg(feature = "external-solvers")]
 mod hodge;
 
+#[cfg(feature = "external-solvers")]
+use common::linalg::nalgebra::CooMatrix;
 use common::linalg::nalgebra::{CsrMatrix, Matrix as NaMatrix, Vector as NaVector};
 #[cfg(feature = "external-solvers")]
 use common::linalg::petsc::{
-    try_petsc_ghiep, GhiepReducedSolve, GhiepWhich, PetscError, PetscGeneralizedEigenDiagnostics,
+    try_petsc_ghep_reduced_with_which, try_petsc_ghiep, GhepReducedOperators, GhiepReducedSolve,
+    GhiepWhich, PetscError, PetscGeneralizedEigenDiagnostics,
+    PetscReducedGeneralizedEigenDiagnostics,
 };
 #[cfg(feature = "external-solvers")]
 use exterior::ExteriorGrade;
@@ -18,6 +22,7 @@ use formoniq::{
     assemble,
     operators::HodgeMassElmat,
     problems::{hodge_laplace, laplace_beltrami},
+    reduction::DofLayout,
 };
 use libm::tgamma;
 #[cfg(feature = "external-solvers")]
@@ -140,6 +145,41 @@ pub enum GpError {
     #[cfg(feature = "external-solvers")]
     #[error("partial eigenbasis resource diagnostic overflow for {quantity}")]
     PartialEigenbasisResourceOverflow { quantity: &'static str },
+    #[cfg(feature = "external-solvers")]
+    #[error("mixed generalized Hodge eigenbasis requires form degree k > 0, got {degree}")]
+    MixedGeneralizedEigenbasisRequiresPositiveDegree { degree: usize },
+    #[cfg(feature = "external-solvers")]
+    #[error("invalid {space} FEEC boundary layout: {message}")]
+    InvalidMixedGeneralizedEigenbasisLayout {
+        space: &'static str,
+        message: String,
+    },
+    #[cfg(feature = "external-solvers")]
+    #[error(
+        "mixed generalized Hodge eigenbasis requires homogeneous boundary data; {space} dof {index} has value {value}"
+    )]
+    NonHomogeneousMixedGeneralizedEigenbasisLayout {
+        space: &'static str,
+        index: usize,
+        value: f64,
+    },
+    #[cfg(feature = "external-solvers")]
+    #[error(
+        "mixed generalized Hodge block {operator} has shape {rows}x{cols}, expected {expected_rows}x{expected_cols} from the supplied full layouts"
+    )]
+    MixedGeneralizedEigenbasisOperatorDimensionMismatch {
+        operator: &'static str,
+        rows: usize,
+        cols: usize,
+        expected_rows: usize,
+        expected_cols: usize,
+    },
+    #[cfg(feature = "external-solvers")]
+    #[error("mixed generalized Hodge eigenbasis has empty active {space} space")]
+    EmptyMixedGeneralizedEigenbasisSpace { space: &'static str },
+    #[cfg(feature = "external-solvers")]
+    #[error("failed to assemble homogeneous full-relative FEEC operators: {message}")]
+    MixedGeneralizedEigenbasisAssembly { message: String },
     #[cfg(feature = "external-solvers")]
     #[error(transparent)]
     ExternalGeneralizedEigenproblem(#[from] PetscError),
@@ -289,6 +329,81 @@ pub struct PartialGeneralizedEigenbasisDiagnostics {
 pub struct PartialGeneralizedEigenbasis {
     basis: EigenBasis,
     diagnostics: PartialGeneralizedEigenbasisDiagnostics,
+}
+
+/// Policy for a sparse mixed Hodge eigensolve.
+///
+/// The external helper applies the lower-codifferential contribution through
+/// a solve with `M_(k-1)` and never materializes the dense marginal weak Hodge
+/// Laplacian. Only the smallest modes are retained.
+#[cfg(feature = "external-solvers")]
+#[derive(Debug, Clone, Copy)]
+pub struct PartialMixedGeneralizedEigensolverOptions {
+    pub requested_rank: usize,
+    pub eigenvalue_negative_tolerance: f64,
+    pub mass_orthogonality_tolerance: f64,
+    pub mass_solve: GhiepReducedSolve,
+}
+
+#[cfg(feature = "external-solvers")]
+impl PartialMixedGeneralizedEigensolverOptions {
+    /// Construct a smallest-eigenmode solve using the helper's direct lower-mass policy.
+    pub fn new(requested_rank: usize) -> Self {
+        Self {
+            requested_rank,
+            eigenvalue_negative_tolerance: 1.0e-10,
+            mass_orthogonality_tolerance: 1.0e-8,
+            mass_solve: GhiepReducedSolve::Direct,
+        }
+    }
+}
+
+/// Auditable dimensions, sparsity, storage, and process provenance for one
+/// sparse mixed Hodge eigensolve.
+#[cfg(feature = "external-solvers")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialMixedGeneralizedEigenbasisDiagnostics {
+    pub sigma_dimension: usize,
+    pub u_dimension: usize,
+    pub requested_rank: usize,
+    pub converged_rank: usize,
+    pub retained_rank: usize,
+    pub l_nonzeros: usize,
+    pub d_nonzeros: usize,
+    pub c_nonzeros: usize,
+    pub mkm1_nonzeros: usize,
+    pub mk_nonzeros: usize,
+    pub input_nonzeros: usize,
+    pub which: GhiepWhich,
+    pub mass_solve: GhiepReducedSolve,
+    pub basis_storage_entries: usize,
+    pub basis_storage_bytes: usize,
+    pub clamped_negative_eigenvalues: usize,
+    pub workspace: PathBuf,
+    pub binary: PathBuf,
+}
+
+/// A checked mass-orthonormal basis on the active degree-`k` cochain space.
+#[cfg(feature = "external-solvers")]
+#[derive(Debug, Clone)]
+pub struct PartialMixedGeneralizedEigenbasis {
+    basis: EigenBasis,
+    diagnostics: PartialMixedGeneralizedEigenbasisDiagnostics,
+}
+
+#[cfg(feature = "external-solvers")]
+impl PartialMixedGeneralizedEigenbasis {
+    pub fn basis(&self) -> &EigenBasis {
+        &self.basis
+    }
+
+    pub fn diagnostics(&self) -> &PartialMixedGeneralizedEigenbasisDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn into_basis(self) -> EigenBasis {
+        self.basis
+    }
 }
 
 #[cfg(feature = "external-solvers")]
@@ -460,6 +575,192 @@ pub fn partial_generalized_hodge_eigenbasis(
         },
         basis,
     })
+}
+
+/// Compute the smallest generalized Hodge--Laplacian modes from FEEC mixed blocks.
+///
+/// `sigma_layout` and `u_layout` must be the homogeneous layouts for the
+/// degree-`k-1` and degree-`k` spaces, respectively. The implementation
+/// restricts every [`hodge_laplace::MixedGalmats`] block with those same active
+/// index sets before invoking the sparse PETSc/SLEPc shell operator
+/// `L + D M_(k-1)^(-1) C`. It does not assemble the marginal operator and does
+/// not use a dense fallback.
+#[cfg(feature = "external-solvers")]
+pub fn partial_mixed_generalized_hodge_eigenbasis(
+    galmats: &hodge_laplace::MixedGalmats,
+    sigma_layout: &DofLayout,
+    u_layout: &DofLayout,
+    options: PartialMixedGeneralizedEigensolverOptions,
+) -> Result<PartialMixedGeneralizedEigenbasis, GpError> {
+    validate_partial_mixed_options(options, u_layout.reduced_dimension())?;
+    validate_homogeneous_layout("degree-k-1", sigma_layout)?;
+    validate_homogeneous_layout("degree-k", u_layout)?;
+    if sigma_layout.reduced_dimension() == 0 {
+        return Err(GpError::EmptyMixedGeneralizedEigenbasisSpace {
+            space: "degree-k-1",
+        });
+    }
+    if u_layout.reduced_dimension() == 0 {
+        return Err(GpError::EmptyMixedGeneralizedEigenbasisSpace { space: "degree-k" });
+    }
+
+    let mass_sigma_full = CsrMatrix::from(galmats.mass_sigma());
+    let dif_sigma_full = CsrMatrix::from(galmats.dif_sigma());
+    let codif_u_full = CsrMatrix::from(galmats.codif_u());
+    let codifdif_u_full = if galmats.codifdif_u().nrows() == 0 {
+        CsrMatrix::zeros(u_layout.full_dimension, u_layout.full_dimension)
+    } else {
+        CsrMatrix::from(galmats.codifdif_u())
+    };
+    let mass_u_full = CsrMatrix::from(galmats.mass_u());
+
+    validate_mixed_full_shape(
+        "M_(k-1)",
+        &mass_sigma_full,
+        sigma_layout.full_dimension,
+        sigma_layout.full_dimension,
+    )?;
+    validate_mixed_full_shape(
+        "D",
+        &dif_sigma_full,
+        u_layout.full_dimension,
+        sigma_layout.full_dimension,
+    )?;
+    validate_mixed_full_shape(
+        "C",
+        &codif_u_full,
+        sigma_layout.full_dimension,
+        u_layout.full_dimension,
+    )?;
+    validate_mixed_full_shape(
+        "L",
+        &codifdif_u_full,
+        u_layout.full_dimension,
+        u_layout.full_dimension,
+    )?;
+    validate_mixed_full_shape(
+        "M_k",
+        &mass_u_full,
+        u_layout.full_dimension,
+        u_layout.full_dimension,
+    )?;
+
+    let mkm1 = restrict_mixed_operator(&mass_sigma_full, sigma_layout, sigma_layout);
+    let d = restrict_mixed_operator(&dif_sigma_full, u_layout, sigma_layout);
+    let c = restrict_mixed_operator(&codif_u_full, sigma_layout, u_layout);
+    let l = restrict_mixed_operator(&codifdif_u_full, u_layout, u_layout);
+    let mk = restrict_mixed_operator(&mass_u_full, u_layout, u_layout);
+    let result = try_petsc_ghep_reduced_with_which(
+        GhepReducedOperators {
+            l: &l,
+            d: &d,
+            c: &c,
+            mkm1: &mkm1,
+            mk: &mk,
+        },
+        options.requested_rank,
+        GhiepWhich::Smallest,
+        options.mass_solve,
+    )?;
+    let PetscReducedGeneralizedEigenDiagnostics {
+        sigma_dimension,
+        u_dimension,
+        requested_rank,
+        converged_rank,
+        l_nonzeros,
+        d_nonzeros,
+        c_nonzeros,
+        mkm1_nonzeros,
+        mk_nonzeros,
+        input_nonzeros,
+        which,
+        mass_solve,
+        workspace,
+        binary,
+    } = result.diagnostics;
+
+    let mut eigenvalues = result.eigenvalues;
+    let clamped_negative_eigenvalues = validate_and_clamp_generalized_eigenvalues(
+        &mut eigenvalues,
+        options.eigenvalue_negative_tolerance,
+    )?;
+    let basis = EigenBasis::from_generalized_hodge_laplace_eigenpairs(
+        eigenvalues,
+        result.u_eigenvectors,
+        &mk,
+        options.mass_orthogonality_tolerance,
+    )?
+    .truncate_smallest(options.requested_rank)?;
+    let basis_storage_entries =
+        u_dimension
+            .checked_mul(basis.len())
+            .ok_or(GpError::PartialEigenbasisResourceOverflow {
+                quantity: "mixed basis entry count",
+            })?;
+    let basis_storage_bytes = basis_storage_entries
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or(GpError::PartialEigenbasisResourceOverflow {
+            quantity: "mixed basis byte count",
+        })?;
+
+    Ok(PartialMixedGeneralizedEigenbasis {
+        diagnostics: PartialMixedGeneralizedEigenbasisDiagnostics {
+            sigma_dimension,
+            u_dimension,
+            requested_rank,
+            converged_rank,
+            retained_rank: basis.len(),
+            l_nonzeros,
+            d_nonzeros,
+            c_nonzeros,
+            mkm1_nonzeros,
+            mk_nonzeros,
+            input_nonzeros,
+            which,
+            mass_solve,
+            basis_storage_entries,
+            basis_storage_bytes,
+            clamped_negative_eigenvalues,
+            workspace,
+            binary,
+        },
+        basis,
+    })
+}
+
+/// Assemble homogeneous full-relative degree-`k-1` and degree-`k` layouts,
+/// then solve the sparse mixed generalized eigenproblem. The root package's
+/// `ExactFormOperators` constructor uses the same FEEC assembly entry point.
+///
+/// The degree must be positive. This convenience adapter deliberately calls
+/// `formoniq::relative::assemble_whitney_full_relative_operators`, so its
+/// active ordering is the FEEC ordering rather than an independently inferred
+/// boundary convention.
+#[cfg(feature = "external-solvers")]
+pub fn partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
+    topology: &Complex,
+    geometry: &MeshLengths,
+    degree: usize,
+    options: PartialMixedGeneralizedEigensolverOptions,
+) -> Result<PartialMixedGeneralizedEigenbasis, GpError> {
+    if degree == 0 {
+        return Err(GpError::MixedGeneralizedEigenbasisRequiresPositiveDegree { degree });
+    }
+    let relative =
+        formoniq::relative::assemble_whitney_full_relative_operators(topology, geometry, degree)
+            .map_err(|error| GpError::MixedGeneralizedEigenbasisAssembly {
+                message: error.to_string(),
+            })?;
+    let lower = relative
+        .lower()
+        .ok_or(GpError::MixedGeneralizedEigenbasisRequiresPositiveDegree { degree })?;
+    let galmats = hodge_laplace::MixedGalmats::compute(topology, geometry, degree);
+    partial_mixed_generalized_hodge_eigenbasis(
+        &galmats,
+        lower.layout(),
+        relative.state().layout(),
+        options,
+    )
 }
 
 impl EigenBasis {
@@ -2252,6 +2553,91 @@ fn validate_partial_generalized_eigenbasis_inputs(
 }
 
 #[cfg(feature = "external-solvers")]
+fn validate_partial_mixed_options(
+    options: PartialMixedGeneralizedEigensolverOptions,
+    u_dimension: usize,
+) -> Result<(), GpError> {
+    if options.requested_rank == 0 || options.requested_rank > u_dimension {
+        return Err(GpError::InvalidPartialGeneralizedEigenbasisRank {
+            requested: options.requested_rank,
+            dimension: u_dimension,
+        });
+    }
+    if !options.eigenvalue_negative_tolerance.is_finite()
+        || options.eigenvalue_negative_tolerance < 0.0
+    {
+        return Err(GpError::InvalidEigenvalueNegativeTolerance);
+    }
+    if !options.mass_orthogonality_tolerance.is_finite()
+        || options.mass_orthogonality_tolerance < 0.0
+    {
+        return Err(GpError::InvalidMassOrthogonalityTolerance);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "external-solvers")]
+fn validate_homogeneous_layout(space: &'static str, layout: &DofLayout) -> Result<(), GpError> {
+    DofLayout::from_parts(
+        layout.full_dimension,
+        layout.active_dofs.clone(),
+        layout.prescribed_dofs.clone(),
+    )
+    .map_err(|message| GpError::InvalidMixedGeneralizedEigenbasisLayout { space, message })?;
+    if let Some(dof) = layout.prescribed_dofs.iter().find(|dof| dof.value != 0.0) {
+        return Err(GpError::NonHomogeneousMixedGeneralizedEigenbasisLayout {
+            space,
+            index: dof.index,
+            value: dof.value,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "external-solvers")]
+fn validate_mixed_full_shape(
+    operator: &'static str,
+    matrix: &CsrMatrix,
+    expected_rows: usize,
+    expected_cols: usize,
+) -> Result<(), GpError> {
+    if matrix.nrows() != expected_rows || matrix.ncols() != expected_cols {
+        return Err(
+            GpError::MixedGeneralizedEigenbasisOperatorDimensionMismatch {
+                operator,
+                rows: matrix.nrows(),
+                cols: matrix.ncols(),
+                expected_rows,
+                expected_cols,
+            },
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "external-solvers")]
+fn restrict_mixed_operator(full: &CsrMatrix, rows: &DofLayout, columns: &DofLayout) -> CsrMatrix {
+    let row_map = active_index_map(rows);
+    let column_map = active_index_map(columns);
+    let mut reduced = CooMatrix::new(rows.reduced_dimension(), columns.reduced_dimension());
+    for (row, column, value) in full.triplet_iter() {
+        if let (Some(reduced_row), Some(reduced_column)) = (row_map[row], column_map[column]) {
+            reduced.push(reduced_row, reduced_column, *value);
+        }
+    }
+    CsrMatrix::from(&reduced)
+}
+
+#[cfg(feature = "external-solvers")]
+fn active_index_map(layout: &DofLayout) -> Vec<Option<usize>> {
+    let mut map = vec![None; layout.full_dimension];
+    for (reduced, &full) in layout.active_dofs.iter().enumerate() {
+        map[full] = Some(reduced);
+    }
+    map
+}
+
+#[cfg(feature = "external-solvers")]
 fn validate_and_clamp_generalized_eigenvalues(
     eigenvalues: &mut NaVector,
     negative_tolerance: f64,
@@ -3050,6 +3436,181 @@ mod tests {
             validate_and_clamp_generalized_eigenvalues(&mut values, 1.0e-10),
             Err(GpError::NonFiniteEigenvalue { .. })
         ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn mixed_eigensolver_validates_exact_layouts_before_launch() {
+        use formoniq::reduction::PrescribedDof;
+        use manifold::gen::cartesian::CartesianMeshInfo;
+
+        let mesh = CartesianMeshInfo::new_unit(2, 2);
+        let (topology, coordinates) = mesh.compute_coord_complex();
+        let geometry = coordinates.to_edge_lengths(&topology);
+        let relative =
+            formoniq::relative::assemble_whitney_full_relative_operators(&topology, &geometry, 1)
+                .unwrap();
+        let galmats = hodge_laplace::MixedGalmats::compute(&topology, &geometry, 1);
+        let lower_layout = relative.lower().unwrap().layout();
+        let state_layout = relative.state().layout();
+
+        let error = partial_mixed_generalized_hodge_eigenbasis(
+            &galmats,
+            lower_layout,
+            state_layout,
+            PartialMixedGeneralizedEigensolverOptions::new(0),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::InvalidPartialGeneralizedEigenbasisRank { requested: 0, .. }
+        ));
+
+        let mut nonhomogeneous = lower_layout.clone();
+        nonhomogeneous.prescribed_dofs[0] = PrescribedDof {
+            index: nonhomogeneous.prescribed_dofs[0].index,
+            value: 1.0,
+        };
+        let error = partial_mixed_generalized_hodge_eigenbasis(
+            &galmats,
+            &nonhomogeneous,
+            state_layout,
+            PartialMixedGeneralizedEigensolverOptions::new(1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::NonHomogeneousMixedGeneralizedEigenbasisLayout { .. }
+        ));
+
+        let wrong_state = DofLayout::identity(state_layout.full_dimension + 1);
+        let error = partial_mixed_generalized_hodge_eigenbasis(
+            &galmats,
+            lower_layout,
+            &wrong_state,
+            PartialMixedGeneralizedEigensolverOptions::new(1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::MixedGeneralizedEigenbasisOperatorDimensionMismatch { operator: "D", .. }
+        ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn mixed_eigensolver_requires_positive_degree() {
+        use manifold::gen::cartesian::CartesianMeshInfo;
+
+        let mesh = CartesianMeshInfo::new_unit(2, 1);
+        let (topology, coordinates) = mesh.compute_coord_complex();
+        let geometry = coordinates.to_edge_lengths(&topology);
+        let error = partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
+            &topology,
+            &geometry,
+            0,
+            PartialMixedGeneralizedEigensolverOptions::new(1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::MixedGeneralizedEigenbasisRequiresPositiveDegree { degree: 0 }
+        ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    #[ignore = "requires built PETSc/SLEPc reduced Hodge helper"]
+    fn mixed_eigensolver_matches_explicit_full_relative_marginal_reference() {
+        use manifold::gen::cartesian::CartesianMeshInfo;
+
+        let mesh = CartesianMeshInfo::new_unit(2, 2);
+        let (topology, coordinates) = mesh.compute_coord_complex();
+        let geometry = coordinates.to_edge_lengths(&topology);
+        let relative =
+            formoniq::relative::assemble_whitney_full_relative_operators(&topology, &geometry, 1)
+                .unwrap();
+        let lower_layout = relative.lower().unwrap().layout();
+        let state_layout = relative.state().layout();
+        let galmats = hodge_laplace::MixedGalmats::compute(&topology, &geometry, 1);
+        let rank = state_layout.reduced_dimension();
+        let mixed = partial_mixed_generalized_hodge_eigenbasis(
+            &galmats,
+            lower_layout,
+            state_layout,
+            PartialMixedGeneralizedEigensolverOptions::new(rank),
+        )
+        .expect("bounded mixed helper solve should succeed");
+
+        let full_mkm1 = CsrMatrix::from(galmats.mass_sigma());
+        let full_d = CsrMatrix::from(galmats.dif_sigma());
+        let full_c = CsrMatrix::from(galmats.codif_u());
+        let full_l = CsrMatrix::from(galmats.codifdif_u());
+        let full_mk = CsrMatrix::from(galmats.mass_u());
+        let mkm1 = restrict_mixed_operator(&full_mkm1, lower_layout, lower_layout);
+        let d = restrict_mixed_operator(&full_d, state_layout, lower_layout);
+        let c = restrict_mixed_operator(&full_c, lower_layout, state_layout);
+        let l = restrict_mixed_operator(&full_l, state_layout, state_layout);
+        let mk = restrict_mixed_operator(&full_mk, state_layout, state_layout);
+        let mkm1_dense = NaMatrix::from(&mkm1);
+        let marginal_dense = NaMatrix::from(&l)
+            + NaMatrix::from(&d)
+                * mkm1_dense
+                    .try_inverse()
+                    .expect("small lower mass should be invertible")
+                * NaMatrix::from(&c);
+        let mut marginal_coo = CooMatrix::new(rank, rank);
+        for row in 0..rank {
+            for column in 0..rank {
+                let value = marginal_dense[(row, column)];
+                if value != 0.0 {
+                    marginal_coo.push(row, column, value);
+                }
+            }
+        }
+        let reference = dense_reference_generalized_hodge_eigenbasis(
+            &mk,
+            &CsrMatrix::from(&marginal_coo),
+            DenseReferenceEigensolverOptions::new(rank),
+        )
+        .expect("small explicit marginal reference should succeed");
+
+        for (left, right) in mixed
+            .basis()
+            .eigenvalues()
+            .iter()
+            .zip(reference.eigenvalues())
+        {
+            assert_close(*left, *right, 2.0e-8);
+        }
+        let mass_dense = NaMatrix::from(&mk);
+        let mixed_vectors = NaMatrix::from_fn(rank, rank, |row, column| {
+            mixed.basis().eigenvectors()[(row, column)]
+        });
+        let reference_vectors = NaMatrix::from_fn(rank, rank, |row, column| {
+            reference.eigenvectors()[(row, column)]
+        });
+        let mixed_gram = mixed_vectors.transpose() * &mass_dense * &mixed_vectors;
+        assert!((&mixed_gram - NaMatrix::identity(rank, rank)).norm() <= 2.0e-8);
+        let cross_gram = reference_vectors.transpose() * mass_dense * mixed_vectors;
+        let singular_values = cross_gram.svd(false, false).singular_values;
+        assert!(singular_values
+            .iter()
+            .all(|value| (*value - 1.0).abs() <= 2.0e-8));
+
+        assert_eq!(
+            mixed.diagnostics().sigma_dimension,
+            lower_layout.reduced_dimension()
+        );
+        assert_eq!(mixed.diagnostics().u_dimension, rank);
+        assert_eq!(mixed.diagnostics().retained_rank, rank);
+        assert_eq!(mixed.diagnostics().which, GhiepWhich::Smallest);
+        assert_eq!(mixed.diagnostics().mass_solve, GhiepReducedSolve::Direct);
+        assert_eq!(mixed.diagnostics().basis_storage_entries, rank * rank);
+        eprintln!(
+            "retained reduced Hodge helper workspace for inspection: {:?}",
+            mixed.diagnostics().workspace
+        );
     }
 
     #[cfg(feature = "external-solvers")]
