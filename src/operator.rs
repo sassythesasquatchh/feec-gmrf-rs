@@ -1,4 +1,4 @@
-//! Backend-neutral sparse operators and FEEC form-operator bundles.
+//! Sparse linear maps and FEEC form-operator bundles.
 
 use crate::{FeecGmrfError, Result};
 use common::linalg::nalgebra::CsrMatrix as FeecCsr;
@@ -6,7 +6,7 @@ use feg_core::{SparseTriplet, SparseTripletMatrix};
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-/// The stable sparse matrix type exposed by the parent package.
+/// Sparse matrix representation used by public model and map types.
 pub type SparseMat = SparseTripletMatrix;
 
 /// A validated linear map between finite-dimensional spaces.
@@ -22,7 +22,7 @@ impl LinearMap {
         Ok(Self { matrix })
     }
 
-    /// Convert a FEEC CSR matrix into the stable backend-neutral map type.
+    /// Convert a FEEC CSR matrix into the sparse map representation.
     pub fn from_feec_csr(matrix: &FeecCsr) -> Result<Self> {
         Self::new(sparse_mat_from_feec_csr(matrix))
     }
@@ -161,7 +161,7 @@ impl LinearMap {
     }
 }
 
-/// Convert a FEEC CSR matrix into the stable backend-neutral sparse type.
+/// Convert a FEEC CSR matrix into the public sparse matrix representation.
 pub fn sparse_mat_from_feec_csr(matrix: &FeecCsr) -> SparseMat {
     SparseMat::from_triplets(
         matrix.nrows(),

@@ -1,4 +1,4 @@
-//! Inference results and adapters to generic GMRF algebra.
+//! Posterior queries, reusable factorizations, and uncertainty estimates.
 
 use crate::boundary::EssentialBoundaryElimination;
 use crate::model::{DerivedQuantity, LinearGaussianModelBuilder};

@@ -1,46 +1,66 @@
-# Reproduction guide
+# Reproducing the numerical studies
 
-This guide is for readers reproducing the thesis studies. It covers the pinned
-checkout, study profiles, provenance records, and external prerequisites used by
-the `feg-study` workflow.
+The `feg-study` command provides named configurations for the maintained
+numerical studies. A run records its resolved parameters, source revisions,
+inputs, deterministic seeds, software versions, metrics, and generated
+artifacts.
 
-For operating-system prerequisites, a source build of PETSc with MUMPS, helper
-compilation, and a first verified run, begin with
-[`getting-started.md`](getting-started.md).
-
-Use a recursive checkout so the exact FEEC and GMRF commits pinned by the parent
-are present:
+Begin with [Installation and first run](getting-started.md). Use a recursive
+checkout so that the FEEC and GMRF revisions recorded by the parent are
+available:
 
 ```text
-git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf-rs
+git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf-rs.git
 cd feec-gmrf-rs
 ```
 
-Build the three manifests separately in release mode. The parent declares the
-two submodule directories as workspace exclusions, while Cargo may still
-promote in-tree path dependencies into the root workspace graph.
+## Discovering studies
+
+List the registry and inspect one study:
 
 ```text
-cargo test --release --workspace
-cargo test --release --workspace --manifest-path feec/Cargo.toml
-cargo test --release --workspace --manifest-path gmrf-rs/Cargo.toml
+cargo run --release -p feg-cli --bin feg-study -- list
+cargo run --release -p feg-cli --bin feg-study -- describe STUDY_ID
 ```
+
+The description includes available profiles, accepted custom parameters,
+required input files, and external executables.
 
 ## Profiles
 
-- `smoke` is a cheap deterministic configuration for CI and installation
-  checks.
-- `thesis-submitted` is immutable and matches the submitted report settings.
-  Magnetic calibration uses levels 2–8 and 512 Hutchinson probes; the sphere
-  observable study includes refinement level 6.
-- future publication profiles are immutable and publication-named.
-- custom research configurations are recorded with a `custom` verification
-  status.
+Two profile families are included:
 
-Use `--config` for a strict custom research configuration. The file identifies
-the study and the immutable profile whose defaults it overrides;
-`feg-study describe <study-id>` lists the accepted study-specific keys. Unknown
-keys and mismatched study IDs are errors.
+- `smoke` uses a small deterministic problem for checking the complete
+  execution and reporting path;
+- `thesis-submitted` uses the mesh levels, observations, estimator sizes, and
+  other parameters associated with the submitted thesis results.
+
+Run and verify a profile with:
+
+```text
+cargo run --release -p feg-cli --bin feg-study -- \
+  run STUDY_ID --profile smoke --output out/STUDY_ID
+cargo run --release -p feg-cli --bin feg-study -- \
+  verify out/STUDY_ID --against smoke
+```
+
+Verification compares the run manifest with the requested profile and checks
+the recorded input and artifact inventory. A dirty source tree is recorded;
+verification of a `thesis-submitted` profile requires a clean tree.
+
+The complete smoke collection can be run with:
+
+```text
+bash scripts/run-smoke-studies.sh out/smoke
+```
+
+Some full-resolution studies take substantially longer than the smoke
+profiles.
+
+## Custom configurations
+
+A custom TOML file starts from a named profile and overrides parameters accepted
+by that study:
 
 ```toml
 schema = "feg-study-custom-v1"
@@ -51,27 +71,52 @@ range_cells = 3
 level = 12
 ```
 
+Run and verify it with:
+
 ```text
-feg-study run matern/scalar --config research.toml --output out/research
-feg-study verify out/research --against custom
+cargo run --release -p feg-cli --bin feg-study -- \
+  run matern/scalar --config research.toml --output out/research
+cargo run --release -p feg-cli --bin feg-study -- \
+  verify out/research --against custom
 ```
 
-Every run directory contains the resolved configuration, command line, root and
-submodule commits, dirty status, tool versions, deterministic seeds, metrics,
-input hashes, and artifact inventory. Verification refuses to certify a dirty
-`thesis-submitted` run.
+Unknown keys, duplicate keys, incompatible value types, and a mismatched
+`study_id` are errors. `feg-study describe` lists the accepted keys for each
+study.
 
-Some electromagnetic workflows require Gmsh, PETSc with MUMPS, or SLEPc.
-Optional publication-reference comparisons additionally require NGSolve. Their
-registry descriptors declare runtime prerequisites; a missing prerequisite is
-an error, never a skipped successful run. The manual
-publication workflow builds the FEEC helper programs with
-`scripts/build-petsc-helpers.sh` and runs the gated
-`feg-infer` and external-reference regression tests before executing the 15
-immutable profiles.
+## Recorded run information
 
-The submitted report repository at commit `115890e` is the initial capability
-and reference-results guide. It is not modified by the packaging workflow.
+Each output directory contains enough metadata to identify the computation:
 
-The checked-in geometry definitions and mesh fixtures used by maintained
-profiles are catalogued in [`assets.md`](assets.md).
+- resolved profile or custom configuration;
+- command line;
+- parent, FEEC, and GMRF commit IDs and dirty status;
+- Rust and external-tool versions;
+- deterministic random seeds;
+- paths and hashes of declared scientific inputs;
+- metrics and artifact inventory.
+
+This information is scientific run provenance: it describes how a numerical
+result was obtained. It does not describe repository import or publication
+history.
+
+## External tools
+
+Many studies use only the Rust sparse solver and checked-in meshes. Depending
+on the problem, a descriptor may require:
+
+- Gmsh for runtime mesh generation;
+- PETSc with MUMPS for large sparse direct solves;
+- SLEPc for eigenvalue and harmonic-basis calculations;
+- NGSolve for an optional independent reference comparison.
+
+Missing declared prerequisites cause the run to fail with a diagnostic. The
+PETSc/SLEPc build and environment variables are described in
+[Installation and first run](getting-started.md).
+
+## Scientific inputs
+
+Checked-in geometry definitions and mesh fixtures are listed in
+[Scientific input data](assets.md). Their fixed entity ordering and physical
+tags are part of a reproducible discretization, so a generated mesh should not
+be substituted without recording the change.

@@ -1,4 +1,4 @@
-//! Dependency-light parsing for the stable study command surface.
+//! Dependency-light parsing for `feg-study` arguments.
 
 use std::path::PathBuf;
 

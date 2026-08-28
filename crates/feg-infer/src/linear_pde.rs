@@ -27,14 +27,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::mem::size_of;
 use std::time::Instant;
 
-/// Observation noise for the root state-only PDE builder.
+/// Observation noise for a state-only reduced linear PDE model.
 #[derive(Debug, Clone)]
 pub enum StateOnlyLinearObservationNoise {
     ScalarVariance(f64),
     Precision(SparseTripletMatrix),
 }
 
-/// Active-coordinate affine observation used by the state-only PDE adapter.
+/// Affine observation of the active state coordinates.
 #[derive(Debug, Clone)]
 pub struct StateOnlyLinearObservationSpec {
     pub operator: SparseTripletMatrix,

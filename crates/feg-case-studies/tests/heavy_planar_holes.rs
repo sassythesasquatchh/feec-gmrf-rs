@@ -1,4 +1,4 @@
-//! Stable Cargo target for opt-in planar-holes workflow checks.
+//! Cargo target for opt-in planar-holes study checks.
 //!
 //! The detailed heavy assertions live beside the workflow implementation under
 //! `#[cfg(feature = "heavy-tests")]` and reuse its private setup helpers.

@@ -208,7 +208,7 @@ pub fn run_toroidal_exact_b_sweeps(
 /// Run a research sweep with explicit prefixes of the registered case grids.
 ///
 /// The immutable registry profiles call [`run_toroidal_exact_b_sweeps`]. This
-/// variant is the canonical custom-configuration path and rejects case counts
+/// variant accepts custom configurations and rejects case counts
 /// outside the maintained grids.
 pub fn run_toroidal_exact_b_sweeps_with_case_limits(
     output_dir: impl AsRef<Path>,

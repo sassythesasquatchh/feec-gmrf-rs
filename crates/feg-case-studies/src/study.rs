@@ -148,7 +148,7 @@ impl CustomStudyConfiguration {
     }
 }
 
-/// Stable metadata and runner for one maintained workflow.
+/// Metadata and runner for one maintained study.
 #[derive(Debug, Clone, Copy)]
 pub struct StudyDescriptor {
     pub id: &'static str,
@@ -163,12 +163,12 @@ pub struct StudyDescriptor {
 
 const PROFILES: &[&str] = &["smoke", "thesis-submitted"];
 
-/// Maintained workflow descriptors in stable identifier order.
+/// Maintained study descriptors in identifier order.
 pub fn published_studies() -> &'static [StudyDescriptor] {
     &PUBLISHED
 }
 
-/// Find a maintained workflow by stable identifier.
+/// Find a maintained study by identifier.
 pub fn find_published_study(id: &str) -> Option<&'static StudyDescriptor> {
     PUBLISHED.iter().find(|study| study.id == id)
 }

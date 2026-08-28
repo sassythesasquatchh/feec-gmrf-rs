@@ -1,4 +1,4 @@
-//! Stable Cargo target for opt-in TEAM 13 workflow checks.
+//! Cargo target for opt-in TEAM 13 study checks.
 //!
 //! The detailed heavy assertions live beside the workflow implementation under
 //! `#[cfg(feature = "heavy-tests")]` and reuse its private setup helpers.

@@ -196,7 +196,7 @@ impl<'a> EliminatedResidualModel<'a> {
         })
     }
 
-    /// Boundary elimination applied by this residual adapter.
+    /// Boundary elimination applied before evaluating this residual model.
     pub fn elimination(&self) -> &EssentialBoundaryElimination {
         &self.elimination
     }

@@ -1,4 +1,4 @@
-//! Stable diagnostics for Gaussian predictive distributions.
+//! Diagnostics for Gaussian predictive distributions.
 
 use crate::Result;
 

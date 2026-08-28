@@ -177,8 +177,9 @@ impl LinearPdeSystem {
     /// `assembly.state_mass`--for example, a reduced Hodge Laplacian or
     /// Laplace--Beltrami operator. The builder then interprets it as `L` in
     /// `L + kappa^2 M` and applies the Lindgren recurrence. Symmetry and
-    /// coercivity are modelling assumptions and are intentionally not checked
-    /// here; callers with a general PDE residual should use
+    /// coercivity are modelling assumptions. This method checks dimensions but
+    /// does not establish those analytic properties; callers with a general
+    /// PDE residual should use
     /// [`Self::pde_induced_prior`] instead.
     pub fn matern_prior_builder(&self) -> Result<MaternPriorBuilder<'static>> {
         let (degree, complex_dimension) = self.form_space.ok_or_else(|| {

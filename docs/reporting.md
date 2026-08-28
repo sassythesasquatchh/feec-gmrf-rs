@@ -1,23 +1,31 @@
-# Posterior reporting and artifacts
+# Posterior reporting
 
-`feec_gmrf::report` carries the compact root API through posterior extraction,
-console summaries, validated CSV tables, and VTU field bundles. It does not
-decide which quantities are scientifically meaningful: callers still define
-truth/reference fields, units, held-out data, metrics, artifact selection, and
-acceptance thresholds.
+The `feec_gmrf::report` module turns posterior queries into validated,
+structured results. It supports console summaries, CSV tables, predictive
+diagnostics, exact covariance blocks for small quantities of interest, and VTU
+fields for FEEC meshes.
 
-## From a model to a report
+The reporting types do not decide which quantities are scientifically
+meaningful. Applications supply names, units, truth or reference values,
+physical maps, held-out measurements, and acceptance criteria.
 
-A solved `Posterior` can be queried by latent ordering, full FEEC cochain
-ordering, a named derived output registered on the model, or an ad-hoc
-`LinearMap`:
+## Requesting posterior fields
+
+A `PosteriorReportBuilder` can query:
+
+- latent active coefficients;
+- the complete FEEC cochain, including prescribed boundary values;
+- a derived quantity registered while building the model;
+- an ad hoc `LinearMap`.
+
+Each request selects an uncertainty method independently:
 
 ```rust
 use feec_gmrf::prelude::*;
 
 fn summarize(
     posterior: &mut Posterior,
-    sensor: LinearMap,
+    held_out_map: LinearMap,
     observations: Vec<f64>,
     observation_variances: Vec<f64>,
 ) -> Result<PosteriorReport> {
@@ -32,13 +40,17 @@ fn summarize(
                 .variance_method(VarianceMethod::Exact),
         )
         .field(
-            FieldRequest::derived("flux", "Flux cochain", "d1a_flux_cochain")
-                .unit("Wb"),
+            FieldRequest::derived(
+                "flux",
+                "Magnetic flux cochain",
+                "d1a_flux_cochain",
+            )
+            .unit("Wb"),
         )
         .qoi(
             QoiRequest::derived(
                 "engineering",
-                "Engineering QoIs",
+                "Engineering quantities",
                 "engineering_qois",
                 vec!["flux_x1".into(), "mean_bx".into()],
             )
@@ -48,7 +60,7 @@ fn summarize(
             PredictionRequest::mapped(
                 "held_out",
                 "Held-out sensors",
-                sensor,
+                held_out_map,
                 labels,
                 observations,
                 observation_variances,
@@ -60,32 +72,62 @@ fn summarize(
 }
 ```
 
-Every artifact ID is separate from its human-readable label. IDs use stable
-lowercase ASCII letters, digits, `_`, and `-`; `build()` rejects duplicate IDs,
-unknown named outputs, non-finite values, and every label/unit/truth/reference/
-baseline dimension mismatch.
+Artifact IDs are machine-readable keys and are separate from labels. IDs use
+lowercase ASCII letters, digits, `_`, and `-`. Construction fails on duplicate
+IDs, unknown derived quantities, non-finite data, or inconsistent dimensions.
 
-`FieldReport` retains the complete `VarianceEstimate`, including estimator,
-sample count, batch sizes, batch and relative standard errors, raw negative
-count, and raw minimum. Its standard deviations use
-`sqrt(max(variance, 0))`; the raw estimator diagnostics are not discarded.
-Optional truth and reference vectors produce errors and optional z-scores.
-Zero posterior standard deviation produces a missing z-score instead of an
-infinite table value. Optional baseline variances produce pointwise variance
-reductions when the baseline is positive.
+## Field uncertainty
 
-`QoiReport` always obtains a small exact covariance block from the posterior.
-The covariance-to-correlation conversion is validated in `gmrf-core`: matrices
-must be finite, square, and symmetric; materially negative diagonals are errors;
-and zero-variance rows and columns have zero correlation.
+`FieldReport` contains the posterior mean, marginal variances, standard
+deviations, and the complete `VarianceEstimate`. Stochastic estimates retain:
 
-`PredictionReport` uses the canonical independent-Gaussian predictive
-diagnostics. It records observations, predictive means, raw latent variance
-metadata, observation variances, residuals, predictive standard deviations,
-standardized residuals, RMSE, mean NLPD, and empirical coverage. Pass/fail
-thresholds remain in the calling workflow.
+- estimator family and seed;
+- sample or probe count;
+- batch sizes;
+- batch and relative standard errors;
+- the number and minimum of raw negative estimates;
+- the variance-floor policy.
 
-## Console and canonical CSV output
+Reported standard deviations use `sqrt(max(variance, 0))`, while the raw
+diagnostics remain available for judging whether stabilization is material.
+
+Optional truth values produce errors and pointwise z-scores. A coefficient with
+zero posterior variance has no finite z-score. Optional baseline variances
+produce pointwise variance reductions wherever the baseline is positive.
+
+## Quantities of interest
+
+`QoiRequest` is intended for small output vectors such as integrated fluxes,
+circulations, or volume-averaged field components. The report obtains their
+exact transformed covariance matrix from the posterior factorization,
+including any hard-constraint correction.
+
+Covariance-to-correlation conversion checks that the matrix is finite, square,
+and symmetric. A materially negative diagonal is an error. A zero-variance
+quantity has zero correlation with every quantity, including itself.
+
+## Predictive diagnostics
+
+`PredictionRequest` compares held-out observations with a Gaussian predictive
+distribution. The result contains:
+
+- predictive mean and latent variance;
+- observation variance;
+- residual and standardized residual;
+- predictive standard deviation;
+- root-mean-square error;
+- mean negative log predictive density;
+- empirical interval coverage.
+
+These diagnostics currently assume independent Gaussian held-out errors.
+Correlated observation blocks can still be queried as fields or quantities of
+interest, but a joint Mahalanobis score is not presently part of
+`PredictionReport`.
+
+## Console output and tables
+
+Console summaries are bounded so that a mesh-sized field does not print every
+coefficient:
 
 ```rust
 let options = ConsoleReportOptions {
@@ -95,66 +137,66 @@ let options = ConsoleReportOptions {
     include_correlation: true,
 };
 write_console_report(&mut std::io::stdout(), &report, &options)?;
+```
 
+The standard CSV tables are written with:
+
+```rust
 let tables = report.tables()?;
 write_csv_directory("out/my_workflow", &tables)?;
 ```
 
-Console rendering prints ranges and estimator diagnostics for mesh-sized
-fields; it never dumps complete arrays. QoI and prediction rows are bounded by
-`max_rows`, and matrix output is opt-in.
+The table set includes:
 
-Canonical tables use long, stable schemas:
+- `metrics.csv`;
+- pointwise field and estimator tables;
+- quantity-of-interest values, covariance, and correlation;
+- prediction rows and prediction summaries;
+- optional factorization diagnostics.
 
-- `metrics.csv`: `id,label,unit,value`;
-- `<id>_field.csv` and `<id>_estimator.csv`: pointwise field values and
-  estimator metadata;
-- `<id>_qoi.csv`, `<id>_covariance.csv`, and `<id>_correlation.csv`;
-- `<id>_prediction.csv` and `<id>_prediction_summary.csv`;
-- `factorization.csv`, when requested.
+Applications can construct additional domain-specific tables with
+`ReportTable`. Columns are ordered and unique, and each row must have the
+declared width. Cells are typed as `Text`, `Integer`, `Float`, `Boolean`, or
+`Missing`. A floating-point cell rejects NaN and infinity. CSV escaping is
+handled by the `csv` crate.
 
-Studies can create narrower domain tables with `ReportTable`. Columns are
-unique and ordered, every row has the declared width, and cells are typed as
-`Text`, `Integer`, `Float`, `Boolean`, or `Missing`. `Float` rejects NaN and
-infinity. Use `Missing` for absent data; use explicit `Text("NaN")` only when a
-study intentionally records a non-finite scientific result. CSV encoding uses
-the `csv` crate, including correct quoting for commas, quotes, tabs, and
-newlines.
+## FEEC VTU fields
 
-## VTU bundles
-
-`CochainVtuBuilder` writes named scalar arrays at a declared form degree and can
-add a `FieldReport` directly as mean, variance, and standard-deviation arrays:
+`CochainVtuBuilder` writes scalar arrays associated with one form degree:
 
 ```rust
 let state = report.field("state").expect("requested field");
 let mut vtu = CochainVtuBuilder::new(0);
 vtu.add_field_report("posterior", state)?;
-vtu.write("out/my_workflow/state.vtu", &coords, &topology)?;
+vtu.write("out/state.vtu", &coords, &topology)?;
 ```
 
-`TopCellVtuBuilder` combines named scalar and three-vector fields. Flattened
-vectors must declare `VectorLayout3::Interleaved` or
-`VectorLayout3::ComponentMajor`; conversion, component splitting, dimensions,
-finite values, and duplicate names are validated. Actual XML VTU encoding
-continues to use the canonical FEEC writers. Physical FEEC reconstruction is
-still performed by the established `feg-infer` maps before values reach the
-artifact builder.
+Adding a `FieldReport` writes mean, variance, and standard-deviation arrays.
+The array length must match the number of simplices for the selected form
+degree.
 
-## Workflows in this release
+`TopCellVtuBuilder` writes scalar or three-component fields on top-dimensional
+cells. A flattened vector must declare `VectorLayout3::Interleaved` or
+`VectorLayout3::ComponentMajor`; layout conversion and all dimensions are
+validated.
 
-- `minimal_0form` uses field and prediction requests for sensors, a named
-  transect, an ad-hoc query, and exact/Monte Carlo estimator comparison. It
-  writes canonical tables plus `sensors.csv`, `transect.csv`, `query.csv`,
-  `estimator_comparison.csv`, and `posterior_0form.vtu` under
-  `out/examples/minimal_0form`.
-- `em_1form_uq` uses report requests for A, D1A, reconstructed B, engineering
-  QoIs, and the flux prediction. It writes canonical CSVs and A/D1A/B VTU
-  bundles in each model directory under `out/em_1form_uq`.
-- Matérn trace normalization and magnetic physical calibration retain their
-  typed scientific report rows but use `ReportTable` for their output schemas.
+Physical reconstruction occurs before reporting. For example, the magnetic
+field values supplied to `TopCellVtuBuilder` come from the explicit
+`A -> D1 A -> B` map.
 
-Mixed state/source inference and nonlinear Laplace inference deliberately do
-not have automatic report adapters in this release. Those workflows can use
-`ReportTable` and the VTU builders now, while typed adapters from
-`LinearPdeUqResult` and `NonlinearPosterior` require a separate API design.
+## Current result types
+
+`PosteriorReportBuilder` operates directly on the public `Posterior` returned by
+linear Gaussian and reduced linear PDE model builders. The lower-level mixed
+state/source result and `NonlinearPosterior` expose their means, variances, and
+derived quantities through different structures. Those workflows can write
+typed `ReportTable` data and VTU fields directly; there is not yet a single
+automatic report constructor for them.
+
+The two introductory examples show the complete reporting path:
+
+- `minimal_0form` reports sensors, a transect, an ad hoc query, exact and Monte
+  Carlo uncertainty, and a 0-form VTU field.
+- `em_1form_uq` reports the vector potential, flux cochain, reconstructed
+  magnetic field, engineering covariance, predictive diagnostics, and
+  separate A, D1A, and B VTU files.

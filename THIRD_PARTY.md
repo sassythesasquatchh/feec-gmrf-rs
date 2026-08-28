@@ -1,25 +1,30 @@
-# Third-party code and lineage
+# Acknowledgements and third-party licenses
 
-## formoniq / FEEC submodule
+## FEEC implementation
 
-The `feec` submodule retains the `formoniq` crate name and is an attributed
-thesis fork of Luis Wirth's implementation. Its recorded upstream baseline is
-commit `65b98b55f3fee1c28bc37acb68981a3f3bd63e9e` (the “bsc-thesis version”).
-Upstream and fork code are available under MIT or Apache-2.0; both license texts
-are included in the submodule.
+The `formoniq` finite element code in `feec/` is derived from Luis Wirth's
+[formoniq project](https://github.com/luiswirth/formoniq), developed in
+connection with his ETH Zürich bachelor's thesis on coordinate-free Whitney
+finite element exterior calculus.
 
-## GMRF submodule
+The FEEC workspace retains the upstream MIT/Apache-2.0 license choice. Both
+license texts are included in that workspace. Patrick Dowd and contributors
+developed the boundary-aware assembly, electromagnetic residuals and
+Jacobians, spatiotemporal operators, reconstruction maps, and integration
+interfaces used by FEEC–GMRF.
 
-The `gmrf-rs` submodule contains the standalone `gmrf-core` crate from the
-clean-history `gmrf-rs` repository. Its `UPSTREAM.md` records the exact import
-commit from the earlier Rust port, whose recorded divergence point is Tim
-Weiland's commit `6cfba1e6ab8a71b49eabd5a0545e7eb72eae940a`. It is distributed
-under MIT and retains upstream attribution and the original license text.
+## GMRF implementation
+
+The `gmrf-core` code in `gmrf-rs/` builds on Gaussian Markov random field work
+by Tim Weiland. Patrick Dowd and contributors developed the Rust integration,
+sparse conditioning, constraint, sampling, covariance, and uncertainty
+functionality used here.
+
+The GMRF workspace is distributed under the MIT license and includes its
+license text.
 
 ## Rust dependencies
 
-Rust dependency names, versions, declared license expressions, sources, and
-repositories are generated from all three locked workspaces with `cargo
-metadata`. The generated inventory belongs in the versioned release archive,
-not in source control, because exact transitive versions are fixed by the three
-lockfiles.
+The exact transitive Rust dependencies are fixed by the lockfiles in the
+parent, FEEC, and GMRF workspaces. Their names, versions, sources, and declared
+licenses can be obtained with `cargo metadata` or a dependency-license tool.

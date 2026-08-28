@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 pub use feec_gmrf::report::{CochainVtuBuilder, TopCellVtuBuilder, VectorLayout3};
 
-/// Return the canonical VTU path for a visual artifact.
+/// Return the VTU path used for a visual artifact.
 ///
 /// Callers may still pass legacy `.vtk` stems while thesis visual outputs
 /// migrate to XML VTU.

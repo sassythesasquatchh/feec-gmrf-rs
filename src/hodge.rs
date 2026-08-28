@@ -1,4 +1,4 @@
-//! First-class root façade for sparse 1-form Hodge-decomposed Gaussian priors.
+//! Sparse Gaussian priors for exact, coexact, and harmonic 1-form components.
 
 use crate::infer::{Posterior, VarianceEstimate, VarianceMethod};
 use crate::model::{
@@ -31,7 +31,7 @@ enum HodgePriorConstruction {
     FormMatern(HodgeMatern1FormPriorConfig),
 }
 
-/// Builder selecting one canonical sparse 1-form Hodge prior construction.
+/// Builder for a sparse Hodge-decomposed 1-form prior.
 pub struct HodgeOneFormPriorBuilder<'a> {
     topology: &'a Complex,
     coords: Option<&'a MeshCoords>,
@@ -66,8 +66,8 @@ impl<'a> HodgeOneFormPriorBuilder<'a> {
     /// The latent potential precision compensates for the spectral factor
     /// introduced by `d` or `delta`, so an ambient branch eigenmode has
     /// covariance proportional to `(kappa^2 + lambda)^(-a)`. Sparse gauges
-    /// are selected internally only to make the potential representation
-    /// proper; they are not part of the statistical model's public identity.
+    /// remove null directions from the potential coordinates so that their
+    /// precision is proper; the synthesized form spectrum is gauge-independent.
     /// Alpha one and two are supported; alpha three is rejected during
     /// validation because its spectrum-matched sparse precision is not yet
     /// implemented.
@@ -90,7 +90,7 @@ impl<'a> HodgeOneFormPriorBuilder<'a> {
         self
     }
 
-    /// Assemble the selected canonical lower-layer construction and wrap it.
+    /// Assemble the branch precisions and their maps into the ambient 1-form space.
     pub fn build(self) -> Result<HodgeOneFormPrior> {
         let (spectrum, config) = match self.construction {
             HodgePriorConstruction::PotentialMatern(config) => {

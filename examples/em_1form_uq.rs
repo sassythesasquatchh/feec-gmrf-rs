@@ -429,8 +429,8 @@ fn print_setup(
     );
 }
 
-/// Register outputs once so every model returns the ordinary root `Posterior`
-/// with the same names and coordinate conventions.
+/// Register outputs once so every model returns a `Posterior` with the same
+/// names and coordinate conventions.
 fn register_outputs<'a>(
     builder: LinearPdeModelBuilder<'a>,
     system: &'a LinearPdeSystem,

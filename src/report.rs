@@ -1,8 +1,8 @@
-//! First-class posterior summaries and artifact renderers.
+//! Validated posterior summaries and scientific artifact renderers.
 //!
-//! The report façade keeps posterior extraction, validation, and generic
-//! Gaussian diagnostics reusable while leaving scientific interpretation and
-//! artifact selection with the calling workflow.
+//! Reports query latent, full-cochain, derived, or mapped quantities from a
+//! posterior. Applications supply the physical interpretation, units,
+//! references, and selected output artifacts.
 
 mod console;
 mod table;

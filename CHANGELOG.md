@@ -1,88 +1,71 @@
 # Changelog
 
-All notable changes to the supported package are recorded here. Numerical
-changes must describe their mathematical cause and may not be hidden by changing
-tolerances or reference data.
+This file records user-visible capabilities and corrections that change the
+mathematical or numerical result.
 
 ## 0.1.0 — unreleased
 
-- Added the reusable `feec_gmrf` root façade.
-- Added the state-only linear FEEC--GMRF UQ façade, including canonical
-  zero-form and electromagnetic one-form conditioning examples.
-- Added constrained Monte Carlo uncertainty estimates in `gmrf-core` and
-  exposed the FEEC boundary-orientation sign needed by physical weak-form
-  assembly.
-- Added grade-independent Matérn recurrence construction for alpha 1, 2, and 3.
-- Added validated sparse maps, boundary layouts, linear observations,
-  constraints, physical pushforwards, posterior uncertainty, and spatiotemporal
-  prior construction.
-- Made the FEEC and GMRF workspaces independently buildable.
-- Added registry-driven maintained-study profiles and provenance manifests.
-- Added strict file-backed custom research configurations based on immutable
-  publication profiles.
-- Centralized physical-RMS calibration through generic transformed GMRF
-  covariance actions.
-- Added cached prior factors, reusable prepared linear-Gaussian designs,
-  heteroscedastic observation rows, exact/Hutchinson/automatic variance
-  policies, weighted covariance traces, and factorization diagnostics to the
-  root API.
-- Added a root sparse one-form Hodge façade and canonical predictive diagnostics,
-  then migrated seven state-only publication workflows away from direct generic
-  GMRF orchestration. Mixed state/source and nonlinear workflows remain
-  explicitly out of scope for this migration wave.
-- Exposed exact covariance pushforwards for named derived quantities through
-  the supported `Posterior` API, including hard-constraint corrections.
-- Added the first-class `feec_gmrf::report` façade for validated posterior
-  fields, exact QoI covariance/correlation, predictive diagnostics, scalar
-  metrics, deterministic console summaries, typed CSV tables, and cochain or
-  top-cell VTU bundles. Both introductory examples and the first two reporting
-  pilot studies use the new artifact APIs.
-- Added top-level homogeneous and prescribed essential-boundary elimination.
-  FEEC Matérn operators are reduced before the mass-inverse recurrence, fixed
-  values are folded into all linear and nonlinear model terms, and posterior
-  cochain means, variances, and samples are lifted with exact prescribed values.
-- Separated publication-supported and experimental workflow surfaces.
-- Removed tracked generated solver products and observation caches.
-- Removed byte-identical duplicate torus and toroidal-inductor meshes while
-  retaining the canonical filenames and unchanged mesh hashes.
-- Added a clean recursive-clone installation contract for Apple Silicon macOS
-  and Ubuntu 24.04. The documented core path builds pinned repository-local
-  PETSc/MUMPS/SLEPc releases, validates selection precedence and failure modes,
-  and keeps NGSolve confined to optional publication-reference checks.
+### Field models and inference
 
-### Numerical corrections requiring release review
+- Added Matérn precision construction for 0-, 1-, 2-, and 3-form FEEC spaces,
+  with integer orders alpha 1, 2, and 3 and explicit mass-inverse policies.
+- Added potential-spectrum and form-spectrum Hodge-decomposed 1-form priors
+  with exact, coexact, and harmonic branches.
+- Added sparse linear Gaussian observations, heteroscedastic and correlated
+  noise models, hard linear constraints, derived quantities, and predictive
+  diagnostics.
+- Added homogeneous and prescribed essential-boundary elimination. FEEC
+  operators are reduced before the Matérn recurrence, affine offsets are folded
+  into every model term, and posterior results lift back to the complete
+  cochain with zero variance at prescribed values.
+- Added reduced linear PDE models, weak-residual conditioning, PDE-induced
+  priors, nonlinear Gauss–Newton/Laplace inference, and spatiotemporal
+  precision construction.
+- Added block state/source uncertainty models with latent or analytically
+  collapsed uncertain inputs.
 
-- Corrected the GMRF AR(1) precision constructor for endpoint and singleton
-  processes, with exact coefficient tests for each matrix position.
-- Corrected the deterministic cube and torus `H_d` outputs to report the graph
-  norm `sqrt(||u-u_h||^2 + ||d(u-u_h)||^2)`. The packaging baseline had
-  labelled the exterior-derivative seminorm alone as `H_d`; the corrected
-  values restore the submitted tables without changing the underlying solves.
-- Restored `matern/scalar` to the submitted Lindgren-style diagnostic: one
-  central vertex and 21 nonnegative coordinate-axis lags on the level-64 mesh.
-  The initial registry profile incorrectly selected all 35,937 interior
-  vertices and attempted to form their dense transformed covariance. The
-  report configuration is now a first-class maintained workflow with focused
-  profile tests.
-- Corrected `matern/marginal-variance-4d` to run the submitted scalar
-  alpha-2/alpha-3 point, line-average, and area-average study at levels 4, 8,
-  12, and 16. The initial registry entry incorrectly invoked a newer all-form
-  study; that workflow remains available under the experimental feature.
-- Pinned the immutable `toroidal-b/canonical` profile to the exact submitted
-  12/24 training/heldout flux-row split. The reusable greedy source-design
-  algorithm remains the default for smoke and custom research runs; the
-  publication split is recorded explicitly because one selection is a
-  solver-sensitive near-tie.
-- Corrected `hodge/torus-residual-weight` to run the submitted posterior
-  residual-precision convergence sweep at κ=4 over weights 10^2 through
-  10^12 and torus mesh levels 0 through 3. The initial registry entry
-  incorrectly invoked a distinct residual-field variance-decomposition
-  diagnostic, which remains available as a case-study module.
-- Moved the torus resolution-bound check from the cube Hodge--Laplacian runner
-  to the torus residual-weight runner where it belongs. The misplaced check
-  rejected valid submitted cube refinements above 3 before any solve began;
-  focused tests now cover the maintained torus mesh range.
+### Sparse computation and uncertainty
 
-The comparison method, exact profile settings, numerical differences, and
-release dispositions are recorded in
-[`docs/thesis-result-validation.md`](docs/thesis-result-validation.md).
+- Added sparse matrix composition through the `LinearMap` API.
+- Added reusable prior factors and prepared linear Gaussian designs for
+  repeated observation values.
+- Added exact, selected-inverse, Monte Carlo, Hutchinson, local
+  Rao–Blackwellised, and dimension-dependent uncertainty methods.
+- Added transformed covariance actions, exact small-output covariance blocks,
+  weighted covariance traces, constrained variance corrections, and
+  factorization diagnostics.
+- Added deterministic stochastic-estimator batching, standard-error reporting,
+  and explicit variance stabilization metadata.
+- Added physical-RMS calibration through transformed covariance actions.
+
+### Physical fields and scientific output
+
+- Added orientation-aware magnetic maps following
+  `A -> D1 A -> reconstructed B`, along with boundary flux and
+  volume-average maps.
+- Added posterior reports containing fields, quantities of interest,
+  predictive diagnostics, typed CSV tables, and FEEC or top-cell VTU fields.
+- Added `minimal_0form` and `em_1form_uq` as introductory scalar and
+  electromagnetic workflows.
+- Added named, reproducible study profiles and strict custom configurations
+  through the `feg-study` command.
+- Separated maintained case studies from exploratory numerical programs.
+
+### Numerical corrections
+
+- Corrected the AR(1) precision endpoints and singleton case in `gmrf-core`.
+  Exact coefficient tests cover every matrix position.
+- Corrected cube and torus `H_d` error output to use the graph norm
+  `sqrt(||u-u_h||^2 + ||d(u-u_h)||^2)` rather than the exterior-derivative
+  seminorm alone.
+- Restored the scalar Matérn diagnostic to one central vertex and 21
+  nonnegative coordinate-axis lags on the level-64 mesh, avoiding an unintended
+  dense covariance over all interior vertices.
+- Restored the four-dimensional marginal-variance study to the scalar alpha-2
+  and alpha-3 point, line-average, and area-average configurations.
+- Restored the toroidal magnetic study's submitted 12/24 training and held-out
+  flux-row split. The greedy source-design method remains available for new
+  experiments.
+- Restored the torus residual-weight study to the posterior
+  residual-precision sweep at kappa 4 and moved its resolution check to the
+  torus workflow.

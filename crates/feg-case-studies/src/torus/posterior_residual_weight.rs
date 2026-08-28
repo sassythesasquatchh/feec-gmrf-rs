@@ -3,7 +3,7 @@
 //! This is the maintained implementation behind the submitted residual-weight
 //! figure and table. Geometry and manufactured-field assembly stay in the
 //! case-study layer; Matérn construction and Gaussian conditioning delegate to
-//! their canonical integration and GMRF implementations.
+//! the shared integration and GMRF implementations.
 
 use common::linalg::nalgebra::{CsrMatrix as FeecCsr, Vector as FeecVector};
 use ddf::cochain::{cochain_projection, Cochain};

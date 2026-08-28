@@ -1,48 +1,101 @@
-# Clean installation and first run
+# Installation and first run
 
-This is the supported installation path for a new Apple Silicon Mac running
-macOS 15 or newer, or an x86-64 computer running Ubuntu 24.04. It starts from a
-recursive clone of `main` and builds PETSc, MUMPS, MPI, and SLEPc inside the
-checkout. It does not use a system PETSc and does not require NGSolve.
+The core library and its introductory examples require Rust and a recursive Git
+checkout. PETSc, SLEPc, MPI, MUMPS, Gmsh, and NGSolve are needed only by the
+workflows identified below.
 
-Commands in this guide are run from a terminal. Native solver compilation can
-take a substantial amount of time and disk space; the measured values from the
-release clean-room runs are recorded in
-[`clean-install-validation.md`](clean-install-validation.md).
+## Core Rust installation
 
-## 1. Install operating-system prerequisites
-
-### Apple Silicon macOS
-
-Install Apple's command-line developer tools if they are not already present:
-
-```text
-xcode-select --install
-```
-
-Install [Homebrew](https://brew.sh/) if necessary, then install the required
-Fortran compiler, build tools, and mesh generator:
-
-```text
-brew update
-brew install gcc cmake pkg-config gmsh
-```
-
-Install Rust with Rustup and start a new shell, or source Cargo's environment
-file as shown:
+Install Rust 1.80 or newer with [Rustup](https://rustup.rs/):
 
 ```text
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 . "$HOME/.cargo/env"
 rustup default stable
+rustc --version
+cargo --version
 ```
 
-The supported macOS path uses Apple Clang for C/C++ and Homebrew `gfortran` for
-the Fortran packages required by MUMPS.
+Clone the repository and initialize its FEEC and GMRF submodules:
 
-### Ubuntu 24.04 x86-64
+```text
+git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf-rs.git
+cd feec-gmrf-rs
+git submodule status --recursive
+```
 
-Install the system compiler and build prerequisites:
+If an existing clone is missing a submodule, initialize it with:
+
+```text
+git submodule update --init --recursive
+```
+
+Build the principal workspace:
+
+```text
+cargo build --release --locked --workspace --exclude feg-experiments
+```
+
+Run the two introductory examples:
+
+```text
+cargo run --release --locked --example minimal_0form
+cargo run --release --locked --example em_1form_uq
+```
+
+Both examples use the in-process sparse solver. They write CSV and VTU output
+under `out/`, which is ignored by Git.
+
+Run the portable tests for all three workspaces:
+
+```text
+cargo test --release --locked --workspace --exclude feg-experiments --all-targets
+cargo test --release --workspace --all-targets --manifest-path feec/Cargo.toml
+cargo test --release --locked --all-targets --manifest-path gmrf-rs/Cargo.toml
+cargo check --release --locked -p feg-experiments --all-targets
+```
+
+The parent manifest excludes the standalone FEEC and GMRF workspaces, so their
+manifest checks are listed separately.
+
+## Study command
+
+The `feg-study` command lists and runs maintained numerical studies:
+
+```text
+cargo run --release -p feg-cli --bin feg-study -- list
+cargo run --release -p feg-cli --bin feg-study -- describe matern/scalar
+cargo run --release -p feg-cli --bin feg-study -- \
+  run matern/scalar --profile smoke --output out/matern-scalar
+cargo run --release -p feg-cli --bin feg-study -- \
+  verify out/matern-scalar --against smoke
+```
+
+Each study descriptor reports the tools and data it requires. Scalar Matérn
+studies and many topology studies use only Rust. Electromagnetic benchmarks
+may additionally require Gmsh or the native solver stack.
+
+See [Study reproduction](reproduction.md) for profiles, custom
+configurations, and run metadata.
+
+## Optional native solver stack
+
+The source-build procedure below has been used on Apple Silicon macOS 15 and
+Ubuntu 24.04 x86-64. It installs PETSc and SLEPc under the checkout so that a
+system installation cannot silently select a different scalar type, MPI
+implementation, or sparse solver.
+
+### Operating-system packages
+
+On macOS, install the command-line developer tools and Homebrew packages:
+
+```text
+xcode-select --install
+brew update
+brew install gcc cmake pkg-config gmsh
+```
+
+On Ubuntu 24.04:
 
 ```text
 sudo apt-get update
@@ -51,62 +104,11 @@ sudo apt-get install --yes \
   zlib1g-dev libfontconfig1-dev gmsh
 ```
 
-Install Rust with Rustup:
+### Build PETSc and SLEPc
+
+Clone the selected releases:
 
 ```text
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-. "$HOME/.cargo/env"
-rustup default stable
-```
-
-On either platform, confirm that Cargo is at least version 1.80:
-
-```text
-rustc --version
-cargo --version
-```
-
-## 2. Clone the complete repository
-
-Use the public HTTPS URL and initialize both pinned submodules during cloning:
-
-```text
-git clone --recursive https://github.com/sassythesasquatchh/feec-gmrf-rs.git
-cd feec-gmrf-rs
-git submodule status --recursive
-```
-
-The last command must print one FEEC commit and one GMRF commit without a
-leading `-` or `+`. If the repository was cloned without `--recursive`, repair
-it with:
-
-```text
-git submodule update --init --recursive
-```
-
-Record the exact source being installed:
-
-```text
-git rev-parse HEAD
-git -C feec rev-parse HEAD
-git -C gmrf-rs rev-parse HEAD
-```
-
-## 3. Build the pinned native solver stack
-
-The canonical installation is deliberately local to this checkout:
-
-```text
-.native/petsc
-.native/petsc/arch-feec-mumps-opt
-.native/slepc
-```
-
-The directories are ignored by Git. Start with no PETSc/SLEPc variables so an
-old shell configuration cannot influence the build:
-
-```text
-unset PETSC_DIR PETSC_ARCH SLEPC_DIR
 mkdir -p .native
 git clone --depth 1 --branch v3.25.3 \
   https://gitlab.com/petsc/petsc.git .native/petsc
@@ -114,7 +116,7 @@ git clone --depth 1 --branch v3.25.1 \
   https://gitlab.com/slepc/slepc.git .native/slepc
 ```
 
-Set the common build locations:
+Define their locations:
 
 ```text
 repository_root="$PWD"
@@ -123,7 +125,7 @@ export PETSC_ARCH=arch-feec-mumps-opt
 export SLEPC_DIR="$repository_root/.native/slepc"
 ```
 
-On macOS, select Apple Clang and Homebrew Fortran:
+On macOS:
 
 ```text
 export CC=clang
@@ -131,7 +133,7 @@ export CXX=clang++
 export FC=gfortran
 ```
 
-On Ubuntu, select the GNU compiler suite instead:
+On Ubuntu:
 
 ```text
 export CC=gcc
@@ -139,9 +141,8 @@ export CXX=g++
 export FC=gfortran
 ```
 
-Configure an optimized real-scalar PETSc. The external-package flags force the
-required MPI and sparse solver stack to be built locally rather than discovered
-from Homebrew or apt:
+Configure an optimized real-scalar PETSc with the MPI and sparse direct-solver
+dependencies required by the external workflows:
 
 ```text
 cd "$PETSC_DIR"
@@ -163,7 +164,7 @@ cd "$PETSC_DIR"
 make PETSC_DIR="$PETSC_DIR" PETSC_ARCH="$PETSC_ARCH" all check
 ```
 
-Build the matching SLEPc 3.25 release against that PETSc configuration:
+Build SLEPc against that PETSc configuration:
 
 ```text
 cd "$SLEPC_DIR"
@@ -173,8 +174,7 @@ make SLEPC_DIR="$SLEPC_DIR" PETSC_DIR="$PETSC_DIR" PETSC_ARCH="$PETSC_ARCH" chec
 cd "$repository_root"
 ```
 
-For a new terminal opened after the build, restore the three variables before
-running native maintenance commands:
+For a later shell, restore:
 
 ```text
 export PETSC_DIR="$PWD/.native/petsc"
@@ -183,63 +183,19 @@ export SLEPC_DIR="$PWD/.native/slepc"
 export PATH="$PETSC_DIR/$PETSC_ARCH/bin:$PATH"
 ```
 
-Repository scripts automatically prefer this complete local layout over
-`pkg-config`. Explicit environment variables still take first priority.
-
-## 4. Validate the native stack and compile the helpers
-
-Run the core native diagnostic; it checks the platform tools, the pinned local
-tags, SLEPc configuration, MPI commands, and `PETSC_HAVE_MUMPS` in the selected
-PETSc header:
+Validate the selected installation and compile the FEEC helper programs:
 
 ```text
 bash scripts/check-native-prerequisites.sh
-```
-
-Successful output ends with:
-
-```text
-native prerequisites are available
-```
-
-Build the three FEEC PETSc/SLEPc helper executables:
-
-```text
 bash scripts/build-petsc-helpers.sh
 ```
 
-Successful output ends with:
+The diagnostic checks that PETSc uses real scalars, that MUMPS is available,
+and that SLEPc is configured against the same PETSc installation.
 
-```text
-PETSc/SLEPc helpers are ready in .../feec/petsc-solver
-```
+### Native integration tests
 
-NGSolve is optional and may already be installed, but no core installation,
-build, test, introductory example, or smoke study depends on it. The separate
-`check-publication-prerequisites.sh` command additionally requires NGSolve for
-optional external-reference reproduction.
-
-## 5. Build and test every Rust workspace
-
-All supported checks use optimized builds:
-
-```text
-cargo build --release --locked --workspace --exclude feg-experiments
-cargo test --release --locked --workspace --exclude feg-experiments --all-targets
-
-cargo test --release --workspace --all-targets --manifest-path feec/Cargo.toml
-cargo test --release --all-targets --locked --manifest-path gmrf-rs/Cargo.toml
-
-cargo check --release --locked -p feg-experiments --all-targets
-cargo test --release --locked -p feg-experiments --all-targets
-bash scripts/test-external-consumer.sh
-```
-
-Cargo may promote in-tree path dependencies into the parent workspace graph
-even though `feec/` and `gmrf-rs/` are exclusions. The explicit manifest checks
-above therefore remain required.
-
-Run the native integration gates:
+With the variables above set:
 
 ```text
 cargo test --release --manifest-path feec/Cargo.toml -p formoniq \
@@ -247,118 +203,63 @@ cargo test --release --manifest-path feec/Cargo.toml -p formoniq \
 cargo test --release -p feg-gp --features external-solvers \
   --test hodge_laplace_integration
 cargo test --release -p feg-infer --features external-solver-tests
-cargo test --release -p feg-case-studies --lib --features external-reference-tests \
+cargo test --release -p feg-case-studies --lib \
+  --features external-reference-tests \
   sphere_sparse_anchor_kernel_validation::tests
 ```
 
-No test in this section may be counted as passed when it reports that a native
-prerequisite was skipped.
+NGSolve is not required by the core library or introductory examples. It is
+used only for optional comparisons with independently generated reference
+solutions. `scripts/check-publication-prerequisites.sh` checks that extended
+environment.
 
-## 6. Run the introductory examples
+## Troubleshooting
 
-Run both public API examples from the repository root:
-
-```text
-cargo run --release --locked --example minimal_0form
-cargo run --release --locked --example em_1form_uq
-```
-
-These examples write only to ignored output locations and require no NGSolve
-reference data.
-
-## 7. Run and verify all maintained smoke studies
-
-The installation acceptance suite contains 15 deterministic smoke profiles:
+### A submodule is missing or at the wrong commit
 
 ```text
-bash scripts/run-smoke-studies.sh out/smoke
+git submodule update --init --recursive
+git submodule status --recursive
 ```
 
-Each study must print both `completed` and `verified`; the command must exit
-with status zero. The expensive `thesis-submitted` profiles are a separate
-publication regression and are not part of installation acceptance.
+A leading `-` means the submodule is uninitialized. A leading `+` means its
+working tree is not at the commit recorded by the parent.
 
-To rerun one failed study after correcting a prerequisite, use the commands
-printed by the runner, or inspect the stable command surface with:
+### The wrong PETSc is selected
+
+Explicit `PETSC_DIR`, `PETSC_ARCH`, and `SLEPC_DIR` values take precedence.
+Clear stale values before using the checkout-local installation:
 
 ```text
-cargo run --release -p feg-cli --bin feg-study -- list
-cargo run --release -p feg-cli --bin feg-study -- describe STUDY_ID
+unset PETSC_DIR PETSC_ARCH SLEPC_DIR
+export PETSC_DIR="$PWD/.native/petsc"
+export PETSC_ARCH=arch-feec-mumps-opt
+export SLEPC_DIR="$PWD/.native/slepc"
+bash scripts/check-native-prerequisites.sh
 ```
 
-## 8. Confirm the checkout remains clean
+### PETSc was built without MUMPS
 
-Native sources, helper executables, Cargo targets, and study output are ignored.
-The final recursive status should contain no tracked changes:
+Reconfigure PETSc with `--download-mumps` and its MPI/ScaLAPACK dependencies.
+The helper build treats a missing MUMPS configuration as an error.
+
+### SLEPc reports a PETSc mismatch
+
+Reconfigure SLEPc after selecting the intended `PETSC_DIR` and `PETSC_ARCH`.
+Both packages must use the same PETSc build.
+
+### Gmsh is unavailable
+
+Install Gmsh with `brew install gmsh` or `apt-get install gmsh`. Studies that
+use checked-in meshes can still run; studies that generate benchmark meshes
+will report the missing executable.
+
+### Generated files appear in Git status
+
+Build products, `.native/`, and `out/` are ignored. If tracked files appear
+modified, inspect them before deleting anything:
 
 ```text
 git status --short
 git submodule foreach --recursive git status --short
 ```
-
-## Troubleshooting
-
-### The local clone is partial
-
-If either `.native/petsc` or `.native/slepc` exists without its matching build,
-the diagnostic deliberately selects the local layout and reports the missing
-directory or configuration. Complete the interrupted build, or remove only the
-incomplete `.native` solver directories and repeat section 3.
-
-### The wrong PETSc is selected
-
-`check-native-prerequisites.sh` prints its selection and all paths. For the
-supported clean installation it must say `repository-local installation`. If it
-says `explicit environment`, clear stale values and rerun it:
-
-```text
-unset PETSC_DIR PETSC_ARCH SLEPC_DIR
-bash scripts/check-native-prerequisites.sh
-```
-
-### PETSc lacks MUMPS
-
-The check reads the exact `petscconf.h` it prints and requires
-`PETSC_HAVE_MUMPS 1`. Do not substitute a Homebrew or distribution PETSc that
-fails this check; build the pinned local configuration in section 3.
-
-### PETSc cannot build Bison
-
-The pinned `--download-bison` configuration still needs `flex` (or `lex`) on
-`PATH`. On Ubuntu, install the documented `flex` package and rerun PETSc
-configuration. On macOS, `flex` is supplied by the Xcode command-line tools;
-rerun `xcode-select --install` if the native diagnostic reports it missing.
-
-### PETSc checks print a PMIx compression warning
-
-The downloaded OpenMPI build needs the zlib development headers when it is
-configured. On Ubuntu, install the documented `zlib1g-dev` package. If PETSc
-was already configured without it, rebuild the local PETSc arch from a clean
-`.native/petsc/arch-feec-mumps-opt`; merely installing the package afterward
-does not add compression support to the existing OpenMPI build.
-
-### Cargo cannot find `fontconfig.pc`
-
-The plotting dependency used by the Rust workspaces links to Fontconfig on
-Linux. Install the documented Ubuntu `libfontconfig1-dev` package, rerun the
-native diagnostic, and resume the release Cargo command. Cargo will reuse the
-dependencies it already compiled.
-
-### A compiler was upgraded
-
-PETSc records compiler and runtime-library paths at configuration time. For the
-repository-local installation, the durable repair is to rebuild both local
-solver directories with the current compilers, then rebuild the three helpers.
-
-### A helper cannot load an MPI or Fortran library
-
-First restore the environment block from section 3 and confirm that
-`$PETSC_DIR/$PETSC_ARCH/bin` is on `PATH`. On macOS inspect the helper with
-`otool -L`; on Ubuntu use `ldd`. A path into a removed compiler installation
-means PETSc and SLEPc must be rebuilt rather than patched in place.
-
-### NGSolve is reported missing
-
-Use `check-native-prerequisites.sh` for the supported professor installation.
-NGSolve is required only by `check-publication-prerequisites.sh` and optional
-external-reference workflows.

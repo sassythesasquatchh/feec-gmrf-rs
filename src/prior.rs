@@ -10,7 +10,7 @@ use feg_core::SparseTriplet;
 use gmrf_core::{Gmrf, Vector};
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 
-/// Provenance for converting user-facing Matérn parameters to `alpha/kappa/tau`.
+/// Convention used to obtain `alpha`, `kappa`, and `tau`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MaternParameterConvention {
     /// Parameters were supplied directly as `alpha`, `kappa`, and `tau`.

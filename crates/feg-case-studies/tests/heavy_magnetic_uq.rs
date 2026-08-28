@@ -1,4 +1,4 @@
-//! Stable Cargo target for opt-in magnetic UQ workflow checks.
+//! Cargo target for opt-in magnetic UQ study checks.
 //!
 //! The detailed heavy assertions live beside the workflow implementation under
 //! `#[cfg(feature = "heavy-tests")]` and reuse its private setup helpers.

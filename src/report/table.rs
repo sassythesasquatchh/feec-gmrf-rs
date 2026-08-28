@@ -119,8 +119,8 @@ pub fn write_csv_directory(directory: impl AsRef<Path>, tables: &[ReportTable]) 
 }
 
 impl PosteriorReport {
-    /// Materialize the canonical long-form metric, field, QoI, matrix,
-    /// prediction, and factorization tables.
+    /// Materialize the standard metric, field, QoI, matrix, prediction, and
+    /// factorization tables.
     pub fn tables(&self) -> Result<Vec<ReportTable>> {
         let mut tables = vec![metric_table(self)?];
         for field in &self.fields {

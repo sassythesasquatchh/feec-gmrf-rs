@@ -1,4 +1,4 @@
-//! Implementations of the stable CLI commands.
+//! Implementations of the `feg-study` subcommands.
 
 mod describe;
 mod list;

@@ -1,9 +1,10 @@
-//! Reusable finite element exterior calculus (FEEC) and Gaussian Markov
-//! random field (GMRF) model construction.
+//! Gaussian random fields on finite element differential-form spaces.
 //!
-//! The root crate provides the downstream API for FEEC assembly, Gaussian model
-//! composition, and inference through geometry-independent operators. Thesis
-//! applications live in the case-study crates and use the same implementations.
+//! This crate combines FEEC mass, incidence, Hodge, boundary, and
+//! reconstruction operators with sparse GMRF priors, observations, constraints,
+//! Laplace approximations, physical pushforwards, and uncertainty estimators.
+//! The public model types use geometry-independent sparse operators after FEEC
+//! assembly.
 
 pub mod boundary;
 pub mod diagnostics;

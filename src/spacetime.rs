@@ -29,8 +29,8 @@ impl SpacetimePrior {
     }
 }
 
-/// Builder for a structured GMRF from deterministic spatial operators and two
-/// explicitly integration-owned precision matrices.
+/// Builder for a structured GMRF from deterministic spatial operators,
+/// an initial-state precision, and a process precision.
 pub struct SpacetimePriorBuilder {
     mass: CsrMatrix,
     drift: CsrMatrix,

@@ -1,10 +1,24 @@
 # FEEC–GMRF experiments
 
-This crate collects research prototypes and earlier case-study entrypoints. Its
-`examples/` directory contains the runnable programs. Reusable mathematics
-belongs in `feec`, `gmrf`, or the root `feec-gmrf` API. `feg-study` runs the
-maintained report workflows.
+This crate contains exploratory numerical programs for new priors, diagnostics,
+observation designs, geometries, and solver strategies. Programs are kept as
+Rust examples so that each experiment states its complete configuration and
+can be rerun directly.
 
-CI compiles and tests the library. A maintained workflow has a stable registry
-entry, smoke and publication profiles, and reusable operations in their owning
-lower layer.
+List the available programs with:
+
+```text
+cargo run --release -p feg-experiments --example EXAMPLE_NAME
+```
+
+The crate is excluded from the default workspace members because some examples
+have large meshes, external-solver requirements, or long runtimes. Compile and
+test it explicitly with:
+
+```text
+cargo check --release -p feg-experiments --all-targets
+cargo test --release -p feg-experiments --all-targets
+```
+
+Studies with fixed configurations and run manifests are exposed through
+`feg-study` and documented in the case-study crate.

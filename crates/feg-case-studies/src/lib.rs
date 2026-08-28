@@ -1,9 +1,8 @@
-//! Case-study workflows for the FEEC/GMRF thesis codebase.
+//! Numerical studies for Gaussian fields on FEEC spaces.
 //!
-//! The publication-supported API is exposed through [`publication`].  Root-level
-//! modules are kept for backwards compatibility with exploratory binaries and
-//! historical experiments; not every root module is part of the publication
-//! reproducibility surface.
+//! [`publication`] groups the maintained study configurations. Other public
+//! modules contain exploratory calculations and compatibility entry points
+//! used by the example binaries.
 
 pub mod annulus_baselines;
 pub mod annulus_h_formulation;
@@ -66,11 +65,10 @@ pub mod visual_output;
 pub mod weighted_hodge_matern_isolation;
 
 pub mod publication {
-    //! Publication-supported thesis workflows.
+    //! Maintained thesis study configurations.
     //!
-    //! These re-exports identify the case-study modules that are intended to be
-    //! maintained as the reproducible surface for the thesis/report.  Other
-    //! root-level modules are experimental or historical unless promoted here.
+    //! These re-exports identify the studies with named profiles and recorded
+    //! run metadata.
 
     pub mod chapter7 {
         //! Active Chapter 7 numerical-validation workflows.
@@ -97,11 +95,10 @@ pub mod publication {
 
 #[cfg(feature = "experimental")]
 pub mod experimental {
-    //! Historical and exploratory workflows.
+    //! Exploratory and compatibility workflows.
     //!
-    //! These modules remain available for local experiments, but they are not
-    //! part of the publication-supported API and may still contain duplicated
-    //! or less-polished orchestration code.
+    //! These modules provide numerical investigations that do not have
+    //! maintained study profiles.
 
     pub use crate::cube_voids_coexact_transform;
     pub use crate::cube_zero_form_kernel_validation;

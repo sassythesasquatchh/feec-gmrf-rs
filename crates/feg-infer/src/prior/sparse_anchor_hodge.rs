@@ -45,7 +45,7 @@ pub struct HodgeMaternBranchConfig {
     pub alpha: MaternAlpha,
 }
 
-/// Legacy implementation-oriented name for [`HodgeMaternBranchConfig`].
+/// Compatibility alias for [`HodgeMaternBranchConfig`].
 pub type SparseAnchorBranchConfig = HodgeMaternBranchConfig;
 
 /// Placement of the requested Matérn spectrum in a decomposed Hodge prior.
@@ -109,7 +109,7 @@ impl HodgeMatern1FormPriorConfig {
     }
 }
 
-/// Legacy implementation-oriented name for [`HodgeMatern1FormPriorConfig`].
+/// Compatibility alias for [`HodgeMatern1FormPriorConfig`].
 pub type SparseAnchorHodge1FormPriorConfig = HodgeMatern1FormPriorConfig;
 
 #[derive(Debug, Clone)]
@@ -152,7 +152,7 @@ pub struct HodgePotentialGauge {
     pub max_transform_null_residual: f64,
 }
 
-/// Legacy implementation-oriented name for [`HodgePotentialGauge`].
+/// Compatibility alias for [`HodgePotentialGauge`].
 pub type SparseAnchorGauge = HodgePotentialGauge;
 
 #[derive(Debug, Clone)]
@@ -166,7 +166,7 @@ pub struct HodgeMatern1FormBranch {
     pub gauge: Option<HodgePotentialGauge>,
 }
 
-/// Legacy implementation-oriented name for [`HodgeMatern1FormBranch`].
+/// Compatibility alias for [`HodgeMatern1FormBranch`].
 pub type SparseAnchorHodge1FormBranch = HodgeMatern1FormBranch;
 
 impl HodgeMatern1FormBranch {
@@ -186,7 +186,7 @@ pub struct HodgeMatern1FormPrior {
     pub branches: Vec<HodgeMatern1FormBranch>,
 }
 
-/// Legacy implementation-oriented name for [`HodgeMatern1FormPrior`].
+/// Compatibility alias for [`HodgeMatern1FormPrior`].
 pub type SparseAnchorHodge1FormPrior = HodgeMatern1FormPrior;
 
 impl HodgeMatern1FormPrior {

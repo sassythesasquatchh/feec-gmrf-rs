@@ -1,8 +1,8 @@
-//! FEEC physical-field pushforward adapters.
+//! Sparse maps from FEEC cochains to physical fields and integrated quantities.
 //!
 //! These helpers keep physical vector proxies explicit: first assemble FEEC
 //! cochain maps such as exterior derivatives, then apply a Hodge/reconstruction
-//! adapter to produce physical reporting quantities.
+//! reconstruction map to produce physical quantities.
 
 use crate::{
     linear_pde::LinearPdeDerivedQuantitySpec,
@@ -318,7 +318,7 @@ pub fn build_magnetic_flux_density_averages_3d(
     })
 }
 
-/// Backward-compatible alias for the full magnetic flux-density pushforward.
+/// Compatibility alias for the full magnetic flux-density pushforward.
 pub fn build_magnetic_flux_density_operator_3d(
     topology: &Complex,
     coords: &MeshCoords,

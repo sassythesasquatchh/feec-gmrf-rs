@@ -804,7 +804,7 @@ pub struct ToroidalExactBObservationIndexOverride {
     pub heldout_indices: Vec<usize>,
 }
 
-/// Exact observation split used to generate the submitted canonical toroidal
+/// Exact observation split used to generate the submitted toroidal
 /// source-designed-flux artifacts.
 ///
 /// The generic greedy design remains the default for research configurations.

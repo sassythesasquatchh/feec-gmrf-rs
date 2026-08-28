@@ -1,63 +1,77 @@
-# FEG Case Studies
+# FEEC–GMRF case studies
 
-This crate contains the maintained thesis workflows used for publication and
-report reproducibility. They are available through
-`feg_case_studies::publication`.
+This crate contains maintained numerical studies for Gaussian fields on
+differential-form spaces. The studies exercise convergence, topology,
+physical calibration, electromagnetic inverse problems, and uncertainty
+quantification at reproducible parameter settings.
 
-The registry-driven `feg-study` CLI runs the report workflows. Research
-prototypes and earlier entrypoints live in `feg-experiments`.
+## Scientific groups
 
-## Publication workflows
+The `publication` module groups the maintained studies into:
 
-- Chapter 7 validation: cube mass-inverse variance, Matérn trace
-  normalization, Matérn functional convergence, sphere branch observables, and
-  torus 1-form PDE workflows.
-- Chapter 8 electromagnetic UQ: magnetic physical calibration, magnetic prior
-  UQ comparison, annular H-formulation, and exact toroidal B/source workflows.
+- **Matérn and FEEC validation**: scalar kernels, mass-inverse effects,
+  functional convergence, trace normalization, and form-degree dependence;
+- **Hodge and topology**: exact, coexact, and harmonic branch observables on
+  spheres, tori, multiply connected planar domains, and genus-two meshes;
+- **electromagnetic uncertainty**: magnetic-field calibration, prior
+  comparison, annular H-formulations, TEAM benchmarks, and toroidal
+  state/source recovery.
 
-`feg-infer`, `feg-gp`, and `gmrf-core` provide the reusable FEEC/GMRF
-operations. The case-study modules handle geometry, configuration, reporting,
-and thesis-specific artifact generation.
+Study modules define the geometry, physical parameters, measurement design,
+reference values, and scientific artifacts. FEEC assembly is provided by
+`formoniq`; Gaussian conditioning and uncertainty calculations are provided by
+`gmrf-core` and `feg-infer`.
 
-Studies may use public `feg-infer` and `gmrf-core` APIs for specialist
-diagnostics or lower-level control. External applications should use the root
-`feec-gmrf` API. Shared operations belong in their lower-layer implementation.
+Nonlinear magnetostatic and eddy-current investigations are available among
+the exploratory programs.
 
-## Experimental workflows
+## Running studies
 
-Root-level modules gated by the `experimental` feature are historical or
-exploratory and are re-exported through `feg-experiments`. The publication
-guarantee covers the workflows listed above.
+The registry-driven command lists the available studies and profiles:
 
-## Test Tiers
-
-The default test suite is intended to be fast and deterministic:
-
-```sh
-rtk cargo test -p feg-case-studies --release
+```text
+cargo run --release -p feg-cli --bin feg-study -- list
+cargo run --release -p feg-cli --bin feg-study -- describe STUDY_ID
+cargo run --release -p feg-cli --bin feg-study -- \
+  run STUDY_ID --profile smoke --output out/STUDY_ID
 ```
 
-Generated-mesh, nonlinear, publication-scale, output-writing, and large
-workflow regression tests are opt-in:
+`smoke` profiles are small deterministic calculations. `thesis-submitted`
+profiles retain the numerical settings associated with the submitted thesis
+and may take much longer. A study descriptor reports whether Gmsh, PETSc,
+SLEPc, NGSolve, or an external fixture is required.
 
-```sh
-rtk cargo test -p feg-case-studies --release --features heavy-tests --lib -- --test-threads=1
-rtk cargo test -p feg-case-studies --release --features heavy-tests --test heavy_team13 -- --test-threads=1
-rtk cargo test -p feg-case-studies --release --features heavy-tests --test heavy_toroidal -- --test-threads=1
-rtk cargo test -p feg-case-studies --release --features heavy-tests --test heavy_planar_holes -- --test-threads=1
-rtk cargo test -p feg-case-studies --release --features heavy-tests --test heavy_magnetic_uq -- --test-threads=1
+## Tests
+
+The portable suite is:
+
+```text
+cargo test -p feg-case-studies --release
 ```
 
-Tests that need external reference tools or large reference artifacts use the
-external tier:
+Generated-mesh, nonlinear, large-output, and full-workflow checks are enabled
+separately:
 
-```sh
-rtk cargo test -p feg-case-studies --release --features external-reference-tests --test external_references -- --test-threads=1
-rtk cargo test -p feg-case-studies --release --features external-reference-tests --lib -- --test-threads=1
+```text
+cargo test -p feg-case-studies --release \
+  --features heavy-tests --lib -- --test-threads=1
+cargo test -p feg-case-studies --release \
+  --features heavy-tests --test heavy_team13 -- --test-threads=1
+cargo test -p feg-case-studies --release \
+  --features heavy-tests --test heavy_toroidal -- --test-threads=1
+cargo test -p feg-case-studies --release \
+  --features heavy-tests --test heavy_planar_holes -- --test-threads=1
+cargo test -p feg-case-studies --release \
+  --features heavy-tests --test heavy_magnetic_uq -- --test-threads=1
 ```
 
-Most heavy assertions remain as feature-gated unit tests beside the workflow
-code, where they reuse the private setup helpers. New workflow-scale tests
-should use `#[cfg(feature = "heavy-tests")]`;
-tests requiring PETSc, NGSolve exports, or other external reference artifacts
-should use `#[cfg(feature = "external-reference-tests")]`.
+Comparisons that require external software or reference data use:
+
+```text
+cargo test -p feg-case-studies --release \
+  --features external-reference-tests --test external_references \
+  -- --test-threads=1
+```
+
+Exploratory programs that are not part of the maintained study registry are in
+`feg-experiments`.

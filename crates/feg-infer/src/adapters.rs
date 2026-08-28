@@ -1,4 +1,4 @@
-//! Explicit adapters between FEEC assembly contracts and integration models.
+//! Conversions from FEEC assembly results to statistical model specifications.
 
 use feg_core::{NonlinearResidualEvaluation, NonlinearResidualModel};
 use formoniq::problems::residual::{ResidualEvaluation, ResidualModel};
