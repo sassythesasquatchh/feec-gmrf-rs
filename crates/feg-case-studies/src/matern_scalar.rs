@@ -100,7 +100,7 @@ pub fn run_scalar_matern_validation(
     let (topology, coords) = mesh.compute_coord_complex();
     let metric = coords.to_edge_lengths(&topology);
     let ndofs = coords.nvertices();
-    let prior = MaternPriorBuilder::from_feec(&topology, &metric, 0)
+    let prior = MaternPriorBuilder::from_feec_whitney_projected(&topology, &metric, 0)
         .map_err(|error| error.to_string())?
         .parameters(
             MaternParameters::new(MaternAlpha::Two, kappa, tau)

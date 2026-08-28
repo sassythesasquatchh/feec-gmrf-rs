@@ -11,6 +11,9 @@ pub enum FeecGmrfError {
     /// A model parameter is non-finite or outside its mathematical domain.
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
+    /// A proper Gaussian API was asked to construct an intrinsic or improper law.
+    #[error("intrinsic model is unsupported by this proper-prior API: {0}")]
+    IntrinsicModelUnsupported(String),
     /// FEEC assembly failed.
     #[error("FEEC assembly failed: {0}")]
     Assembly(String),

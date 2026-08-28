@@ -119,12 +119,24 @@ Q_2 = tau^2 A_k M_k^-1 A_k
 Q_3 = tau^2 A_k M_k^-1 A_k M_k^-1 A_k.
 ```
 
-The mass-inverse policy is part of the discretization. The consistent inverses is dense, and the sparse approximate inverses perturb the covariance structure even beyond the perturbation introduced by consistent discretisation. The default and recommended sparse inverse is the projected inverse, described in the thesis report.  
+Two inverse roles are part of this discretization: the lower-space inverse
+inside the weak codifferential term and the state-space inverse between
+repeated Matérn factors. `LowerAdjointMassInversePolicy` and
+`RecurrenceMassInversePolicy` expose them independently, while
+`MaternPriorMetadata` records the policies actually applied. The compact
+Whitney route uses projected sparse inverses by default and is explicitly
+reported as `WhitneyApproximateEliminated`; it is not labelled as an exact
+full-metric law.
 
 `MaternPriorBuilder::essential_boundary_conditions` reduces \(M_k\), \(L_k\),
 and the selected inverse before applying this recurrence. Constructing a
 full-space alpha-2 or alpha-3 precision and conditioning it afterwards is, in
-general, a different Gaussian model.
+general, a different Gaussian model. The former is retained as a legacy
+principal restriction of an already collapsed approximate operator and is
+reported as such in metadata. `GaussianPrior::condition_on_essential_boundary`
+is the separately named finite-law conditioning operation. Compatible
+adjacent-space boundary assembly is required before an exact boundary-domain
+constructor can be exposed.
 
 ### Hodge-decomposed 1-form priors
 

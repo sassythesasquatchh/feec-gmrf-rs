@@ -34,9 +34,10 @@ fn main() -> Result<()> {
     // tau=1 sets the initial precision amplitude. The RMS calibration below
     // gives the prior its requested physical uncertainty.
     let parameters = MaternParameters::from_practical_range(MaternAlpha::Two, 0.25, 2, 1.0)?;
-    let uncalibrated_prior = MaternPriorBuilder::from_feec(&topology, &metric, 0)?
-        .parameters(parameters)
-        .build()?;
+    let uncalibrated_prior =
+        MaternPriorBuilder::from_feec_whitney_projected(&topology, &metric, 0)?
+            .parameters(parameters)
+            .build()?;
     let scalar_rms_weights = scalar_field_l2_rms_weights(&topology, &coords)?;
     let (prior, calibration) = calibrate_prior_to_weighted_physical_rms(
         &uncalibrated_prior,

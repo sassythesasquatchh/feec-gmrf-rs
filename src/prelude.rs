@@ -41,8 +41,10 @@ pub use crate::physical::{
     scalar_field_l2_rms_weights, MagneticFieldMaps3d, PhysicalMap, PhysicalRmsCalibration,
 };
 pub use crate::prior::{
-    GaussianPrior, MassInversePolicy, MaternAlpha, MaternParameterConvention, MaternParameters,
-    MaternPriorBuilder, PriorMahalanobisCalibration, PriorNormalization,
+    GaussianPrior, InverseUse, LowerAdjointMassInversePolicy, MassInverseKind, MassInversePolicy,
+    MaternAlpha, MaternBoundarySemantics, MaternOperatorSource, MaternParameterConvention,
+    MaternParameters, MaternPriorBuilder, MaternPriorMetadata, MaternRepresentation,
+    PriorMahalanobisCalibration, PriorNormalization, RecurrenceMassInversePolicy,
 };
 pub use crate::report::{
     write_console_report, write_csv, write_csv_directory, CochainVtuBuilder, ConsoleReportOptions,

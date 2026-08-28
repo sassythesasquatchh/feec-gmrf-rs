@@ -40,7 +40,13 @@ impl MaternParameters {
     pub fn new(alpha: MaternAlpha, kappa: f64, tau: f64) -> Result<Self> {
         if !kappa.is_finite() || kappa < 0.0 {
             return Err(FeecGmrfError::InvalidParameter(
-                "Matérn kappa must be finite and non-negative".to_string(),
+                "Matérn kappa must be finite and positive".to_string(),
+            ));
+        }
+        if kappa == 0.0 {
+            return Err(FeecGmrfError::IntrinsicModelUnsupported(
+                "kappa = 0 requires explicit nullspace, harmonic, and quotient semantics"
+                    .to_string(),
             ));
         }
         if !tau.is_finite() || tau <= 0.0 {
@@ -98,18 +104,193 @@ impl Default for MaternParameters {
     }
 }
 
-/// Policy used to approximate or supply the form mass inverse.
+/// Policy for the degree-`k` mass inverse between repeated Matérn factors.
 #[derive(Debug, Clone, PartialEq, Default)]
-pub enum MassInversePolicy {
+pub enum RecurrenceMassInversePolicy {
+    /// Use the Whitney projected/top-degree inverse supplied by FEEC.
+    #[default]
+    WhitneyProjected,
     /// Invert the row-sum lumped mass diagonal.
     RowSumLumped,
     /// Invert the assembled diagonal entries. Appropriate for diagonal top-degree masses.
     Diagonal,
-    /// Use the Whitney projected/top-degree inverse supplied by FEEC.
-    #[default]
-    Projected,
     /// Use an explicitly supplied inverse.
     Provided(SparseMat),
+}
+
+/// Backwards-compatible policy for the recurrence/load mass inverse.
+///
+/// This policy never selects the lower-adjoint inverse inside the Hodge
+/// Laplacian. New code should use [`RecurrenceMassInversePolicy`] explicitly.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum MassInversePolicy {
+    RowSumLumped,
+    Diagonal,
+    #[default]
+    Projected,
+    Provided(SparseMat),
+}
+
+impl From<MassInversePolicy> for RecurrenceMassInversePolicy {
+    fn from(policy: MassInversePolicy) -> Self {
+        match policy {
+            MassInversePolicy::RowSumLumped => Self::RowSumLumped,
+            MassInversePolicy::Diagonal => Self::Diagonal,
+            MassInversePolicy::Projected => Self::WhitneyProjected,
+            MassInversePolicy::Provided(inverse) => Self::Provided(inverse),
+        }
+    }
+}
+
+/// Policy for the lower-degree mass inverse inside the weak Hodge adjoint.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub enum LowerAdjointMassInversePolicy {
+    /// Use the Whitney projected sparse inverse supplied by FEEC.
+    #[default]
+    WhitneyProjected,
+    /// Invert the row-sum lumped lower mass diagonal.
+    RowSumLumped,
+    /// Invert the assembled lower mass diagonal.
+    Diagonal,
+    /// Use an explicitly supplied inverse on the lower auxiliary space.
+    Provided(SparseMat),
+}
+
+impl LowerAdjointMassInversePolicy {
+    fn kind(&self) -> MassInverseKind {
+        match self {
+            Self::WhitneyProjected => MassInverseKind::WhitneyProjected,
+            Self::RowSumLumped => MassInverseKind::RowSumLumped,
+            Self::Diagonal => MassInverseKind::Diagonal,
+            Self::Provided(_) => MassInverseKind::Provided,
+        }
+    }
+}
+
+/// Stable, matrix-free description of a resolved inverse construction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MassInverseKind {
+    ExactMaterialized,
+    WhitneyProjected,
+    RowSumLumped,
+    Diagonal,
+    Provided,
+    EmbeddedInCollapsedHodge,
+}
+
+impl RecurrenceMassInversePolicy {
+    fn kind(&self, degree: FormDegree, complex_dimension: usize) -> MassInverseKind {
+        match self {
+            Self::WhitneyProjected if degree.get() == complex_dimension => {
+                MassInverseKind::Diagonal
+            }
+            Self::WhitneyProjected => MassInverseKind::WhitneyProjected,
+            Self::RowSumLumped => MassInverseKind::RowSumLumped,
+            Self::Diagonal => MassInverseKind::Diagonal,
+            Self::Provided(_) => MassInverseKind::Provided,
+        }
+    }
+}
+
+/// Whether an inverse role is present and used in a particular Matérn law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InverseUse {
+    NotApplicable,
+    NotUsed,
+    Applied(MassInverseKind),
+}
+
+/// Finite-dimensional representation constructed by a Matérn builder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaternRepresentation {
+    /// Existing compact Whitney law with at least one approximate metric role.
+    WhitneyApproximateEliminated,
+    /// A collapsed Hodge operator supplied by the caller.
+    ProvidedCollapsedEliminated,
+}
+
+/// Origin of the operators used to construct a Matérn prior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaternOperatorSource {
+    FeecWhitney,
+    UserSuppliedCollapsed,
+}
+
+/// Boundary operation applied during or after Matérn construction.
+#[derive(Debug, Clone, PartialEq)]
+pub enum MaternBoundarySemantics {
+    /// No essential coefficients were removed from the supplied discrete space.
+    UnrestrictedDiscreteComplex,
+    /// An already collapsed operator was principally reduced before recurrence.
+    PrincipalRestrictedCollapsedOperator {
+        state_layout: crate::operator::BoundaryLayout,
+    },
+    /// A completed finite Gaussian was conditioned on coefficient values.
+    ConditionedCompletedDiscreteLaw {
+        state_layout: crate::operator::BoundaryLayout,
+    },
+    /// The caller supplied an already reduced collapsed operator bundle.
+    UserSuppliedReducedCollapsedOperator {
+        state_layout: crate::operator::BoundaryLayout,
+    },
+}
+
+/// Auditable description of the finite Matérn law returned by the builder.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MaternPriorMetadata {
+    representation: MaternRepresentation,
+    operator_source: MaternOperatorSource,
+    boundary: MaternBoundarySemantics,
+    form_degree: FormDegree,
+    complex_dimension: usize,
+    parameters: MaternParameters,
+    lower_adjoint_inverse: InverseUse,
+    recurrence_inverse: InverseUse,
+    normalization: PriorNormalization,
+    post_construction_precision_scale: f64,
+}
+
+impl MaternPriorMetadata {
+    pub fn representation(&self) -> MaternRepresentation {
+        self.representation
+    }
+
+    pub fn operator_source(&self) -> MaternOperatorSource {
+        self.operator_source
+    }
+
+    pub fn boundary(&self) -> &MaternBoundarySemantics {
+        &self.boundary
+    }
+
+    pub fn form_degree(&self) -> FormDegree {
+        self.form_degree
+    }
+
+    pub fn complex_dimension(&self) -> usize {
+        self.complex_dimension
+    }
+
+    pub fn parameters(&self) -> MaternParameters {
+        self.parameters
+    }
+
+    pub fn lower_adjoint_inverse(&self) -> InverseUse {
+        self.lower_adjoint_inverse
+    }
+
+    pub fn recurrence_inverse(&self) -> InverseUse {
+        self.recurrence_inverse
+    }
+
+    pub fn normalization(&self) -> PriorNormalization {
+        self.normalization
+    }
+
+    /// Additional deterministic precision scaling applied after construction.
+    pub fn post_construction_precision_scale(&self) -> f64 {
+        self.post_construction_precision_scale
+    }
 }
 
 /// Optional deterministic scaling applied after Matérn construction.
@@ -129,6 +310,7 @@ pub struct GaussianPrior {
     precision: SparseMat,
     form_degree: Option<FormDegree>,
     boundary_elimination: Option<EssentialBoundaryElimination>,
+    matern_metadata: Option<MaternPriorMetadata>,
 }
 
 /// Report from scaling a prior so one reference state has a requested
@@ -161,6 +343,7 @@ impl GaussianPrior {
             precision,
             form_degree: None,
             boundary_elimination: None,
+            matern_metadata: None,
         })
     }
 
@@ -182,6 +365,11 @@ impl GaussianPrior {
         }
         self.boundary_elimination = Some(elimination);
         Ok(self)
+    }
+
+    pub(crate) fn with_matern_metadata(mut self, metadata: MaternPriorMetadata) -> Self {
+        self.matern_metadata = Some(metadata);
+        self
     }
 
     /// Prior dimension.
@@ -223,6 +411,11 @@ impl GaussianPrior {
     /// Essential-boundary elimination carried by this prior, when present.
     pub fn boundary_elimination(&self) -> Option<&EssentialBoundaryElimination> {
         self.boundary_elimination.as_ref()
+    }
+
+    /// Construction metadata when this prior was built by a Matérn builder.
+    pub fn matern_metadata(&self) -> Option<&MaternPriorMetadata> {
+        self.matern_metadata.as_ref()
     }
 
     /// Factor the prior once for repeated variance, covariance, and sampling queries.
@@ -369,6 +562,12 @@ impl GaussianPrior {
         let mean = gmrf.mean().iter().copied().collect();
         let mut prior = Self::new(mean, reduced_precision)?;
         prior.form_degree = self.form_degree;
+        prior.matern_metadata = self.matern_metadata.clone().map(|mut metadata| {
+            metadata.boundary = MaternBoundarySemantics::ConditionedCompletedDiscreteLaw {
+                state_layout: elimination.layout().clone(),
+            };
+            metadata
+        });
         prior.with_boundary_elimination(elimination)
     }
 
@@ -405,11 +604,16 @@ impl GaussianPrior {
                 "precision scale must be finite and positive".to_string(),
             ));
         }
+        let matern_metadata = self.matern_metadata.clone().map(|mut metadata| {
+            metadata.post_construction_precision_scale *= scale;
+            metadata
+        });
         Ok(Self {
             mean: self.mean.clone(),
             precision: self.precision.scaled(scale),
             form_degree: self.form_degree,
             boundary_elimination: self.boundary_elimination.clone(),
+            matern_metadata,
         })
     }
 }
@@ -427,7 +631,8 @@ enum MaternSource<'a> {
 pub struct MaternPriorBuilder<'a> {
     source: MaternSource<'a>,
     parameters: MaternParameters,
-    mass_inverse: MassInversePolicy,
+    lower_adjoint_mass_inverse: Option<LowerAdjointMassInversePolicy>,
+    recurrence_mass_inverse: RecurrenceMassInversePolicy,
     normalization: PriorNormalization,
     mean: Option<Vec<f64>>,
     essential_boundary_conditions: Option<EssentialBoundaryConditions>,
@@ -439,7 +644,8 @@ impl MaternPriorBuilder<'static> {
         Self {
             source: MaternSource::Operators(Box::new(operators)),
             parameters: MaternParameters::default(),
-            mass_inverse: MassInversePolicy::RowSumLumped,
+            lower_adjoint_mass_inverse: None,
+            recurrence_mass_inverse: RecurrenceMassInversePolicy::RowSumLumped,
             normalization: PriorNormalization::None,
             mean: None,
             essential_boundary_conditions: None,
@@ -454,6 +660,16 @@ impl<'a> MaternPriorBuilder<'a> {
         metric: &'a MeshLengths,
         degree: usize,
     ) -> Result<Self> {
+        Self::from_feec_whitney_projected(topology, metric, degree)
+    }
+
+    /// Start from the existing compact Whitney construction with projected
+    /// lower-adjoint and recurrence inverse policies.
+    pub fn from_feec_whitney_projected(
+        topology: &'a Complex,
+        metric: &'a MeshLengths,
+        degree: usize,
+    ) -> Result<Self> {
         let degree = FormDegree::new(degree, topology.dim())?;
         Ok(Self {
             source: MaternSource::Feec {
@@ -462,7 +678,8 @@ impl<'a> MaternPriorBuilder<'a> {
                 degree,
             },
             parameters: MaternParameters::default(),
-            mass_inverse: MassInversePolicy::Projected,
+            lower_adjoint_mass_inverse: Some(LowerAdjointMassInversePolicy::WhitneyProjected),
+            recurrence_mass_inverse: RecurrenceMassInversePolicy::WhitneyProjected,
             normalization: PriorNormalization::None,
             mean: None,
             essential_boundary_conditions: None,
@@ -475,9 +692,25 @@ impl<'a> MaternPriorBuilder<'a> {
         self
     }
 
-    /// Set the mass-inverse policy.
+    /// Set the recurrence/load mass-inverse policy.
+    ///
+    /// This compatibility method never changes the lower-adjoint inverse
+    /// inside the Hodge Laplacian. New code should use
+    /// [`Self::recurrence_mass_inverse`].
     pub fn mass_inverse(mut self, policy: MassInversePolicy) -> Self {
-        self.mass_inverse = policy;
+        self.recurrence_mass_inverse = policy.into();
+        self
+    }
+
+    /// Set the lower-adjoint mass-inverse policy used to assemble the Hodge term.
+    pub fn lower_adjoint_mass_inverse(mut self, policy: LowerAdjointMassInversePolicy) -> Self {
+        self.lower_adjoint_mass_inverse = Some(policy);
+        self
+    }
+
+    /// Set the degree-`k` recurrence/load mass-inverse policy.
+    pub fn recurrence_mass_inverse(mut self, policy: RecurrenceMassInversePolicy) -> Self {
+        self.recurrence_mass_inverse = policy;
         self
     }
 
@@ -507,46 +740,131 @@ impl<'a> MaternPriorBuilder<'a> {
 
     /// Assemble the prior precision through the grade-independent recurrence.
     pub fn build(self) -> Result<GaussianPrior> {
-        let (mut operators, mut projected_inverse) = match self.source {
-            MaternSource::Operators(operators) => (*operators, None),
-            MaternSource::Feec {
-                topology,
-                metric,
-                degree,
-            } => {
-                let hodge = feg_infer::prior::matern::generic::build_hodge_laplacian_form(
+        let Self {
+            source,
+            parameters,
+            lower_adjoint_mass_inverse,
+            recurrence_mass_inverse,
+            normalization,
+            mean,
+            essential_boundary_conditions,
+        } = self;
+        let needs_projected_recurrence = parameters.alpha != MaternAlpha::One
+            && matches!(
+                recurrence_mass_inverse,
+                RecurrenceMassInversePolicy::WhitneyProjected
+            );
+        let (mut operators, mut projected_inverse, representation, operator_source, lower_use) =
+            match source {
+                MaternSource::Operators(operators) => {
+                    if lower_adjoint_mass_inverse.is_some() {
+                        return Err(FeecGmrfError::Unsupported(
+                        "the lower-adjoint inverse is already embedded in a caller-supplied collapsed Hodge operator"
+                            .to_string(),
+                    ));
+                    }
+                    (
+                        *operators,
+                        None,
+                        MaternRepresentation::ProvidedCollapsedEliminated,
+                        MaternOperatorSource::UserSuppliedCollapsed,
+                        InverseUse::Applied(MassInverseKind::EmbeddedInCollapsedHodge),
+                    )
+                }
+                MaternSource::Feec {
                     topology,
                     metric,
-                    degree.get(),
-                )
+                    degree,
+                } => {
+                    let lower_policy = lower_adjoint_mass_inverse.unwrap_or_default();
+                    let lower_use = if degree.get() == 0 {
+                        InverseUse::NotApplicable
+                    } else {
+                        InverseUse::Applied(lower_policy.kind())
+                    };
+                    let hodge = if degree.get() == 0 {
+                    feg_infer::prior::matern::generic::build_hodge_laplacian_form(
+                        topology,
+                        metric,
+                        degree.get(),
+                    )
+                } else {
+                    match &lower_policy {
+                        LowerAdjointMassInversePolicy::WhitneyProjected => {
+                            feg_infer::prior::matern::generic::build_hodge_laplacian_form(
+                                topology,
+                                metric,
+                                degree.get(),
+                            )
+                        }
+                        LowerAdjointMassInversePolicy::RowSumLumped => {
+                            feg_infer::prior::matern::generic::build_hodge_laplacian_form_with_row_sum_lower_mass_inverse(
+                                topology,
+                                metric,
+                                degree.get(),
+                            )
+                        }
+                        LowerAdjointMassInversePolicy::Diagonal => {
+                            feg_infer::prior::matern::generic::build_hodge_laplacian_form_with_diagonal_lower_mass_inverse(
+                                topology,
+                                metric,
+                                degree.get(),
+                            )
+                        }
+                        LowerAdjointMassInversePolicy::Provided(inverse) => {
+                            let inverse =
+                                feg_infer::sparse::core_triplet_to_feec_csr(inverse);
+                            feg_infer::prior::matern::generic::build_hodge_laplacian_form_with_lower_mass_inverse(
+                                topology,
+                                metric,
+                                degree.get(),
+                                &inverse,
+                            )
+                        }
+                    }
+                }
                 .map_err(FeecGmrfError::Assembly)?;
-                let mass = feg_infer::sparse::feec_csr_to_core_triplet(&hodge.mass_u);
-                let laplacian = feg_infer::sparse::feec_csr_to_core_triplet(&hodge.laplacian);
-                let inverse =
-                    feg_infer::prior::matern::generic::build_projected_or_top_degree_mass_inverse(
+                    let mass = feg_infer::sparse::feec_csr_to_core_triplet(&hodge.mass_u);
+                    let laplacian = feg_infer::sparse::feec_csr_to_core_triplet(&hodge.laplacian);
+                    let projected_inverse = needs_projected_recurrence
+                    .then(|| {
+                        feg_infer::prior::matern::generic::build_projected_or_top_degree_mass_inverse(
                         topology,
                         metric,
                         degree.get(),
                         &hodge.mass_u,
                     )
-                    .map_err(FeecGmrfError::Assembly)?;
-                (
-                    FormOperators::new(degree, topology.dim(), mass, laplacian)?,
-                    Some(feg_infer::sparse::feec_csr_to_core_triplet(&inverse)),
-                )
-            }
-        };
+                    })
+                    .transpose()
+                    .map_err(FeecGmrfError::Assembly)?
+                    .map(|inverse| feg_infer::sparse::feec_csr_to_core_triplet(&inverse));
+                    (
+                        FormOperators::new(degree, topology.dim(), mass, laplacian)?,
+                        projected_inverse,
+                        MaternRepresentation::WhitneyApproximateEliminated,
+                        MaternOperatorSource::FeecWhitney,
+                        lower_use,
+                    )
+                }
+            };
 
         let original_dimension = operators.dimension();
         let embedded_layout = operators.boundary_layout().clone();
         let already_reduced = embedded_layout.full_dimension() != operators.dimension()
             || !embedded_layout.fixed_dofs().is_empty();
+        let mut boundary_semantics = if already_reduced {
+            MaternBoundarySemantics::UserSuppliedReducedCollapsedOperator {
+                state_layout: embedded_layout.clone(),
+            }
+        } else {
+            MaternBoundarySemantics::UnrestrictedDiscreteComplex
+        };
         let mut boundary_elimination = if already_reduced {
             Some(EssentialBoundaryElimination::from_layout(embedded_layout)?)
         } else {
             None
         };
-        if let Some(conditions) = self.essential_boundary_conditions {
+        if let Some(conditions) = essential_boundary_conditions {
             if already_reduced {
                 return Err(FeecGmrfError::InvalidParameter(
                     "cannot apply essential boundary conditions to operators that are already boundary-reduced"
@@ -567,50 +885,70 @@ impl<'a> MaternPriorBuilder<'a> {
                 .as_ref()
                 .map(|inverse| elimination.reduce_square(inverse))
                 .transpose()?;
+            boundary_semantics = MaternBoundarySemantics::PrincipalRestrictedCollapsedOperator {
+                state_layout: elimination.layout().clone(),
+            };
             boundary_elimination = Some(elimination);
         }
 
-        let mass_inverse = match self.mass_inverse {
-            MassInversePolicy::RowSumLumped => row_sum_inverse(operators.mass())?,
-            MassInversePolicy::Diagonal => diagonal_inverse(operators.mass())?,
-            MassInversePolicy::Projected => projected_inverse.ok_or_else(|| {
-                FeecGmrfError::Unsupported(
-                    "projected mass inversion requires the FEEC constructor or an explicit inverse"
-                        .to_string(),
-                )
-            })?,
-            MassInversePolicy::Provided(inverse) => {
-                if inverse.nrows() == operators.dimension()
-                    && inverse.ncols() == operators.dimension()
-                {
-                    inverse
-                } else if let Some(elimination) = &boundary_elimination {
-                    elimination.reduce_square(&inverse)?
-                } else {
-                    return Err(FeecGmrfError::Dimension(
-                        "provided mass inverse does not match the form-space dimension".to_string(),
-                    ));
-                }
-            }
-        };
-
         let system = add_sparse(
             operators.hodge_laplacian(),
-            &operators.mass().scaled(self.parameters.kappa.powi(2)),
+            &operators.mass().scaled(parameters.kappa.powi(2)),
         )?;
-        let mut precision = matern_recurrence(
-            &system,
-            &mass_inverse,
-            self.parameters.alpha,
-            self.parameters.tau,
-        )?;
-        apply_normalization(&mut precision, self.normalization)?;
-        let mean = resolve_reduced_mean(
-            self.mean,
-            operators.dimension(),
-            boundary_elimination.as_ref(),
-        )?;
-        let prior = GaussianPrior::new(mean, precision)?.with_form_degree(operators.degree());
+        let (mut precision, recurrence_use) = if parameters.alpha == MaternAlpha::One {
+            (system.scaled(parameters.tau.powi(2)), InverseUse::NotUsed)
+        } else {
+            let recurrence_kind =
+                recurrence_mass_inverse.kind(operators.degree(), operators.complex_dimension());
+            let mass_inverse = match recurrence_mass_inverse {
+                RecurrenceMassInversePolicy::RowSumLumped => row_sum_inverse(operators.mass())?,
+                RecurrenceMassInversePolicy::Diagonal => diagonal_inverse(operators.mass())?,
+                RecurrenceMassInversePolicy::WhitneyProjected => {
+                    projected_inverse.ok_or_else(|| {
+                        FeecGmrfError::Unsupported(
+                            "Whitney-projected recurrence inversion requires the FEEC constructor or an explicit inverse"
+                                .to_string(),
+                        )
+                    })?
+                }
+                RecurrenceMassInversePolicy::Provided(inverse) => {
+                    if inverse.nrows() == operators.dimension()
+                        && inverse.ncols() == operators.dimension()
+                    {
+                        inverse
+                    } else if let Some(elimination) = &boundary_elimination {
+                        elimination.reduce_square(&inverse)?
+                    } else {
+                        return Err(FeecGmrfError::Dimension(
+                            "provided recurrence mass inverse does not match the form-space dimension"
+                                .to_string(),
+                        ));
+                    }
+                }
+            };
+            (
+                matern_recurrence(&system, &mass_inverse, parameters.alpha, parameters.tau)?,
+                InverseUse::Applied(recurrence_kind),
+            )
+        };
+        apply_normalization(&mut precision, normalization)?;
+        let mean =
+            resolve_reduced_mean(mean, operators.dimension(), boundary_elimination.as_ref())?;
+        let metadata = MaternPriorMetadata {
+            representation,
+            operator_source,
+            boundary: boundary_semantics,
+            form_degree: operators.degree(),
+            complex_dimension: operators.complex_dimension(),
+            parameters,
+            lower_adjoint_inverse: lower_use,
+            recurrence_inverse: recurrence_use,
+            normalization,
+            post_construction_precision_scale: 1.0,
+        };
+        let prior = GaussianPrior::new(mean, precision)?
+            .with_form_degree(operators.degree())
+            .with_matern_metadata(metadata);
         match boundary_elimination {
             Some(elimination) => prior.with_boundary_elimination(elimination),
             None => Ok(prior),
@@ -758,6 +1096,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn proper_matern_parameters_reject_intrinsic_kappa() {
+        let error = MaternParameters::new(MaternAlpha::Two, 0.0, 1.0).unwrap_err();
+        assert!(matches!(error, FeecGmrfError::IntrinsicModelUnsupported(_)));
+
+        for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+            assert!(matches!(
+                MaternParameters::new(MaternAlpha::Two, invalid, 1.0),
+                Err(FeecGmrfError::InvalidParameter(_))
+            ));
+        }
+    }
+
+    #[test]
     fn exact_pushforward_variances_support_non_diagonal_precision() {
         let precision =
             SparseMat::from_rows(2, &[vec![(0, 2.0), (1, 1.0)], vec![(0, 1.0), (1, 2.0)]]).unwrap();
@@ -795,5 +1146,27 @@ mod tests {
         assert_eq!(q1.apply_checked(&[1.0, 1.0]).unwrap(), vec![2.0, 2.0]);
         assert_eq!(q2.apply_checked(&[1.0, 1.0]).unwrap(), vec![2.0, 2.0]);
         assert_eq!(q3.apply_checked(&[1.0, 1.0]).unwrap(), vec![2.0, 2.0]);
+    }
+
+    #[test]
+    fn alpha_one_does_not_validate_or_apply_recurrence_inverse() {
+        let degree = FormDegree::new(1, 2).unwrap();
+        let mass = SparseMat::diagonal(2, 2.0);
+        let hodge = SparseMat::diagonal(2, 1.0);
+        let parameters = MaternParameters::new(MaternAlpha::One, 1.0, 2.0).unwrap();
+        let prior =
+            MaternPriorBuilder::from_operators(FormOperators::new(degree, 2, mass, hodge).unwrap())
+                .parameters(parameters)
+                .recurrence_mass_inverse(RecurrenceMassInversePolicy::Provided(
+                    SparseMat::diagonal(1, 1.0),
+                ))
+                .build()
+                .unwrap();
+
+        assert_eq!(
+            prior.matern_metadata().unwrap().recurrence_inverse(),
+            InverseUse::NotUsed
+        );
+        assert_eq!(prior.precision(), &SparseMat::diagonal(2, 12.0));
     }
 }

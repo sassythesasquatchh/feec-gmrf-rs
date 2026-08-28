@@ -54,10 +54,15 @@ Q_2 = tau^2 A_k M_k^-1 A_k
 Q_3 = tau^2 A_k M_k^-1 A_k M_k^-1 A_k.
 ```
 
-`MaternPriorBuilder` assembles these models for 0-, 1-, 2-, and 3-form
-spaces, with explicit policies for the mass inverse and essential boundary
-conditions. The parameter `kappa` controls correlation length, `tau` controls
-precision amplitude, and `alpha` controls spectral decay and therefore smoothness of the random field.
+`MaternPriorBuilder::from_feec_whitney_projected` assembles the practical
+Whitney-cochain approximation for 0-, 1-, 2-, and 3-form spaces. The API names
+the lower-adjoint inverse inside the Hodge operator separately from the
+degree-`k` inverse used between repeated Matérn factors, and the returned prior
+records both choices in `MaternPriorMetadata`. This route is intentionally
+labelled approximate: it is the compact sparse method used by the studies, not
+an exact full-metric reference construction. The parameter `kappa` controls
+correlation length, `tau` controls precision amplitude, and `alpha` controls
+spectral decay and therefore smoothness of the random field.
 
 For k-forms (where 0 < k < n), a Hodge-decomposed model can place separate priors on exact,
 coexact, and harmonic components. The two non-harmonic constructions differ in

@@ -35,12 +35,28 @@ fn operator_prior(degree: usize) -> Result<GaussianPrior> {
     )?;
     MaternPriorBuilder::from_operators(operators)
         .parameters(MaternParameters::new(MaternAlpha::Two, 1.25, 0.8)?)
+        .recurrence_mass_inverse(RecurrenceMassInversePolicy::RowSumLumped)
         .build()
 }
 
 fn main() -> Result<()> {
     let _scalar_prior = operator_prior(0)?;
     let form_prior = operator_prior(1)?;
+    let metadata = form_prior
+        .matern_metadata()
+        .ok_or_else(|| FeecGmrfError::Inference("missing Matérn metadata".to_string()))?;
+    assert_eq!(
+        metadata.representation(),
+        MaternRepresentation::ProvidedCollapsedEliminated
+    );
+    assert_eq!(
+        metadata.lower_adjoint_inverse(),
+        InverseUse::Applied(MassInverseKind::EmbeddedInCollapsedHodge)
+    );
+    assert_eq!(
+        metadata.recurrence_inverse(),
+        InverseUse::Applied(MassInverseKind::RowSumLumped)
+    );
 
     let sensor = LinearMap::new(
         SparseMat::from_rows(2, &[vec![(0, 1.0)]]).map_err(FeecGmrfError::Dimension)?,

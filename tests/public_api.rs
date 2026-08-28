@@ -111,6 +111,55 @@ fn downstream_user_can_build_condition_and_push_forward_a_form_prior() {
 }
 
 #[test]
+fn whitney_matern_metadata_records_both_inverse_roles_independently() {
+    let mesh = CartesianMeshInfo::new_unit_scaled(2, 1, 1.0);
+    let (topology, coords) = mesh.compute_coord_complex();
+    let metric = coords.to_edge_lengths(&topology);
+    let prior = MaternPriorBuilder::from_feec_whitney_projected(&topology, &metric, 1)
+        .unwrap()
+        .parameters(MaternParameters::new(MaternAlpha::Two, 1.0, 1.0).unwrap())
+        .lower_adjoint_mass_inverse(LowerAdjointMassInversePolicy::RowSumLumped)
+        .recurrence_mass_inverse(RecurrenceMassInversePolicy::Diagonal)
+        .build()
+        .unwrap();
+
+    let metadata = prior.matern_metadata().unwrap();
+    assert_eq!(
+        metadata.representation(),
+        MaternRepresentation::WhitneyApproximateEliminated
+    );
+    assert_eq!(
+        metadata.operator_source(),
+        MaternOperatorSource::FeecWhitney
+    );
+    assert_eq!(
+        metadata.lower_adjoint_inverse(),
+        InverseUse::Applied(MassInverseKind::RowSumLumped)
+    );
+    assert_eq!(
+        metadata.recurrence_inverse(),
+        InverseUse::Applied(MassInverseKind::Diagonal)
+    );
+}
+
+#[test]
+fn collapsed_operator_prior_cannot_relabel_its_embedded_lower_inverse() {
+    let operators = FormOperators::new(
+        FormDegree::new(1, 2).unwrap(),
+        2,
+        SparseMat::diagonal(2, 1.0),
+        SparseMat::diagonal(2, 0.5),
+    )
+    .unwrap();
+    let error = MaternPriorBuilder::from_operators(operators)
+        .lower_adjoint_mass_inverse(LowerAdjointMassInversePolicy::Diagonal)
+        .build()
+        .unwrap_err();
+
+    assert!(matches!(error, FeecGmrfError::Unsupported(_)));
+}
+
+#[test]
 fn exact_and_mc_variance_apis_cover_named_and_ad_hoc_outputs() {
     let prior = GaussianPrior::new(
         vec![0.0, 0.0],

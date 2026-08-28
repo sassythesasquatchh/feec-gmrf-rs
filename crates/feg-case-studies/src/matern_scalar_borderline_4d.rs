@@ -206,7 +206,7 @@ fn run_level(
     let functionals = build_exact_nested_scalar_functionals(n)?;
 
     for alpha in [MaternAlpha::Two, MaternAlpha::Three] {
-        let prior = MaternPriorBuilder::from_feec(&topology, &metric, 0)
+        let prior = MaternPriorBuilder::from_feec_whitney_projected(&topology, &metric, 0)
             .map_err(|error| error.to_string())?
             .parameters(
                 MaternParameters::new(alpha, config.kappa, config.tau)
@@ -968,7 +968,7 @@ mod tests {
         let mesh = CartesianMeshInfo::new_unit_scaled(4, level, 1.0);
         let (topology, coords) = mesh.compute_coord_complex();
         let metric = coords.to_edge_lengths(&topology);
-        let prior = MaternPriorBuilder::from_feec(&topology, &metric, 0)
+        let prior = MaternPriorBuilder::from_feec_whitney_projected(&topology, &metric, 0)
             .expect("scalar prior builder should initialize")
             .parameters(
                 MaternParameters::new(MaternAlpha::Three, 4.0, 1.0)
