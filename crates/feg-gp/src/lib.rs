@@ -120,6 +120,43 @@ pub enum GpError {
         value: f64,
         tolerance: f64,
     },
+    #[error("dense reference eigensolver maximum dimension must be positive")]
+    InvalidDenseReferenceMaximumDimension,
+    #[error(
+        "dense reference eigensolver dimension {dimension} exceeds the explicit maximum {maximum}"
+    )]
+    DenseReferenceDimensionLimitExceeded { dimension: usize, maximum: usize },
+    #[error(
+        "dense reference generalized eigenproblem requires matching square matrices, got mass {mass_rows}x{mass_cols} and Laplacian {laplacian_rows}x{laplacian_cols}"
+    )]
+    DenseReferenceOperatorDimensionMismatch {
+        mass_rows: usize,
+        mass_cols: usize,
+        laplacian_rows: usize,
+        laplacian_cols: usize,
+    },
+    #[error("dense reference {operator} entry ({row}, {col}) is non-finite: {value}")]
+    NonFiniteDenseReferenceOperatorEntry {
+        operator: &'static str,
+        row: usize,
+        col: usize,
+        value: f64,
+    },
+    #[error("dense reference symmetry tolerance must be finite and non-negative")]
+    InvalidDenseReferenceSymmetryTolerance,
+    #[error(
+        "dense reference {operator} is not symmetric at ({row}, {col}): {left} versus {right} exceeds tolerance {tolerance}"
+    )]
+    DenseReferenceOperatorNotSymmetric {
+        operator: &'static str,
+        row: usize,
+        col: usize,
+        left: f64,
+        right: f64,
+        tolerance: f64,
+    },
+    #[error("dense reference mass matrix is not positive definite")]
+    DenseReferenceMassNotPositiveDefinite,
     #[error("covariance must be square, got {rows}x{cols}")]
     InvalidCovarianceShape { rows: usize, cols: usize },
     #[error("observation indices length {indices} does not match values length {values}")]
@@ -157,6 +194,74 @@ pub enum GpError {
 pub struct EigenBasis {
     eigenvalues: Vec<f64>,
     eigenvectors: Mat<f64>,
+}
+
+/// Explicit resource and validation limits for the dense reference
+/// generalized Hodge eigensolver.
+///
+/// The maximum dimension is intentionally supplied by every caller.  This
+/// solver materializes several dense square matrices and is suitable only for
+/// smoke tests and small reference problems, not production scaling studies.
+#[derive(Debug, Clone, Copy)]
+pub struct DenseReferenceEigensolverOptions {
+    pub maximum_dimension: usize,
+    pub symmetry_tolerance: f64,
+    pub mass_orthogonality_tolerance: f64,
+}
+
+impl DenseReferenceEigensolverOptions {
+    /// Construct options with an explicit problem-size ceiling.
+    pub fn new(maximum_dimension: usize) -> Self {
+        Self {
+            maximum_dimension,
+            symmetry_tolerance: 1.0e-11,
+            mass_orthogonality_tolerance: 1.0e-9,
+        }
+    }
+}
+
+/// Solve `L v = lambda M v` by a dense Cholesky whitening of `M`.
+///
+/// Both sparse inputs must describe the same boundary-reduced coefficient
+/// space.  The routine is a correctness/reference adapter only: it converts
+/// both operators to dense matrices, performs a dense Cholesky factorization,
+/// and computes the complete spectrum.  Every caller must state a maximum
+/// accepted dimension through `options`.
+pub fn dense_reference_generalized_hodge_eigenbasis(
+    mass: &CsrMatrix,
+    weak_hodge_laplacian: &CsrMatrix,
+    options: DenseReferenceEigensolverOptions,
+) -> Result<EigenBasis, GpError> {
+    validate_dense_reference_inputs(mass, weak_hodge_laplacian, options)?;
+    let dimension = mass.nrows();
+    let mass_dense = dense_reference_matrix(mass, "mass")?;
+    let laplacian_dense = dense_reference_matrix(weak_hodge_laplacian, "Hodge Laplacian")?;
+    validate_dense_reference_symmetry(&mass_dense, "mass", options.symmetry_tolerance)?;
+    validate_dense_reference_symmetry(
+        &laplacian_dense,
+        "Hodge Laplacian",
+        options.symmetry_tolerance,
+    )?;
+
+    let mass_cholesky = mass_dense
+        .cholesky()
+        .ok_or(GpError::DenseReferenceMassNotPositiveDefinite)?;
+    let mass_lower_inverse = mass_cholesky
+        .l()
+        .try_inverse()
+        .ok_or(GpError::DenseReferenceMassNotPositiveDefinite)?;
+    let whitened = &mass_lower_inverse * laplacian_dense * mass_lower_inverse.transpose();
+    let whitened = 0.5 * (&whitened + whitened.transpose());
+    let eigen = whitened.symmetric_eigen();
+    let generalized_vectors = mass_lower_inverse.transpose() * eigen.eigenvectors;
+
+    EigenBasis::from_generalized_hodge_laplace_eigenpairs(
+        eigen.eigenvalues,
+        generalized_vectors,
+        mass,
+        options.mass_orthogonality_tolerance,
+    )?
+    .truncate_smallest(dimension)
 }
 
 impl EigenBasis {
@@ -1330,6 +1435,85 @@ fn validate_mass_orthogonality(
     Ok(())
 }
 
+fn validate_dense_reference_inputs(
+    mass: &CsrMatrix,
+    weak_hodge_laplacian: &CsrMatrix,
+    options: DenseReferenceEigensolverOptions,
+) -> Result<(), GpError> {
+    if options.maximum_dimension == 0 {
+        return Err(GpError::InvalidDenseReferenceMaximumDimension);
+    }
+    if !options.symmetry_tolerance.is_finite() || options.symmetry_tolerance < 0.0 {
+        return Err(GpError::InvalidDenseReferenceSymmetryTolerance);
+    }
+    if !options.mass_orthogonality_tolerance.is_finite()
+        || options.mass_orthogonality_tolerance < 0.0
+    {
+        return Err(GpError::InvalidMassOrthogonalityTolerance);
+    }
+    let dimension = mass.nrows();
+    if dimension == 0
+        || mass.ncols() != dimension
+        || weak_hodge_laplacian.nrows() != dimension
+        || weak_hodge_laplacian.ncols() != dimension
+    {
+        return Err(GpError::DenseReferenceOperatorDimensionMismatch {
+            mass_rows: mass.nrows(),
+            mass_cols: mass.ncols(),
+            laplacian_rows: weak_hodge_laplacian.nrows(),
+            laplacian_cols: weak_hodge_laplacian.ncols(),
+        });
+    }
+    if dimension > options.maximum_dimension {
+        return Err(GpError::DenseReferenceDimensionLimitExceeded {
+            dimension,
+            maximum: options.maximum_dimension,
+        });
+    }
+    Ok(())
+}
+
+fn dense_reference_matrix(matrix: &CsrMatrix, operator: &'static str) -> Result<NaMatrix, GpError> {
+    let mut dense = NaMatrix::zeros(matrix.nrows(), matrix.ncols());
+    for (row, col, value) in matrix.triplet_iter() {
+        if !value.is_finite() {
+            return Err(GpError::NonFiniteDenseReferenceOperatorEntry {
+                operator,
+                row,
+                col,
+                value: *value,
+            });
+        }
+        dense[(row, col)] += *value;
+    }
+    Ok(dense)
+}
+
+fn validate_dense_reference_symmetry(
+    matrix: &NaMatrix,
+    operator: &'static str,
+    tolerance: f64,
+) -> Result<(), GpError> {
+    for row in 0..matrix.nrows() {
+        for col in (row + 1)..matrix.ncols() {
+            let left = matrix[(row, col)];
+            let right = matrix[(col, row)];
+            let scale = left.abs().max(right.abs()).max(1.0);
+            if (left - right).abs() > tolerance * scale {
+                return Err(GpError::DenseReferenceOperatorNotSymmetric {
+                    operator,
+                    row,
+                    col,
+                    left,
+                    right,
+                    tolerance,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[inline]
 fn idx(i: usize) -> Idx<usize> {
     unsafe { Idx::<usize>::new_unbound(i) }
@@ -1481,6 +1665,15 @@ mod tests {
             eigenvalues[row] * eigenvector_inverse[(row, col)]
         });
         let laplacian = dense_product(&inverse_transpose, &weighted_inverse);
+        let mut sparse_laplacian = CooMatrix::new(3, 3);
+        for row in 0..3 {
+            for col in 0..3 {
+                if laplacian[(row, col)] != 0.0 {
+                    sparse_laplacian.push(row, col, laplacian[(row, col)]);
+                }
+            }
+        }
+        let sparse_laplacian = CsrMatrix::from(&sparse_laplacian);
 
         assert!(
             mass[(0, 1)].abs() > 0.1,
@@ -1502,22 +1695,26 @@ mod tests {
         });
         assert_matrix_close(&generalized_left, &generalized_right, 2e-14);
 
+        let basis = dense_reference_generalized_hodge_eigenbasis(
+            &sparse_mass,
+            &sparse_laplacian,
+            DenseReferenceEigensolverOptions::new(3),
+        )
+        .expect("bounded dense generalized reference solve should succeed");
+        let solved_left = dense_product(&laplacian, basis.eigenvectors());
+        let solved_mass_basis = dense_product(&mass, basis.eigenvectors());
+        let solved_right = Mat::from_fn(3, 3, |row, col| {
+            solved_mass_basis[(row, col)] * basis.eigenvalues()[col]
+        });
+        assert_matrix_close(&solved_left, &solved_right, 2e-12);
+        assert_eq!(basis.eigenvalues().len(), 3);
+
         let kappa = 1.3;
         let tau = 0.7;
         let system = Mat::from_fn(3, 3, |row, col| {
             kappa * kappa * mass[(row, col)] + laplacian[(row, col)]
         });
         let mass_inverse = spd_inverse(&mass);
-
-        // Present the eigenpairs out of order so this also exercises the
-        // constructor's smallest-eigenvalue ordering at full rank.
-        let permutation = [2, 0, 1];
-        let unordered_values = permutation
-            .iter()
-            .map(|&col| eigenvalues[col])
-            .collect::<Vec<_>>();
-        let unordered_vectors =
-            Mat::from_fn(3, 3, |row, col| eigenvectors[(row, permutation[col])]);
 
         let mut unscaled_precision = system.clone();
         for alpha in 1..=3 {
@@ -1529,15 +1726,8 @@ mod tests {
                 Mat::from_fn(3, 3, |row, col| tau * tau * unscaled_precision[(row, col)]);
             let precision_covariance = spd_inverse(&precision);
 
-            let basis = EigenBasis::from_generalized_hodge_laplace_eigenpairs(
-                NaVector::from_vec(unordered_values.clone()),
-                NaMatrix::from_fn(3, 3, |row, col| unordered_vectors[(row, col)]),
-                &sparse_mass,
-                2.0e-14,
-            )
-            .expect("mass-orthonormal generalized eigenbasis should be valid");
             let spectral = SpectralMaternGp::from_eigenbasis(
-                basis,
+                basis.clone(),
                 SpectralMaternConfig {
                     kappa,
                     alpha: f64::from(alpha),
@@ -1763,6 +1953,62 @@ mod tests {
         assert!(matches!(
             error,
             GpError::EigenvectorsNotMassOrthogonal { .. }
+        ));
+    }
+
+    #[test]
+    fn dense_reference_eigensolver_enforces_limits_symmetry_and_spd_mass() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let mut identity = CooMatrix::new(2, 2);
+        identity.push(0, 0, 1.0);
+        identity.push(1, 1, 1.0);
+        let identity = CsrMatrix::from(&identity);
+
+        let error = dense_reference_generalized_hodge_eigenbasis(
+            &identity,
+            &identity,
+            DenseReferenceEigensolverOptions::new(1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::DenseReferenceDimensionLimitExceeded {
+                dimension: 2,
+                maximum: 1
+            }
+        ));
+
+        let mut nonsymmetric = CooMatrix::new(2, 2);
+        nonsymmetric.push(0, 0, 1.0);
+        nonsymmetric.push(0, 1, 0.25);
+        nonsymmetric.push(1, 1, 2.0);
+        let error = dense_reference_generalized_hodge_eigenbasis(
+            &identity,
+            &CsrMatrix::from(&nonsymmetric),
+            DenseReferenceEigensolverOptions::new(2),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::DenseReferenceOperatorNotSymmetric {
+                operator: "Hodge Laplacian",
+                ..
+            }
+        ));
+
+        let mut indefinite = CooMatrix::new(2, 2);
+        indefinite.push(0, 0, 1.0);
+        indefinite.push(1, 1, -1.0);
+        let error = dense_reference_generalized_hodge_eigenbasis(
+            &CsrMatrix::from(&indefinite),
+            &identity,
+            DenseReferenceEigensolverOptions::new(2),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::DenseReferenceMassNotPositiveDefinite
         ));
     }
 
