@@ -37,6 +37,7 @@ def base_row(
         "same_discrete_law_eligible": "true" if method == "fm_direct" else "false",
         "matched_physical_qoi_eligible": "true",
         "full_uq_workload_eligible": "true",
+        "method_performance_timing_eligible": "true",
         "refinement": str(refinement),
         "spatial_dimension": "3",
         "form_degree": "1",
@@ -197,7 +198,7 @@ def manifest(profile: str, row_count: int) -> dict[str, object]:
 
 
 class AnalyzeArchiveTests(unittest.TestCase):
-    def test_csv_loader_accepts_complete_v2_triplets(self) -> None:
+    def test_csv_loader_accepts_complete_v3_triplets(self) -> None:
         rows = synthetic_rows()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rows.csv"
@@ -307,6 +308,30 @@ row_count: 1
         self.assertEqual(joint.smallest_eligible_rank, curve.ambient_dimension // 4)
         self.assertAlmostEqual(joint.smallest_eligible_rank_fraction, 0.25)
         self.assertEqual(joint.bracket_status, "bracketed")
+
+    def test_v3_shared_basis_timing_is_not_aggregated(self) -> None:
+        rows = synthetic_rows()
+        spectral = next(value for value in rows if value["method"] == "spectral_r")
+        spectral["method_performance_timing_eligible"] = "false"
+        result = c51.analyze(manifest("smoke", len(rows)), rows, c51.GateConfig())
+        row_number = rows.index(spectral) + 2
+        self.assertFalse(
+            any(
+                value.group_key == c51.row_group_key(spectral)
+                and value.method_label == c51.method_label(spectral, row_number)
+                for value in result.aggregates
+            )
+        )
+
+    def test_v2_archive_remains_readable_without_timing_eligibility_column(self) -> None:
+        rows = synthetic_rows()
+        for row in rows:
+            row["schema_version"] = "c51-accuracy-resource-v2"
+            del row["method_performance_timing_eligible"]
+        legacy_manifest = manifest("smoke", len(rows))
+        legacy_manifest["schema_version"] = "c51-accuracy-resource-v2"
+        result = c51.analyze(legacy_manifest, rows, c51.GateConfig())
+        self.assertEqual(result.evidence_tier, "discovery")
 
 
 if __name__ == "__main__":

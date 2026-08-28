@@ -24,7 +24,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA_VERSION = "c51-accuracy-resource-v2"
+SCHEMA_VERSION = "c51-accuracy-resource-v3"
+SUPPORTED_SCHEMA_VERSIONS = {
+    "c51-accuracy-resource-v2",
+    SCHEMA_VERSION,
+}
 STUDY_ID = "c51/accuracy-resource"
 PUBLICATION_PROFILE = re.compile(r"^juq-v[1-9][0-9]*(?:[-_.][a-z0-9][a-z0-9._-]*)?$")
 
@@ -418,8 +422,10 @@ def load_rows(path: Path) -> list[dict[str, str]]:
 
 
 def validate_archive(manifest: dict[str, Any], rows: Sequence[dict[str, str]]) -> None:
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        raise ArchiveError(f"manifest schema_version must be {SCHEMA_VERSION!r}")
+    manifest_schema = manifest.get("schema_version")
+    if manifest_schema not in SUPPORTED_SCHEMA_VERSIONS:
+        supported = ", ".join(sorted(repr(value) for value in SUPPORTED_SCHEMA_VERSIONS))
+        raise ArchiveError(f"manifest schema_version must be one of {supported}")
     if manifest.get("study_id") != STUDY_ID:
         raise ArchiveError(f"manifest study_id must be {STUDY_ID!r}")
     if manifest.get("rows_csv") != "rows.csv":
@@ -436,7 +442,7 @@ def validate_archive(manifest: dict[str, Any], rows: Sequence[dict[str, str]]) -
             f"manifest row_count {manifest.get('row_count')!r} does not match {len(rows)} rows"
         )
     for row_number, row in enumerate(rows, 2):
-        if row["schema_version"] != SCHEMA_VERSION or row["study_id"] != STUDY_ID:
+        if row["schema_version"] != manifest_schema or row["study_id"] != STUDY_ID:
             raise ArchiveError(f"row {row_number}: schema or study identifier mismatch")
         available = parse_bool(row["available"], "available", row_number)
         reason = row["unavailable_reason"].strip()
@@ -450,6 +456,16 @@ def validate_archive(manifest: dict[str, Any], rows: Sequence[dict[str, str]]) -
             "full_uq_workload_eligible",
         ):
             parse_bool(row[boolean_field], boolean_field, row_number)
+        if manifest_schema == SCHEMA_VERSION:
+            if "method_performance_timing_eligible" not in row:
+                raise ArchiveError(
+                    f"row {row_number}: schema v3 requires method_performance_timing_eligible"
+                )
+            parse_bool(
+                row["method_performance_timing_eligible"],
+                "method_performance_timing_eligible",
+                row_number,
+            )
         for numeric_field in (
             "refinement",
             "spatial_dimension",
@@ -810,6 +826,12 @@ def aggregate_rows(
             continue
         if not parse_bool(
             row["full_uq_workload_eligible"], "full_uq_workload_eligible", row_number
+        ):
+            continue
+        if row["schema_version"] == SCHEMA_VERSION and not parse_bool(
+            row["method_performance_timing_eligible"],
+            "method_performance_timing_eligible",
+            row_number,
         ):
             continue
         grouped[(row_group_key(row), method_label(row, row_number))].append((row_number, row))
