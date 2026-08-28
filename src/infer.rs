@@ -444,6 +444,14 @@ impl FactoredGaussianPrior {
         self.posterior.factorization_diagnostics()
     }
 
+    /// Apply the prior covariance to an active-coordinate right-hand side.
+    ///
+    /// The cached sparse precision factor is reused; no covariance matrix is
+    /// materialized.
+    pub fn covariance_action(&mut self, rhs: &[f64]) -> Result<Vec<f64>> {
+        self.posterior.covariance_action(rhs)
+    }
+
     /// Estimate active-coordinate marginal variances.
     pub fn latent_variance_estimate(&mut self, method: VarianceMethod) -> Result<VarianceEstimate> {
         self.posterior.latent_variance_estimate(method)
@@ -554,6 +562,28 @@ impl Posterior {
                 factor_nonzeros as f64 / lower_precision_nonzeros as f64
             },
         })
+    }
+
+    /// Apply the posterior covariance to an active-coordinate right-hand side.
+    ///
+    /// Hard equality constraints are included exactly. Their affine target
+    /// affects the posterior mean but not this covariance action. The solve is
+    /// delegated to the canonical GMRF precision/constraint algebra and does
+    /// not materialize a covariance matrix.
+    pub fn covariance_action(&mut self, rhs: &[f64]) -> Result<Vec<f64>> {
+        if rhs.len() != self.mean.len() {
+            return Err(FeecGmrfError::Dimension(format!(
+                "covariance right hand side length {} does not match active dimension {}",
+                rhs.len(),
+                self.mean.len()
+            )));
+        }
+        let rhs = Vector::from_vec(rhs.to_vec());
+        let action = match &self.constraints {
+            Some((constraints, _)) => self.gmrf.constrained_covariance_action(&rhs, constraints)?,
+            None => self.gmrf.covariance_action(&rhs)?,
+        };
+        Ok(action.iter().copied().collect())
     }
 
     /// Compute exact marginal variances of the latent coefficients.
