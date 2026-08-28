@@ -6,7 +6,7 @@ use crate::model::{
 };
 use crate::operator::{BoundaryLayout, FormDegree, FormOperators, LinearMap};
 use crate::physical::PhysicalMap;
-use crate::prior::{GaussianPrior, MassInversePolicy, MaternPriorBuilder};
+use crate::prior::{GaussianPrior, MaternPriorBuilder, RecurrenceMassInversePolicy};
 use crate::{FeecGmrfError, Result};
 use common::linalg::nalgebra::Vector as FeecVector;
 use formoniq::problems::reduced_linear::ReducedLinearPdeAssembly;
@@ -202,8 +202,10 @@ impl LinearPdeSystem {
             )
         })?;
         Ok(
-            MaternPriorBuilder::from_operators(operators).mass_inverse(
-                MassInversePolicy::Provided(feg_infer::sparse::feec_csr_to_core_triplet(inverse)),
+            MaternPriorBuilder::from_operators(operators).recurrence_mass_inverse(
+                RecurrenceMassInversePolicy::Provided(feg_infer::sparse::feec_csr_to_core_triplet(
+                    inverse,
+                )),
             ),
         )
     }

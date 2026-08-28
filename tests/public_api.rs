@@ -74,6 +74,7 @@ fn canonical_matern_recurrence_matches_legacy_for_all_supported_degrees() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn downstream_user_can_build_condition_and_push_forward_a_form_prior() {
     let mesh = CartesianMeshInfo::new_unit_scaled(2, 1, 1.0);
     let (topology, coords) = mesh.compute_coord_complex();
@@ -702,6 +703,7 @@ fn arbitrary_gaussian_boundary_elimination_uses_conditional_mean() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn essential_elimination_precedes_the_matern_mass_recurrence() {
     let mass = SparseMat::from_rows(
         3,
@@ -760,6 +762,7 @@ fn pre_reduced_form_operators_retain_their_boundary_layout() {
 }
 
 #[test]
+#[allow(deprecated)]
 fn feec_matern_boundary_path_builds_across_degrees_and_alphas() {
     let mesh = CartesianMeshInfo::new_unit_scaled(2, 1, 1.0);
     let (topology, coords) = mesh.compute_coord_complex();

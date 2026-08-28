@@ -655,6 +655,9 @@ impl MaternPriorBuilder<'static> {
 
 impl<'a> MaternPriorBuilder<'a> {
     /// Start from a FEEC topology, metric, and form degree.
+    #[deprecated(
+        note = "use from_feec_whitney_projected; this compatibility constructor builds the same explicitly approximate Whitney law"
+    )]
     pub fn from_feec(
         topology: &'a Complex,
         metric: &'a MeshLengths,
@@ -697,6 +700,9 @@ impl<'a> MaternPriorBuilder<'a> {
     /// This compatibility method never changes the lower-adjoint inverse
     /// inside the Hodge Laplacian. New code should use
     /// [`Self::recurrence_mass_inverse`].
+    #[deprecated(
+        note = "use recurrence_mass_inverse; this method never controls the lower-adjoint inverse"
+    )]
     pub fn mass_inverse(mut self, policy: MassInversePolicy) -> Self {
         self.recurrence_mass_inverse = policy.into();
         self

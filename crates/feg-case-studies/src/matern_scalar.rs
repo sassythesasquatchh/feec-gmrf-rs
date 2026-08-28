@@ -4,8 +4,8 @@
 //! vertex and vertices at integer coordinate-axis lags.
 
 use feec_gmrf::prelude::{
-    DerivedQuantity, LinearGaussianModelBuilder, LinearMap, MassInversePolicy, MaternAlpha,
-    MaternParameters, MaternPriorBuilder, SparseMat,
+    DerivedQuantity, LinearGaussianModelBuilder, LinearMap, MaternAlpha, MaternParameters,
+    MaternPriorBuilder, RecurrenceMassInversePolicy, SparseMat,
 };
 use feg_gp::{matern_covariance_euclidean, EuclideanMaternConfig};
 use libm::tgamma;
@@ -106,7 +106,7 @@ pub fn run_scalar_matern_validation(
             MaternParameters::new(MaternAlpha::Two, kappa, tau)
                 .map_err(|error| error.to_string())?,
         )
-        .mass_inverse(MassInversePolicy::RowSumLumped)
+        .recurrence_mass_inverse(RecurrenceMassInversePolicy::RowSumLumped)
         .build()
         .map_err(|error| error.to_string())?;
 
