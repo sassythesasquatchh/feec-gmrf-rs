@@ -44,6 +44,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v3";
+pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v1";
 pub const C51_STUDY_ID: &str = "c51/accuracy-resource";
 
 const EXACT_REFERENCE_MAXIMUM_DIMENSION: usize = 1_024;
@@ -54,6 +55,8 @@ const KKT_FILL_UNAVAILABLE_REASON: &str =
     "faer 0.21.9 does not expose sparse LU numeric factor storage";
 const SPECTRAL_SPARSE_PRECISION_REASON: &str =
     "a spectral feature model does not assemble a sparse coefficient precision";
+const RESOURCE_ACCURACY_UNAVAILABLE_REASON: &str =
+    "resource-only method process does not construct an accuracy reference";
 
 /// A resource or accuracy quantity with explicit availability semantics.
 #[derive(Debug, Clone, PartialEq)]
@@ -151,6 +154,190 @@ impl C51ObservationClass {
             Self::LocalSelectors => "local_selectors",
             Self::GlobalRow => "global_row",
         }
+    }
+}
+
+/// Requested sensor count for a method-isolated resource process.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum C51ResourceSensorTarget {
+    Count(usize),
+    Density(f64),
+}
+
+impl C51ResourceSensorTarget {
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::Count(_) => "count",
+            Self::Density(_) => "density",
+        }
+    }
+
+    pub fn value(self) -> f64 {
+        match self {
+            Self::Count(count) => count as f64,
+            Self::Density(density) => density,
+        }
+    }
+}
+
+/// Process phase whose peak memory has exactly one method owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C51ResourcePhase {
+    ColdSetup,
+    QueryFullUq,
+}
+
+impl C51ResourcePhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ColdSetup => "cold_setup",
+            Self::QueryFullUq => "query_full_uq",
+        }
+    }
+}
+
+/// Exactly one resource workload selected for one fresh process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51ResourceSelection {
+    pub refinement: usize,
+    pub observation_class: C51ObservationClass,
+    pub sensor_target: C51ResourceSensorTarget,
+    pub repeated_data_count: usize,
+    pub method: C51MethodId,
+    pub spectral_rank: Option<usize>,
+    pub phase: C51ResourcePhase,
+}
+
+impl C51ResourceSelection {
+    fn validate(&self) -> Result<()> {
+        if self.refinement < 2 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 resource refinement must be at least two".to_string(),
+            ));
+        }
+        match self.sensor_target {
+            C51ResourceSensorTarget::Count(0) => {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "C51 resource sensor count must be positive".to_string(),
+                ))
+            }
+            C51ResourceSensorTarget::Density(density)
+                if !density.is_finite() || density <= 0.0 || density > 1.0 =>
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "C51 resource sensor density must lie in (0, 1]".to_string(),
+                ))
+            }
+            _ => {}
+        }
+        if self.observation_class == C51ObservationClass::GlobalRow
+            && self.sensor_target != C51ResourceSensorTarget::Count(1)
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "the C51 global-row control has exactly one observation".to_string(),
+            ));
+        }
+        if self.repeated_data_count == 0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 resource repeated-data count must be positive".to_string(),
+            ));
+        }
+        match (self.method, self.spectral_rank) {
+            (C51MethodId::SpectralFullRank, None) => {}
+            (C51MethodId::SpectralLowRank, Some(rank)) if rank > 0 => {}
+            (C51MethodId::SpectralFullRank | C51MethodId::SpectralLowRank, _) => {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "full-rank spectral selection requires no rank; low-rank spectral selection requires one positive rank"
+                        .to_string(),
+                ))
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "only a low-rank spectral resource selection accepts an explicit rank"
+                        .to_string(),
+                ))
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Scientific constants plus one method-owned resource selection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51ResourceConfig {
+    pub selection: C51ResourceSelection,
+    pub spatial_dimension: usize,
+    pub form_degree: usize,
+    pub alpha: MaternAlpha,
+    pub kappa: f64,
+    pub tau: f64,
+    pub observation_noise_variance: f64,
+    pub physical_qoi_region_lower: [f64; 3],
+    pub physical_qoi_region_upper: [f64; 3],
+    pub spectral_reference_maximum_dimension: usize,
+    pub spectral_operator_materialization_maximum_dimension: usize,
+    pub posterior_sample_count: usize,
+    pub seed: u64,
+}
+
+impl C51ResourceConfig {
+    /// Reuse the smoke scientific constants while selecting exactly one row.
+    pub fn smoke(selection: C51ResourceSelection) -> Self {
+        let smoke = C51BenchmarkConfig::smoke();
+        Self {
+            selection,
+            spatial_dimension: smoke.spatial_dimension,
+            form_degree: smoke.form_degree,
+            alpha: smoke.alpha,
+            kappa: smoke.kappa,
+            tau: smoke.tau,
+            observation_noise_variance: smoke.observation_noise_variance,
+            physical_qoi_region_lower: smoke.physical_qoi_region_lower,
+            physical_qoi_region_upper: smoke.physical_qoi_region_upper,
+            spectral_reference_maximum_dimension: smoke.spectral_reference_maximum_dimension,
+            spectral_operator_materialization_maximum_dimension: smoke
+                .spectral_operator_materialization_maximum_dimension,
+            posterior_sample_count: smoke.posterior_sample_count,
+            seed: smoke.seed,
+        }
+    }
+
+    fn benchmark_config(&self) -> C51BenchmarkConfig {
+        let (local_sensor_counts, local_sensor_density_targets) = match self.selection.sensor_target
+        {
+            C51ResourceSensorTarget::Count(count) => (vec![count], Vec::new()),
+            C51ResourceSensorTarget::Density(density) => (Vec::new(), vec![density]),
+        };
+        C51BenchmarkConfig {
+            refinements: vec![self.selection.refinement],
+            spatial_dimension: self.spatial_dimension,
+            form_degree: self.form_degree,
+            alpha: self.alpha,
+            kappa: self.kappa,
+            tau: self.tau,
+            observation_noise_variance: self.observation_noise_variance,
+            local_sensor_counts,
+            local_sensor_density_targets,
+            repeated_data_counts: vec![self.selection.repeated_data_count],
+            include_global_row: self.selection.observation_class == C51ObservationClass::GlobalRow,
+            include_local_selectors: self.selection.observation_class
+                == C51ObservationClass::LocalSelectors,
+            physical_qoi_region_lower: self.physical_qoi_region_lower,
+            physical_qoi_region_upper: self.physical_qoi_region_upper,
+            spectral_low_ranks: self.selection.spectral_rank.into_iter().collect(),
+            spectral_rank_fractions: Vec::new(),
+            spectral_reference_maximum_dimension: self.spectral_reference_maximum_dimension,
+            spectral_operator_materialization_maximum_dimension: self
+                .spectral_operator_materialization_maximum_dimension,
+            posterior_sample_count: self.posterior_sample_count,
+            seed: self.seed,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        self.selection.validate()?;
+        self.benchmark_config().validate()
     }
 }
 
@@ -317,16 +504,20 @@ impl C51BenchmarkConfig {
                     .to_string(),
             ));
         }
-        if self.local_sensor_counts.is_empty() || self.local_sensor_counts.contains(&0) {
+        if self.local_sensor_counts.is_empty() && self.local_sensor_density_targets.is_empty() {
             return Err(FeecGmrfError::InvalidParameter(
-                "C51 requires at least one positive local sensor count".to_string(),
+                "C51 requires at least one local sensor count or density".to_string(),
             ));
         }
-        if self.local_sensor_density_targets.is_empty()
-            || self
-                .local_sensor_density_targets
-                .iter()
-                .any(|density| !density.is_finite() || *density <= 0.0 || *density > 1.0)
+        if self.local_sensor_counts.contains(&0) {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 local sensor counts must be positive".to_string(),
+            ));
+        }
+        if self
+            .local_sensor_density_targets
+            .iter()
+            .any(|density| !density.is_finite() || *density <= 0.0 || *density > 1.0)
         {
             return Err(FeecGmrfError::InvalidParameter(
                 "C51 local sensor densities must lie in (0, 1]".to_string(),
@@ -337,9 +528,9 @@ impl C51BenchmarkConfig {
                 "C51 requires at least one positive repeated-data count".to_string(),
             ));
         }
-        if self.spectral_low_ranks.is_empty() || self.spectral_low_ranks.contains(&0) {
+        if self.spectral_low_ranks.contains(&0) {
             return Err(FeecGmrfError::InvalidParameter(
-                "C51 spectral low-rank grid must contain positive ranks".to_string(),
+                "C51 spectral low-rank grid may contain only positive ranks".to_string(),
             ));
         }
         if self
@@ -810,6 +1001,149 @@ impl C51BenchmarkArchive {
     }
 }
 
+/// One-row archive for a method- and phase-isolated fresh process.
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51ResourceArchive {
+    pub metadata: C51RunMetadata,
+    pub config: C51ResourceConfig,
+    pub row: C51BenchmarkRow,
+}
+
+impl C51ResourceArchive {
+    pub fn validate(&self) -> Result<()> {
+        self.config.validate()?;
+        let selection = &self.config.selection;
+        if self.row.method != selection.method
+            || self.row.refinement != selection.refinement
+            || self.row.observation_class != selection.observation_class
+            || self.row.repeated_data_count != selection.repeated_data_count
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 resource row does not match its single method/observation/workload selection"
+                    .to_string(),
+            ));
+        }
+        let expected_sensor_count = match selection.sensor_target {
+            C51ResourceSensorTarget::Count(count) => count,
+            C51ResourceSensorTarget::Density(density) => {
+                (density * self.row.latent_dimension as f64).ceil() as usize
+            }
+        };
+        if self.row.sensor_count != expected_sensor_count {
+            return Err(FeecGmrfError::InvalidParameter(format!(
+                "C51 resource sensor target resolves to {expected_sensor_count}, but the selected observation has {} rows",
+                self.row.sensor_count
+            )));
+        }
+        for measurement in [
+            &self.row.posterior_mean_relative_error,
+            &self.row.covariance_action_relative_error,
+            &self.row.physical_covariance_action_relative_error,
+            &self.row.physical_variance_relative_error,
+            &self.row.physical_transformed_variance_relative_error,
+            &self.row.physical_mean_relative_error,
+        ] {
+            if !matches!(measurement, C51Measurement::Unavailable { reason } if reason == RESOURCE_ACCURACY_UNAVAILABLE_REASON)
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "C51 resource-only rows must mark every accuracy field unavailable".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn record_external_peak_rss(&mut self, bytes: u64) -> Result<()> {
+        if bytes == 0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 external peak RSS must be positive".to_string(),
+            ));
+        }
+        match self.config.selection.phase {
+            C51ResourcePhase::ColdSetup => self.row.record_factor_external_peak_rss(bytes),
+            C51ResourcePhase::QueryFullUq => self.row.record_query_external_peak_rss(bytes),
+        }
+        Ok(())
+    }
+
+    pub fn write_directory(&self, directory: &Path) -> Result<()> {
+        self.validate()?;
+        fs::create_dir_all(directory)?;
+        self.write_csv(&directory.join("rows.csv"))?;
+        self.write_manifest(&directory.join("manifest.yaml"))?;
+        Ok(())
+    }
+
+    pub fn write_csv(&self, path: &Path) -> Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        writeln!(writer, "resource_scope,workload_phase,{}", csv_header())?;
+        writeln!(
+            writer,
+            "method_phase,{},{}",
+            self.config.selection.phase.as_str(),
+            row_to_csv(&self.row)
+        )?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    pub fn write_manifest(&self, path: &Path) -> Result<()> {
+        let selection = &self.config.selection;
+        let mut writer = BufWriter::new(File::create(path)?);
+        writeln!(
+            writer,
+            "schema_version: {}",
+            yaml_scalar(C51_RESOURCE_SCHEMA_VERSION)
+        )?;
+        writeln!(writer, "study_id: {}", yaml_scalar(C51_STUDY_ID))?;
+        writeln!(writer, "profile: {}", yaml_scalar(&self.metadata.profile))?;
+        writeln!(writer, "resource_scope: method_phase")?;
+        writeln!(writer, "workload_phase: {}", selection.phase.as_str())?;
+        writeln!(writer, "selection:")?;
+        writeln!(writer, "  refinement: {}", selection.refinement)?;
+        writeln!(writer, "  method: {}", selection.method.as_str())?;
+        writeln!(
+            writer,
+            "  observation_class: {}",
+            selection.observation_class.as_str()
+        )?;
+        writeln!(
+            writer,
+            "  sensor_target_kind: {}",
+            selection.sensor_target.kind()
+        )?;
+        writeln!(
+            writer,
+            "  sensor_target_value: {}",
+            selection.sensor_target.value()
+        )?;
+        writeln!(writer, "  resolved_sensor_count: {}", self.row.sensor_count)?;
+        writeln!(
+            writer,
+            "  resolved_sensor_density: {}",
+            self.row.sensor_density
+        )?;
+        writeln!(
+            writer,
+            "  repeated_data_count: {}",
+            selection.repeated_data_count
+        )?;
+        match selection.spectral_rank {
+            Some(rank) => writeln!(writer, "  spectral_rank: {rank}")?,
+            None => writeln!(writer, "  spectral_rank: null")?,
+        }
+        writeln!(
+            writer,
+            "accuracy_status: {}",
+            yaml_scalar(RESOURCE_ACCURACY_UNAVAILABLE_REASON)
+        )?;
+        writeln!(writer, "rows_csv: rows.csv")?;
+        writeln!(writer, "row_count: 1")?;
+        writer.flush()?;
+        Ok(())
+    }
+}
+
 /// Execute the cheap benchmark through the root `feec_gmrf` public API.
 pub fn run_c51_benchmark(
     config: &C51BenchmarkConfig,
@@ -828,6 +1162,101 @@ pub fn run_c51_benchmark(
             C51ComparisonFrame::MatchedPhysicalQoiMethod,
         ],
         rows,
+    };
+    archive.validate()?;
+    Ok(archive)
+}
+
+/// Execute exactly one selected scientific method and phase.
+///
+/// Unlike the accuracy archive, this function never constructs an exact
+/// comparison model or any unselected method. Accuracy fields are therefore
+/// typed unavailable. This is the only entry point intended for external
+/// fresh-process peak-RSS attribution.
+pub fn run_c51_resource(
+    config: &C51ResourceConfig,
+    metadata: C51RunMetadata,
+) -> Result<C51ResourceArchive> {
+    config.validate()?;
+    let benchmark = config.benchmark_config();
+    let selection = &config.selection;
+    if selection.method == C51MethodId::WhitneyCompact {
+        let mut row = run_isolated_compact_resource(&benchmark, selection)?;
+        mark_resource_accuracy_unavailable(&mut row);
+        let archive = C51ResourceArchive {
+            metadata,
+            config: config.clone(),
+            row,
+        };
+        archive.validate()?;
+        return Ok(archive);
+    }
+    let mut assembled = assemble_refinement(&benchmark, selection.refinement)?;
+    let matching = assembled
+        .designs
+        .drain(..)
+        .filter(|design| design.class == selection.observation_class)
+        .collect::<Vec<_>>();
+    let [design] = matching.as_slice() else {
+        return Err(FeecGmrfError::Inference(format!(
+            "C51 resource selection resolved to {} observation designs instead of one",
+            matching.len()
+        )));
+    };
+    let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
+    let mut row = match selection.method {
+        C51MethodId::FullMetricDirect => {
+            let (prior, prior_build) = build_exact_prior(&assembled.operators, parameters)?;
+            run_selected_spd_resource(
+                C51MethodId::FullMetricDirect,
+                &prior,
+                prior_build,
+                assembled.feec_assembly,
+                &benchmark,
+                design,
+                &assembled.problem,
+                selection,
+            )?
+        }
+        C51MethodId::WhitneyCompact => unreachable!("handled by isolated compact route"),
+        C51MethodId::FullMetricAugmented => {
+            let (prior, prior_build) = build_supported_prior(&assembled.operators, parameters)?;
+            run_selected_supported_resource(
+                &prior,
+                prior_build,
+                assembled.feec_assembly,
+                &benchmark,
+                design,
+                &assembled.problem,
+                selection,
+            )?
+        }
+        C51MethodId::SpectralFullRank | C51MethodId::SpectralLowRank => {
+            let spectral = build_spectral_reference(&benchmark, &assembled.operators)?;
+            let rank = match selection.method {
+                C51MethodId::SpectralFullRank => spectral.basis.len(),
+                C51MethodId::SpectralLowRank => selection
+                    .spectral_rank
+                    .expect("validated low-rank resource selection"),
+                _ => unreachable!(),
+            };
+            run_selected_spectral_resource(
+                selection.method,
+                rank,
+                &spectral,
+                assembled.feec_assembly,
+                &benchmark,
+                design,
+                &assembled.problem,
+                selection,
+            )?
+        }
+    };
+    mark_resource_accuracy_unavailable(&mut row);
+    let archive = C51ResourceArchive {
+        metadata,
+        config: config.clone(),
+        row,
     };
     archive.validate()?;
     Ok(archive)
@@ -1041,7 +1470,7 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
                 &design,
                 repeated_data_count,
                 &assembled.problem,
-                &reference,
+                Some(&reference),
             )?);
             for rank in spectral_low_ranks(config, spectral.basis.len()) {
                 rows.push(run_spectral_method(
@@ -1054,7 +1483,7 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
                     &design,
                     repeated_data_count,
                     &assembled.problem,
-                    &reference,
+                    Some(&reference),
                 )?);
             }
         }
@@ -1128,7 +1557,7 @@ fn run_partial_spectral_refinement(
                     &design,
                     repeated_data_count,
                     &assembled.problem,
-                    &reference,
+                    Some(&reference),
                 )?);
             }
         }
@@ -1149,19 +1578,44 @@ fn assemble_refinement(
         &metric,
         config.form_degree,
     )?;
-    let (physical_qoi_cells, physical_qoi_volume_fraction) = physical_qoi_region_cells(
+    let elimination =
+        EssentialBoundaryElimination::from_layout(operators.state().boundary_layout().clone())?;
+    let (problem, designs) = assemble_problem_maps(
+        config,
         &topology,
         &coordinates,
+        &elimination,
+        operators.state().dimension(),
+    )?;
+    let feec_assembly = assembly_start.elapsed();
+    Ok(AssembledRefinement {
+        topology,
+        metric,
+        operators,
+        problem,
+        designs,
+        feec_assembly,
+    })
+}
+
+fn assemble_problem_maps(
+    config: &C51BenchmarkConfig,
+    topology: &Complex,
+    coordinates: &manifold::geometry::coord::mesh::MeshCoords,
+    elimination: &EssentialBoundaryElimination,
+    state_dimension: usize,
+) -> Result<(ProblemMaps, Vec<ObservationDesign>)> {
+    let (physical_qoi_cells, physical_qoi_volume_fraction) = physical_qoi_region_cells(
+        topology,
+        coordinates,
         config.physical_qoi_region_lower,
         config.physical_qoi_region_upper,
     )?;
     let physical_maps = MagneticFieldMaps3d::from_feec_with_volume_average_cells(
-        &topology,
-        &coordinates,
+        topology,
+        coordinates,
         &physical_qoi_cells,
     )?;
-    let elimination =
-        EssentialBoundaryElimination::from_layout(operators.state().boundary_layout().clone())?;
     let physical_observation = elimination
         .eliminate_map(
             physical_maps.magnetic_field.map(),
@@ -1179,27 +1633,15 @@ fn assemble_refinement(
         })
         .collect::<Result<Vec<_>>>()?;
     let physical_qoi = LinearMap::stack(&volume_average_components)?;
-    let feec_assembly = assembly_start.elapsed();
     let problem = ProblemMaps {
         physical_qoi,
         physical_observation,
-        latent_probe: deterministic_probe(operators.state().dimension(), config.seed),
+        latent_probe: deterministic_probe(state_dimension, config.seed),
         physical_qoi_selected_cell_count: physical_qoi_cells.len(),
         physical_qoi_selected_volume_fraction: physical_qoi_volume_fraction,
     };
-    let designs = observation_designs(
-        config,
-        operators.state().dimension(),
-        &problem.physical_observation,
-    )?;
-    Ok(AssembledRefinement {
-        topology,
-        metric,
-        operators,
-        problem,
-        designs,
-        feec_assembly,
-    })
+    let designs = observation_designs(config, state_dimension, &problem.physical_observation)?;
+    Ok((problem, designs))
 }
 
 fn build_priors(
@@ -1209,12 +1651,7 @@ fn build_priors(
     operators: &ExactFormOperators,
     parameters: MaternParameters,
 ) -> Result<BuiltPriors> {
-    let start = Instant::now();
-    let exact = ExactMaternPriorBuilder::from_operators(operators.clone())
-        .parameters(parameters)
-        .maximum_materialized_dimension(EXACT_REFERENCE_MAXIMUM_DIMENSION)?
-        .build()?;
-    let exact_build = start.elapsed();
+    let (exact, exact_build) = build_exact_prior(operators, parameters)?;
 
     let scalable = build_scalable_priors(config, topology, metric, operators, parameters)?;
     let BuiltScalablePriors {
@@ -1247,22 +1684,8 @@ fn build_scalable_priors(
     operators: &ExactFormOperators,
     parameters: MaternParameters,
 ) -> Result<BuiltScalablePriors> {
-    let start = Instant::now();
-    let supported = SupportedMaternPriorBuilder::from_operators(operators.clone())
-        .parameters(parameters)
-        .build()?;
-    let supported_build = start.elapsed();
-
-    let start = Instant::now();
-    let compact =
-        MaternPriorBuilder::from_feec_whitney_projected(topology, metric, config.form_degree)?
-            .parameters(parameters)
-            .essential_boundary_conditions(EssentialBoundaryConditions::homogeneous_on_boundary(
-                topology,
-                config.form_degree,
-            )?)
-            .build()?;
-    let compact_build = start.elapsed();
+    let (supported, supported_build) = build_supported_prior(operators, parameters)?;
+    let (compact, compact_build) = build_compact_prior(config, topology, metric, parameters)?;
     if compact.dimension() != supported.state_dimension() {
         return Err(FeecGmrfError::Dimension(format!(
             "compact dimension {} differs from exact supported dimension {}",
@@ -1276,6 +1699,47 @@ fn build_scalable_priors(
         compact_build,
         supported_build,
     })
+}
+
+fn build_exact_prior(
+    operators: &ExactFormOperators,
+    parameters: MaternParameters,
+) -> Result<(GaussianPrior, Duration)> {
+    let start = Instant::now();
+    let prior = ExactMaternPriorBuilder::from_operators(operators.clone())
+        .parameters(parameters)
+        .maximum_materialized_dimension(EXACT_REFERENCE_MAXIMUM_DIMENSION)?
+        .build()?;
+    Ok((prior, start.elapsed()))
+}
+
+fn build_supported_prior(
+    operators: &ExactFormOperators,
+    parameters: MaternParameters,
+) -> Result<(SupportedMaternPrior, Duration)> {
+    let start = Instant::now();
+    let prior = SupportedMaternPriorBuilder::from_operators(operators.clone())
+        .parameters(parameters)
+        .build()?;
+    Ok((prior, start.elapsed()))
+}
+
+fn build_compact_prior(
+    config: &C51BenchmarkConfig,
+    topology: &manifold::topology::complex::Complex,
+    metric: &manifold::geometry::metric::mesh::MeshLengths,
+    parameters: MaternParameters,
+) -> Result<(GaussianPrior, Duration)> {
+    let start = Instant::now();
+    let prior =
+        MaternPriorBuilder::from_feec_whitney_projected(topology, metric, config.form_degree)?
+            .parameters(parameters)
+            .essential_boundary_conditions(EssentialBoundaryConditions::homogeneous_on_boundary(
+                topology,
+                config.form_degree,
+            )?)
+            .build()?;
+    Ok((prior, start.elapsed()))
 }
 
 /// Recover the exact weak Hodge--Laplacian from the canonical alpha-one
@@ -1413,6 +1877,443 @@ fn spectral_low_ranks(config: &C51BenchmarkConfig, full_rank: usize) -> Vec<usiz
         }
     }
     ranks.into_iter().collect()
+}
+
+fn run_isolated_compact_resource(
+    config: &C51BenchmarkConfig,
+    selection: &C51ResourceSelection,
+) -> Result<C51BenchmarkRow> {
+    let mesh_start = Instant::now();
+    let mesh = CartesianMeshInfo::new_unit_scaled(3, selection.refinement, 1.0);
+    let (topology, coordinates) = mesh.compute_coord_complex();
+    let metric = coordinates.to_edge_lengths(&topology);
+    let mesh_assembly = mesh_start.elapsed();
+    let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
+    let (prior, prior_build) = build_compact_prior(config, &topology, &metric, parameters)?;
+    let elimination = prior.boundary_elimination().ok_or_else(|| {
+        FeecGmrfError::Inference(
+            "C51 compact resource prior is missing its boundary elimination".to_string(),
+        )
+    })?;
+    let maps_start = Instant::now();
+    let (problem, mut designs) = assemble_problem_maps(
+        config,
+        &topology,
+        &coordinates,
+        elimination,
+        prior.dimension(),
+    )?;
+    let feec_assembly = mesh_assembly + maps_start.elapsed();
+    let matching = designs
+        .drain(..)
+        .filter(|design| design.class == selection.observation_class)
+        .collect::<Vec<_>>();
+    let [design] = matching.as_slice() else {
+        return Err(FeecGmrfError::Inference(format!(
+            "C51 compact resource selection resolved to {} observation designs instead of one",
+            matching.len()
+        )));
+    };
+    run_selected_spd_resource(
+        C51MethodId::WhitneyCompact,
+        &prior,
+        prior_build,
+        feec_assembly,
+        config,
+        design,
+        &problem,
+        selection,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn base_resource_row(
+    method: C51MethodId,
+    config: &C51BenchmarkConfig,
+    selection: &C51ResourceSelection,
+    design: &ObservationDesign,
+    problem: &ProblemMaps,
+    latent_dimension: usize,
+    ambient_dimension: usize,
+    constraint_dimension: usize,
+) -> C51BenchmarkRow {
+    let accuracy_unavailable = || C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+    C51BenchmarkRow {
+        method,
+        available: true,
+        unavailable_reason: String::new(),
+        discrete_law_id: match method {
+            C51MethodId::FullMetricDirect
+            | C51MethodId::FullMetricAugmented
+            | C51MethodId::SpectralFullRank => "exact_full_metric_whitney",
+            C51MethodId::WhitneyCompact => "projected_inverse_whitney",
+            C51MethodId::SpectralLowRank => "truncated_exact_full_metric_whitney_spectral",
+        }
+        .to_string(),
+        same_discrete_law_eligible: matches!(
+            method,
+            C51MethodId::FullMetricDirect
+                | C51MethodId::FullMetricAugmented
+                | C51MethodId::SpectralFullRank
+        ),
+        matched_physical_qoi_eligible: false,
+        full_uq_workload_eligible: selection.phase == C51ResourcePhase::QueryFullUq
+            && method != C51MethodId::FullMetricAugmented,
+        method_performance_timing_eligible: true,
+        spectral_basis_source: "not_applicable".to_string(),
+        spectral_eigensolver_backend: "not_applicable".to_string(),
+        spectral_helper_workspace: String::new(),
+        spectral_helper_binary: String::new(),
+        refinement: selection.refinement,
+        spatial_dimension: config.spatial_dimension,
+        form_degree: config.form_degree,
+        alpha: config.alpha.as_u32(),
+        kappa: config.kappa,
+        tau: config.tau,
+        observation_class: design.class,
+        physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
+        physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
+        sensor_count: design.sensor_count,
+        sensor_density: design.sensor_count as f64 / latent_dimension as f64,
+        repeated_data_count: selection.repeated_data_count,
+        posterior_sample_count: config.posterior_sample_count,
+        seed: config.seed,
+        latent_dimension,
+        ambient_dimension,
+        constraint_dimension,
+        observation_nnz: design.operator.matrix().nnz(),
+        prior_precision_nnz: resource_phase_not_executed(),
+        observation_update_nnz: resource_phase_not_executed(),
+        posterior_precision_nnz: resource_phase_not_executed(),
+        ambient_energy_nnz: resource_phase_not_executed(),
+        constraint_nnz: resource_phase_not_executed(),
+        kkt_input_nnz: resource_phase_not_executed(),
+        factor_storage_nnz: resource_phase_not_executed(),
+        certificate_factor_storage_nnz: resource_phase_not_executed(),
+        fill_ratio: resource_phase_not_executed(),
+        spectral_rank: C51Measurement::NotRecorded,
+        spectral_basis_storage_values: C51Measurement::NotRecorded,
+        spectral_gp_storage_values: C51Measurement::NotRecorded,
+        spectral_prepared_storage_values: C51Measurement::NotRecorded,
+        spectral_dense_factor_values: C51Measurement::NotRecorded,
+        spectral_state_feature_values: C51Measurement::NotRecorded,
+        spectral_observation_feature_values: C51Measurement::NotRecorded,
+        spectral_sampling_normal_dimension: C51Measurement::NotRecorded,
+        spectral_rank_fraction: C51Measurement::NotRecorded,
+        spectral_shared_maximum_basis_rank: C51Measurement::NotRecorded,
+        spectral_partial_requested_rank: C51Measurement::NotRecorded,
+        spectral_partial_converged_rank: C51Measurement::NotRecorded,
+        spectral_partial_mass_nnz: C51Measurement::NotRecorded,
+        spectral_partial_weak_hodge_laplacian_nnz: C51Measurement::NotRecorded,
+        spectral_partial_input_nnz: C51Measurement::NotRecorded,
+        spectral_partial_basis_storage_bytes: C51Measurement::NotRecorded,
+        spectral_partial_clamped_negative_eigenvalues: C51Measurement::NotRecorded,
+        solver: "not_executed".to_string(),
+        ordering: "not_applicable".to_string(),
+        feec_assembly_ns: resource_phase_not_executed(),
+        prior_build_ns: resource_phase_not_executed(),
+        spectral_operator_recovery_ns: C51Measurement::NotRecorded,
+        spectral_eigensolve_ns: C51Measurement::NotRecorded,
+        spectral_gp_build_ns: C51Measurement::NotRecorded,
+        observation_update_assembly_ns: resource_phase_not_executed(),
+        observation_update_and_factor_ns: resource_phase_not_executed(),
+        symbolic_analysis_ns: resource_phase_not_executed(),
+        numeric_factor_ns: resource_phase_not_executed(),
+        combined_factor_setup_ns: resource_phase_not_executed(),
+        repeated_data_ns: resource_phase_not_executed(),
+        covariance_action_ns: resource_phase_not_executed(),
+        physical_qoi_ns: resource_phase_not_executed(),
+        sampling_ns: resource_phase_not_executed(),
+        variance_estimation_ns: resource_phase_not_executed(),
+        factor_external_peak_rss_bytes: C51Measurement::NotRecorded,
+        query_external_peak_rss_bytes: C51Measurement::NotRecorded,
+        posterior_mean_relative_error: accuracy_unavailable(),
+        covariance_action_relative_error: accuracy_unavailable(),
+        physical_covariance_action_relative_error: accuracy_unavailable(),
+        physical_variance_relative_error: accuracy_unavailable(),
+        physical_transformed_variance_relative_error: accuracy_unavailable(),
+        physical_mean_relative_error: accuracy_unavailable(),
+        physical_transformed_variance_min_raw: resource_phase_not_executed(),
+        physical_transformed_variance_negative_count: resource_phase_not_executed(),
+    }
+}
+
+fn resource_phase_not_executed<T>() -> C51Measurement<T> {
+    C51Measurement::unavailable("not executed in selected resource phase")
+}
+
+fn mark_resource_accuracy_unavailable(row: &mut C51BenchmarkRow) {
+    row.matched_physical_qoi_eligible = false;
+    row.posterior_mean_relative_error =
+        C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+    row.covariance_action_relative_error =
+        C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+    row.physical_covariance_action_relative_error =
+        C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+    row.physical_variance_relative_error =
+        C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+    row.physical_transformed_variance_relative_error =
+        C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+    row.physical_mean_relative_error =
+        C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selected_spd_resource(
+    method: C51MethodId,
+    prior: &GaussianPrior,
+    prior_build: Duration,
+    feec_assembly: Duration,
+    config: &C51BenchmarkConfig,
+    design: &ObservationDesign,
+    problem: &ProblemMaps,
+    selection: &C51ResourceSelection,
+) -> Result<C51BenchmarkRow> {
+    if selection.phase == C51ResourcePhase::QueryFullUq {
+        return run_spd_method(
+            method,
+            prior,
+            prior_build,
+            feec_assembly,
+            config,
+            selection.refinement,
+            design,
+            selection.repeated_data_count,
+            problem,
+            None,
+        )
+        .map(|result| result.0);
+    }
+    let values = repeated_observation_values(design.sensor_count, 1, config.seed);
+    let observation = LinearObservation::new(
+        design.operator.clone(),
+        values[0].clone(),
+        GaussianNoise::variance(config.observation_noise_variance)?,
+    )?;
+    let setup_start = Instant::now();
+    let (prepared, resource_report) = LinearGaussianModelBuilder::new(prior.clone())
+        .observe(observation)?
+        .prepare_with_resource_report()?;
+    let setup_elapsed = setup_start.elapsed();
+    let factor = prepared.factorization_diagnostics();
+    let conditioning = prepared.conditioning_diagnostics();
+    let observation_update = conditioning.observation_terms.first().ok_or_else(|| {
+        FeecGmrfError::Inference(
+            "C51 prepared resource model is missing observation diagnostics".to_string(),
+        )
+    })?;
+    let mut row = base_resource_row(
+        method,
+        config,
+        selection,
+        design,
+        problem,
+        prior.dimension(),
+        prior.dimension(),
+        0,
+    );
+    row.observation_nnz = observation_update.operator_nonzeros;
+    row.prior_precision_nnz = C51Measurement::Measured(conditioning.prior_precision_nonzeros);
+    row.observation_update_nnz =
+        C51Measurement::Measured(observation_update.precision_update_nonzeros);
+    row.posterior_precision_nnz =
+        C51Measurement::Measured(conditioning.posterior_precision_nonzeros);
+    row.factor_storage_nnz = usize_resource_measurement(&resource_report.factor_storage_nonzeros);
+    row.fill_ratio = C51Measurement::Measured(factor.fill_ratio);
+    row.solver = "sparse_cholesky".to_string();
+    row.ordering = ordering_name(factor.ordering).to_string();
+    row.feec_assembly_ns = duration_measurement(feec_assembly);
+    row.prior_build_ns = duration_measurement(prior_build);
+    row.observation_update_assembly_ns =
+        duration_resource_measurement(&resource_report.assembly.wall_time);
+    row.observation_update_and_factor_ns = duration_measurement(setup_elapsed);
+    row.symbolic_analysis_ns = duration_resource_measurement(&resource_report.analysis.wall_time);
+    row.numeric_factor_ns =
+        duration_resource_measurement(&resource_report.numeric_factorization.wall_time);
+    row.combined_factor_setup_ns =
+        duration_resource_measurement(&resource_report.combined_factor_setup.wall_time);
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selected_supported_resource(
+    prior: &SupportedMaternPrior,
+    prior_build: Duration,
+    feec_assembly: Duration,
+    config: &C51BenchmarkConfig,
+    design: &ObservationDesign,
+    problem: &ProblemMaps,
+    selection: &C51ResourceSelection,
+) -> Result<C51BenchmarkRow> {
+    if selection.phase == C51ResourcePhase::QueryFullUq {
+        return run_supported_method(
+            prior,
+            prior_build,
+            feec_assembly,
+            config,
+            selection.refinement,
+            design,
+            selection.repeated_data_count,
+            problem,
+            None,
+        )
+        .map(|result| result.0);
+    }
+    let values = repeated_observation_values(design.sensor_count, 1, config.seed);
+    let observation = LinearObservation::new(
+        design.operator.clone(),
+        values[0].clone(),
+        GaussianNoise::variance(config.observation_noise_variance)?,
+    )?;
+    let setup_start = Instant::now();
+    let prepared = prior.prepare(&[observation], &[])?;
+    let setup_elapsed = setup_start.elapsed();
+    let diagnostics = prepared.diagnostics();
+    let mut row = base_resource_row(
+        C51MethodId::FullMetricAugmented,
+        config,
+        selection,
+        design,
+        problem,
+        prior.state_dimension(),
+        diagnostics.ambient_dimension,
+        diagnostics.constraint_dimension,
+    );
+    row.prior_precision_nnz = C51Measurement::unavailable(
+        "FM-AUG is a constrained energy, not an eliminated SPD precision",
+    );
+    row.observation_update_nnz = C51Measurement::unavailable(UPDATE_NNZ_PENDING_REASON);
+    row.posterior_precision_nnz = C51Measurement::unavailable(
+        "FM-AUG is a constrained energy, not an eliminated SPD precision",
+    );
+    row.ambient_energy_nnz = C51Measurement::Measured(diagnostics.ambient_energy_nnz);
+    row.constraint_nnz = C51Measurement::Measured(diagnostics.constraint_nnz);
+    row.kkt_input_nnz = C51Measurement::Measured(diagnostics.kkt_nnz);
+    row.factor_storage_nnz = C51Measurement::unavailable(KKT_FILL_UNAVAILABLE_REASON);
+    row.certificate_factor_storage_nnz = C51Measurement::Measured(
+        diagnostics.constraint_gram_factor_nnz + diagnostics.supported_energy_factor_nnz,
+    );
+    row.fill_ratio = C51Measurement::unavailable(KKT_FILL_UNAVAILABLE_REASON);
+    row.solver = "sparse_lu_kkt".to_string();
+    row.ordering = "backend_partial_pivoting".to_string();
+    row.feec_assembly_ns = duration_measurement(feec_assembly);
+    row.prior_build_ns = duration_measurement(prior_build);
+    row.observation_update_assembly_ns = C51Measurement::unavailable(
+        "the supported-law API currently exposes combined observation assembly and KKT setup",
+    );
+    row.observation_update_and_factor_ns = duration_measurement(setup_elapsed);
+    row.symbolic_analysis_ns = C51Measurement::unavailable(
+        "the sparse LU backend does not expose separate symbolic analysis",
+    );
+    row.numeric_factor_ns = C51Measurement::unavailable(
+        "the sparse LU backend does not expose separate numeric factorization",
+    );
+    row.combined_factor_setup_ns = duration_measurement(setup_elapsed);
+    Ok(row)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_selected_spectral_resource(
+    method: C51MethodId,
+    rank: usize,
+    source: &SpectralReference,
+    feec_assembly: Duration,
+    config: &C51BenchmarkConfig,
+    design: &ObservationDesign,
+    problem: &ProblemMaps,
+    selection: &C51ResourceSelection,
+) -> Result<C51BenchmarkRow> {
+    if selection.phase == C51ResourcePhase::QueryFullUq {
+        let mut row = run_spectral_method(
+            method,
+            rank,
+            source,
+            feec_assembly,
+            config,
+            selection.refinement,
+            design,
+            selection.repeated_data_count,
+            problem,
+            None,
+        )?;
+        // The current isolated spectral route still materializes exact marginal
+        // L and is therefore resource-attributable but not a scalable method
+        // timing baseline.
+        row.method_performance_timing_eligible = false;
+        return Ok(row);
+    }
+    let gp_start = Instant::now();
+    let gp = SpectralMaternGp::from_eigenbasis(
+        source.basis.clone(),
+        SpectralMaternConfig {
+            kappa: config.kappa,
+            alpha: f64::from(config.alpha.as_u32()),
+            tau: config.tau,
+            k: rank,
+        },
+    )
+    .map_err(spectral_error)?;
+    let gp_build = gp_start.elapsed();
+    let observation = feg_infer::sparse::core_triplet_to_feec_csr(design.operator.matrix());
+    let setup_start = Instant::now();
+    let prepared = gp
+        .prepare_linear_observations(&observation, config.observation_noise_variance)
+        .map_err(spectral_error)?;
+    let setup_elapsed = setup_start.elapsed();
+    let diagnostics = prepared.diagnostics();
+    let mut row = base_resource_row(
+        method,
+        config,
+        selection,
+        design,
+        problem,
+        diagnostics.latent_dimension,
+        diagnostics.ambient_dimension,
+        0,
+    );
+    row.method_performance_timing_eligible = false;
+    row.spectral_basis_source = "dense_full_reference".to_string();
+    row.spectral_eigensolver_backend = "dense_checked_generalized_eigensolver".to_string();
+    row.spectral_rank = C51Measurement::Measured(rank);
+    row.spectral_basis_storage_values = C51Measurement::Measured(source.basis_storage_values);
+    row.spectral_gp_storage_values =
+        C51Measurement::Measured(diagnostics.ambient_dimension * rank + 2 * rank);
+    row.spectral_prepared_storage_values =
+        C51Measurement::Measured(diagnostics.persistent_f64_entries);
+    row.spectral_dense_factor_values =
+        C51Measurement::Measured(diagnostics.dense_factor_allocated_entries);
+    row.spectral_state_feature_values = C51Measurement::Measured(diagnostics.state_feature_entries);
+    row.spectral_observation_feature_values =
+        C51Measurement::Measured(diagnostics.observation_feature_entries);
+    row.spectral_sampling_normal_dimension =
+        C51Measurement::Measured(diagnostics.sampling_standard_normal_dimension);
+    row.spectral_rank_fraction =
+        C51Measurement::Measured(rank as f64 / diagnostics.ambient_dimension as f64);
+    row.solver = match diagnostics.conditioning_strategy {
+        LowRankConditioningStrategy::ObservationSpace => {
+            "spectral_observation_space_dense_cholesky"
+        }
+        LowRankConditioningStrategy::LatentSpace => "spectral_latent_space_dense_cholesky",
+    }
+    .to_string();
+    row.ordering = "not_applicable".to_string();
+    row.feec_assembly_ns = duration_measurement(feec_assembly);
+    row.prior_build_ns =
+        duration_measurement(source.operator_recovery + source.eigensolve + gp_build);
+    row.spectral_operator_recovery_ns = duration_measurement(source.operator_recovery);
+    row.spectral_eigensolve_ns = duration_measurement(source.eigensolve);
+    row.spectral_gp_build_ns = duration_measurement(gp_build);
+    row.observation_update_assembly_ns = C51Measurement::unavailable(
+        "prepared spectral API exposes combined feature projection and dense factor setup",
+    );
+    row.observation_update_and_factor_ns = duration_measurement(setup_elapsed);
+    row.symbolic_analysis_ns = C51Measurement::unavailable(
+        "symbolic sparse analysis is not applicable to dense spectral conditioning",
+    );
+    row.numeric_factor_ns =
+        C51Measurement::unavailable("prepared spectral API exposes combined dense setup time");
+    row.combined_factor_setup_ns = duration_measurement(setup_elapsed);
+    Ok(row)
 }
 
 // These arguments are the frozen method/problem/observation axes of one row;
@@ -1771,7 +2672,7 @@ fn run_spectral_method(
     design: &ObservationDesign,
     repeated_data_count: usize,
     problem: &ProblemMaps,
-    reference: &ReferenceAnswers,
+    reference: Option<&ReferenceAnswers>,
 ) -> Result<C51BenchmarkRow> {
     if !matches!(
         method,
@@ -1875,7 +2776,7 @@ fn run_spectral_method(
         physical_transformed_variances: output.variance,
         physical_mean: output.mean,
     };
-    let errors = errors_against(&answers, Some(reference))?;
+    let errors = errors_against(&answers, reference)?;
     let (
         method_performance_timing_eligible,
         spectral_basis_source,
@@ -2776,6 +3677,113 @@ mod tests {
         .unwrap_err();
         assert!(matches!(error, FeecGmrfError::Unsupported(_)));
         assert!(error.to_string().contains("PETSc/SLEPc"));
+    }
+
+    #[test]
+    fn compact_resource_process_produces_only_one_compact_setup_row() {
+        let selection = C51ResourceSelection {
+            refinement: 2,
+            observation_class: C51ObservationClass::LocalPhysicalB,
+            sensor_target: C51ResourceSensorTarget::Count(4),
+            repeated_data_count: 1,
+            method: C51MethodId::WhitneyCompact,
+            spectral_rank: None,
+            phase: C51ResourcePhase::ColdSetup,
+        };
+        let mut config = C51ResourceConfig::smoke(selection);
+        // A spectral construction would fail this cap. The isolated compact
+        // route neither assembles ExactFormOperators nor constructs a basis.
+        config.spectral_reference_maximum_dimension = 1;
+        let mut archive = run_c51_resource(&config, C51RunMetadata::smoke("resource-test"))
+            .expect("isolated compact setup should not construct spectral or exact models");
+        assert_eq!(archive.row.method, C51MethodId::WhitneyCompact);
+        assert_eq!(
+            archive.row.observation_class,
+            C51ObservationClass::LocalPhysicalB
+        );
+        assert!(matches!(
+            archive.row.factor_storage_nnz,
+            C51Measurement::Measured(_)
+        ));
+        assert!(matches!(
+            archive.row.spectral_rank,
+            C51Measurement::NotRecorded
+        ));
+        assert!(matches!(
+            archive.row.sampling_ns,
+            C51Measurement::Unavailable { .. }
+        ));
+        assert!(matches!(
+            archive.row.posterior_mean_relative_error,
+            C51Measurement::Unavailable { ref reason }
+                if reason == RESOURCE_ACCURACY_UNAVAILABLE_REASON
+        ));
+        archive.record_external_peak_rss(12_345).unwrap();
+        assert_eq!(
+            archive.row.factor_external_peak_rss_bytes,
+            C51Measurement::Measured(12_345)
+        );
+        assert_eq!(
+            archive.row.query_external_peak_rss_bytes,
+            C51Measurement::NotRecorded
+        );
+    }
+
+    #[test]
+    fn resource_density_is_resolved_and_query_phase_executes_full_uq() {
+        let selection = C51ResourceSelection {
+            refinement: 2,
+            observation_class: C51ObservationClass::LocalSelectors,
+            sensor_target: C51ResourceSensorTarget::Density(0.5),
+            repeated_data_count: 2,
+            method: C51MethodId::WhitneyCompact,
+            spectral_rank: None,
+            phase: C51ResourcePhase::QueryFullUq,
+        };
+        let config = C51ResourceConfig::smoke(selection);
+        let archive = run_c51_resource(&config, C51RunMetadata::smoke("resource-test"))
+            .expect("isolated compact full-UQ resource row should run");
+        assert_eq!(
+            archive.row.sensor_count,
+            (0.5 * archive.row.latent_dimension as f64).ceil() as usize
+        );
+        assert_eq!(archive.row.repeated_data_count, 2);
+        assert!(matches!(
+            archive.row.sampling_ns,
+            C51Measurement::Measured(_)
+        ));
+        assert!(matches!(
+            archive.row.variance_estimation_ns,
+            C51Measurement::Measured(_)
+        ));
+    }
+
+    #[test]
+    fn every_method_has_a_single_row_cold_setup_resource_route() {
+        for (method, spectral_rank) in [
+            (C51MethodId::FullMetricDirect, None),
+            (C51MethodId::FullMetricAugmented, None),
+            (C51MethodId::WhitneyCompact, None),
+            (C51MethodId::SpectralFullRank, None),
+            (C51MethodId::SpectralLowRank, Some(4)),
+        ] {
+            let selection = C51ResourceSelection {
+                refinement: 2,
+                observation_class: C51ObservationClass::LocalPhysicalB,
+                sensor_target: C51ResourceSensorTarget::Count(4),
+                repeated_data_count: 1,
+                method,
+                spectral_rank,
+                phase: C51ResourcePhase::ColdSetup,
+            };
+            let archive = run_c51_resource(
+                &C51ResourceConfig::smoke(selection),
+                C51RunMetadata::smoke("resource-test"),
+            )
+            .unwrap_or_else(|error| panic!("resource route {method:?} failed: {error}"));
+            assert_eq!(archive.row.method, method);
+            assert_eq!(archive.config.selection.phase, C51ResourcePhase::ColdSetup);
+        }
     }
 
     #[cfg(feature = "external-solvers")]

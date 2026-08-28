@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import importlib.util
+import csv
 import pathlib
 import sys
 import tempfile
@@ -16,6 +17,56 @@ SPEC.loader.exec_module(runner)
 
 
 class FreshProcessRunnerTests(unittest.TestCase):
+    def write_resource_rows(self, path, rows):
+        fieldnames = [
+            "resource_scope",
+            "workload_phase",
+            "method",
+            "refinement",
+            "observation_class",
+            "sensor_count",
+            "repeated_data_count",
+            "factor_external_peak_rss_bytes_status",
+            "factor_external_peak_rss_bytes_value",
+            "factor_external_peak_rss_bytes_reason",
+            "query_external_peak_rss_bytes_status",
+            "query_external_peak_rss_bytes_value",
+            "query_external_peak_rss_bytes_reason",
+        ]
+        with path.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def resource_selection(self, phase="cold_setup", method="whitney_compact"):
+        return {
+            "method": method,
+            "refinement": 2,
+            "observation_class": "local_physical_b",
+            "sensor_target_kind": "count",
+            "sensor_target_value": 4,
+            "repeated_data_count": 1,
+            "spectral_rank": None,
+            "workload_phase": phase,
+        }
+
+    def resource_row(self, phase="cold_setup", method="whitney_compact"):
+        return {
+            "resource_scope": "method_phase",
+            "workload_phase": phase,
+            "method": method,
+            "refinement": "2",
+            "observation_class": "local_physical_b",
+            "sensor_count": "4",
+            "repeated_data_count": "1",
+            "factor_external_peak_rss_bytes_status": "not_recorded",
+            "factor_external_peak_rss_bytes_value": "",
+            "factor_external_peak_rss_bytes_reason": "",
+            "query_external_peak_rss_bytes_status": "not_recorded",
+            "query_external_peak_rss_bytes_value": "",
+            "query_external_peak_rss_bytes_reason": "",
+        }
+
     def test_gnu_time_parser_converts_kbytes(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = pathlib.Path(temporary) / "time.txt"
@@ -71,6 +122,64 @@ class FreshProcessRunnerTests(unittest.TestCase):
         self.assertEqual(set(environment.values()), {"3"})
         with self.assertRaises(ValueError):
             runner.thread_environment(0)
+
+    def test_method_phase_rss_attaches_to_exactly_one_matching_row(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "rows.csv"
+            self.write_resource_rows(path, [self.resource_row()])
+            result = runner.attach_peak_rss_to_resource_row(
+                path,
+                self.resource_selection(),
+                runner.measured(4096, "bytes", "test_peak"),
+            )
+            with path.open("r", encoding="utf-8", newline="") as stream:
+                row = next(csv.DictReader(stream))
+        self.assertEqual(result["status"], "measured")
+        self.assertEqual(result["resource_scope"], "method_phase")
+        self.assertEqual(row["factor_external_peak_rss_bytes_status"], "measured")
+        self.assertEqual(row["factor_external_peak_rss_bytes_value"], "4096")
+        self.assertEqual(row["query_external_peak_rss_bytes_status"], "not_recorded")
+
+    def test_query_full_uq_rss_attaches_only_to_query_field(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "rows.csv"
+            self.write_resource_rows(path, [self.resource_row(phase="query_full_uq")])
+            runner.attach_peak_rss_to_resource_row(
+                path,
+                self.resource_selection(phase="query_full_uq"),
+                runner.measured(8192, "bytes", "test_peak"),
+            )
+            with path.open("r", encoding="utf-8", newline="") as stream:
+                row = next(csv.DictReader(stream))
+        self.assertEqual(row["factor_external_peak_rss_bytes_status"], "not_recorded")
+        self.assertEqual(row["query_external_peak_rss_bytes_status"], "measured")
+        self.assertEqual(row["query_external_peak_rss_bytes_value"], "8192")
+
+    def test_row_attribution_refuses_multiple_rows_and_method_phase_mismatch(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "rows.csv"
+            row = self.resource_row()
+            self.write_resource_rows(path, [row, row])
+            with self.assertRaisesRegex(ValueError, "exactly one CSV row"):
+                runner.attach_peak_rss_to_resource_row(
+                    path,
+                    self.resource_selection(),
+                    runner.measured(4096, "bytes", "test_peak"),
+                )
+            self.write_resource_rows(path, [self.resource_row(method="fm_direct")])
+            with self.assertRaisesRegex(ValueError, "does not match selection"):
+                runner.attach_peak_rss_to_resource_row(
+                    path,
+                    self.resource_selection(),
+                    runner.measured(4096, "bytes", "test_peak"),
+                )
+            self.write_resource_rows(path, [self.resource_row(phase="query_full_uq")])
+            with self.assertRaisesRegex(ValueError, "does not match selection"):
+                runner.attach_peak_rss_to_resource_row(
+                    path,
+                    self.resource_selection(),
+                    runner.measured(4096, "bytes", "test_peak"),
+                )
 
 
 if __name__ == "__main__":

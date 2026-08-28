@@ -11,6 +11,7 @@ counter without naming the selected source.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import hashlib
 import json
@@ -31,7 +32,7 @@ from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
 
-SCHEMA_VERSION = "c51-fresh-process-v1"
+SCHEMA_VERSION = "c51-fresh-process-v2"
 THREAD_ENV_NAMES = (
     "OMP_NUM_THREADS",
     "OPENBLAS_NUM_THREADS",
@@ -42,6 +43,15 @@ THREAD_ENV_NAMES = (
     "FAER_NUM_THREADS",
 )
 SUPPORTED_PROFILES = ("smoke",)
+RESOURCE_METHODS = (
+    "fm_direct",
+    "fm_aug",
+    "whitney_compact",
+    "spectral_full_rank",
+    "spectral_low_rank",
+)
+OBSERVATION_CLASSES = ("local_physical_b", "local_selectors", "global_row")
+WORKLOAD_PHASES = ("cold_setup", "query_full_uq")
 
 
 def measured(value: Any, unit: str, source: str) -> dict[str, Any]:
@@ -670,7 +680,194 @@ def build_release_example(
     }
 
 
+def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | None:
+    if args.resource_method is None:
+        resource_values = (
+            args.refinement,
+            args.observation_class,
+            args.sensor_count,
+            args.sensor_density,
+            args.repeated_data,
+            args.spectral_rank,
+            args.workload_phase,
+        )
+        if any(value is not None for value in resource_values):
+            raise ValueError("resource selectors require --resource-method")
+        return None
+    required = {
+        "--refinement": args.refinement,
+        "--observation-class": args.observation_class,
+        "--repeated-data": args.repeated_data,
+        "--workload-phase": args.workload_phase,
+    }
+    missing = [name for name, value in required.items() if value is None]
+    if missing:
+        raise ValueError(f"resource mode is missing {', '.join(missing)}")
+    if args.refinement < 2:
+        raise ValueError("resource refinement must be at least two")
+    if args.repeated_data < 1:
+        raise ValueError("resource repeated-data count must be positive")
+    if (args.sensor_count is None) == (args.sensor_density is None):
+        raise ValueError("resource mode requires exactly one of --sensor-count or --sensor-density")
+    if args.sensor_count is not None and args.sensor_count < 1:
+        raise ValueError("resource sensor count must be positive")
+    if args.sensor_density is not None and not (0.0 < args.sensor_density <= 1.0):
+        raise ValueError("resource sensor density must lie in (0, 1]")
+    if args.observation_class == "global_row" and args.sensor_count != 1:
+        raise ValueError("the global-row resource control requires --sensor-count 1")
+    if args.resource_method == "spectral_low_rank":
+        if args.spectral_rank is None or args.spectral_rank < 1:
+            raise ValueError("spectral_low_rank requires a positive --spectral-rank")
+    elif args.spectral_rank is not None:
+        raise ValueError("only spectral_low_rank accepts --spectral-rank")
+    return {
+        "method": args.resource_method,
+        "refinement": args.refinement,
+        "observation_class": args.observation_class,
+        "sensor_target_kind": "count" if args.sensor_count is not None else "density",
+        "sensor_target_value": (
+            args.sensor_count if args.sensor_count is not None else args.sensor_density
+        ),
+        "repeated_data_count": args.repeated_data,
+        "spectral_rank": args.spectral_rank,
+        "workload_phase": args.workload_phase,
+    }
+
+
+def scientific_command(
+    binary: pathlib.Path,
+    study_output: pathlib.Path,
+    profile: str,
+    selection: Mapping[str, Any] | None,
+) -> list[str]:
+    if selection is None:
+        return [str(binary), profile, str(study_output)]
+    return [
+        str(binary),
+        "resource",
+        profile,
+        str(study_output),
+        str(selection["refinement"]),
+        str(selection["observation_class"]),
+        str(selection["sensor_target_kind"]),
+        str(selection["sensor_target_value"]),
+        str(selection["repeated_data_count"]),
+        str(selection["method"]),
+        "none" if selection["spectral_rank"] is None else str(selection["spectral_rank"]),
+        str(selection["workload_phase"]),
+    ]
+
+
+def resource_scope(selection: Mapping[str, Any] | None) -> dict[str, Any]:
+    if selection is None:
+        return {
+            "kind": "archive_process",
+            "publication_crossover_eligible": False,
+            "reason": "the all-method accuracy archive shares one process and cannot own method RSS",
+        }
+    return {
+        "kind": "method_phase",
+        "row_attribution_eligible": True,
+        "publication_crossover_eligible": False,
+        "selection": dict(selection),
+        "reason": "one process owns one method-phase RSS measurement; publication eligibility still depends on the row's method-performance and full-UQ flags",
+    }
+
+
+def attach_peak_rss_to_resource_row(
+    rows_path: pathlib.Path,
+    selection: Mapping[str, Any],
+    peak_rss: Mapping[str, Any],
+) -> dict[str, Any]:
+    try:
+        with rows_path.open("r", encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            fieldnames = reader.fieldnames
+            rows = list(reader)
+    except OSError as error:
+        raise ValueError(f"cannot read resource rows for RSS attribution: {error}") from error
+    if fieldnames is None or len(rows) != 1:
+        raise ValueError(
+            f"resource RSS attribution requires exactly one CSV row; found {len(rows)}"
+        )
+    row = rows[0]
+    expected = {
+        "resource_scope": "method_phase",
+        "workload_phase": str(selection["workload_phase"]),
+        "method": str(selection["method"]),
+        "refinement": str(selection["refinement"]),
+        "observation_class": str(selection["observation_class"]),
+        "repeated_data_count": str(selection["repeated_data_count"]),
+    }
+    mismatches = {
+        name: {"expected": value, "actual": row.get(name)}
+        for name, value in expected.items()
+        if row.get(name) != value
+    }
+    if selection["spectral_rank"] is not None:
+        actual_rank = row.get("spectral_rank_value")
+        expected_rank = str(selection["spectral_rank"])
+        if row.get("spectral_rank_status") != "measured" or actual_rank != expected_rank:
+            mismatches["spectral_rank"] = {
+                "expected": expected_rank,
+                "actual": actual_rank,
+                "status": row.get("spectral_rank_status"),
+            }
+    if selection["sensor_target_kind"] == "count":
+        expected_count = str(selection["sensor_target_value"])
+        if row.get("sensor_count") != expected_count:
+            mismatches["sensor_count"] = {
+                "expected": expected_count,
+                "actual": row.get("sensor_count"),
+            }
+    if mismatches:
+        raise ValueError(f"resource RSS row does not match selection: {mismatches}")
+    if peak_rss.get("status") != "measured":
+        return unavailable(
+            "method-phase RSS was not attached because no measured peak was available"
+        ) | {"peak_rss": dict(peak_rss), "selection": dict(selection)}
+    measurement_name = (
+        "factor_external_peak_rss_bytes"
+        if selection["workload_phase"] == "cold_setup"
+        else "query_external_peak_rss_bytes"
+    )
+    columns = [
+        f"{measurement_name}_status",
+        f"{measurement_name}_value",
+        f"{measurement_name}_reason",
+    ]
+    missing_columns = [name for name in columns if name not in fieldnames]
+    if missing_columns:
+        raise ValueError(f"resource CSV is missing RSS columns: {missing_columns}")
+    row[columns[0]] = "measured"
+    row[columns[1]] = str(peak_rss["value"])
+    row[columns[2]] = ""
+    temporary = rows_path.with_name(f".{rows_path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with temporary.open("w", encoding="utf-8", newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerow(row)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, rows_path)
+    except OSError as error:
+        try:
+            temporary.unlink()
+        except OSError:
+            pass
+        raise ValueError(f"cannot atomically attach resource RSS: {error}") from error
+    return measured(int(peak_rss["value"]), "bytes", str(peak_rss.get("source", "unknown"))) | {
+        "resource_scope": "method_phase",
+        "workload_phase": selection["workload_phase"],
+        "method": selection["method"],
+        "rows_csv": str(rows_path),
+        "measurement_field": measurement_name,
+    }
+
+
 def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
+    selection = requested_resource_selection(args)
     thread_env = thread_environment(args.threads)
     environment = os.environ.copy()
     environment.update(thread_env)
@@ -686,15 +883,9 @@ def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
         "replicate": args.replicate,
         "profile_support": {
             "supported": list(SUPPORTED_PROFILES),
-            "note": "the current Rust example constructs C51BenchmarkConfig::smoke()",
+            "note": "smoke supports either the all-method accuracy archive or one method-phase resource selection",
         },
-        "resource_scope": {
-            "kind": "archive_process",
-            "publication_crossover_eligible": False,
-            "reason": "the current example executes all methods and designs in one process; "
-            "method/mesh/observation/workload filters and preferably factor/query phase "
-            "separation are required for row-attributable publication RSS",
-        },
+        "resource_scope": resource_scope(selection),
         "repository": str(repository),
         "output": str(args.output),
         "build_command": [
@@ -710,7 +901,7 @@ def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
             "c51_benchmark",
         ],
         "anticipated_binary": str(binary),
-        "scientific_command": [str(binary), str(study_output)],
+        "scientific_command": scientific_command(binary, study_output, args.profile, selection),
         "thread_environment": thread_env,
         "cgroup_mode": args.cgroup_mode,
     }
@@ -724,6 +915,11 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
             f"supported profiles: {', '.join(SUPPORTED_PROFILES)}",
             file=sys.stderr,
         )
+        return 2
+    try:
+        selection = requested_resource_selection(args)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
         return 2
     if args.replicate < 0:
         print("replicate must be non-negative", file=sys.stderr)
@@ -758,15 +954,9 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
         "replicate": args.replicate,
         "profile_support": {
             "supported": list(SUPPORTED_PROFILES),
-            "note": "the current Rust example constructs C51BenchmarkConfig::smoke(); "
-            "replicate identifies the fresh-process operations replicate",
+            "note": "smoke supports all-method accuracy and isolated resource modes; replicate identifies the fresh-process operations replicate",
         },
-        "resource_scope": {
-            "kind": "archive_process",
-            "publication_crossover_eligible": False,
-            "reason": "the current example executes all methods and designs in one process; "
-            "this runner validates discovery instrumentation only until one-row filters exist",
-        },
+        "resource_scope": resource_scope(selection),
         "runner": {
             "path": str(script_path),
             "sha256": sha256_file(script_path),
@@ -819,7 +1009,7 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
         atomic_write_json(manifest_path, initial_manifest)
         return exit_status
 
-    command = [str(binary), str(study_output)]
+    command = scientific_command(binary, study_output, args.profile, selection)
     try:
         result = run_measured_process(
             command,
@@ -829,6 +1019,17 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
             args.cgroup_mode,
             script_path,
         )
+        result.manifest["resource_scope"] = resource_scope(selection)
+        if result.shell_exit_status == 0 and selection is not None:
+            result.manifest["peak_rss_row_attribution"] = attach_peak_rss_to_resource_row(
+                study_output / "rows.csv",
+                selection,
+                result.manifest["peak_rss_archive_process"],
+            )
+        elif selection is not None:
+            result.manifest["peak_rss_row_attribution"] = unavailable(
+                "the selected scientific method phase failed, so no resource row was attributed"
+            ) | {"selection": dict(selection)}
         initial_manifest.update(
             {
                 "status": "completed" if result.shell_exit_status == 0 else "benchmark_failed",
@@ -973,6 +1174,15 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--resource-method", choices=RESOURCE_METHODS)
+    parser.add_argument("--refinement", type=int)
+    parser.add_argument("--observation-class", choices=OBSERVATION_CLASSES)
+    sensor_group = parser.add_mutually_exclusive_group()
+    sensor_group.add_argument("--sensor-count", type=int)
+    sensor_group.add_argument("--sensor-density", type=float)
+    parser.add_argument("--repeated-data", type=int)
+    parser.add_argument("--spectral-rank", type=int)
+    parser.add_argument("--workload-phase", choices=WORKLOAD_PHASES)
     parser.add_argument(
         "--cgroup-mode",
         choices=("auto", "required", "off"),
