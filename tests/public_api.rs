@@ -387,6 +387,14 @@ fn prepared_model_reports_observation_update_factorization_and_initial_solve() {
     ));
     assert_eq!(resources.solve.calls, 1);
     assert_eq!(resources.solve.right_hand_sides, 1);
+    let update = prepared.conditioning_diagnostics();
+    assert_eq!(update.prior_precision_nonzeros, 3);
+    assert_eq!(update.posterior_precision_nonzeros, 3);
+    assert_eq!(update.observation_terms.len(), 1);
+    assert_eq!(update.observation_terms[0].operator_rows, 2);
+    assert_eq!(update.observation_terms[0].operator_columns, 3);
+    assert_eq!(update.observation_terms[0].operator_nonzeros, 2);
+    assert_eq!(update.observation_terms[0].precision_update_nonzeros, 2);
     assert_vector_close(
         prepared.condition().unwrap().mean(),
         &[2.0 / 3.0, 0.0, -1.0 / 3.0],

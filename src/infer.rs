@@ -250,6 +250,23 @@ pub struct FactorizationDiagnostics {
     pub ordering: CholeskyOrderingKind,
 }
 
+/// Sparse-work diagnostics for one observation term in a prepared model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearObservationUpdateDiagnostics {
+    pub operator_rows: usize,
+    pub operator_columns: usize,
+    pub operator_nonzeros: usize,
+    pub precision_update_nonzeros: usize,
+}
+
+/// Sparse-work diagnostics for constructing a posterior precision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinearConditioningDiagnostics {
+    pub prior_precision_nonzeros: usize,
+    pub posterior_precision_nonzeros: usize,
+    pub observation_terms: Vec<LinearObservationUpdateDiagnostics>,
+}
+
 /// A Gaussian prior with a cached sparse factor for repeated uncertainty queries.
 pub struct FactoredGaussianPrior {
     posterior: Posterior,
@@ -275,6 +292,7 @@ pub struct PreparedLinearGaussianModel {
     default_values: Vec<Vec<f64>>,
     posterior_precision: SparseMatrix,
     posterior_factor: gmrf_core::types::SparseCholeskyFactor,
+    conditioning_diagnostics: LinearConditioningDiagnostics,
     public_precision: SparseMat,
     constraints: Option<(DenseMatrix, Vector)>,
     constraint_solver: Option<ConstrainedPrecisionSolver>,
@@ -307,6 +325,11 @@ impl PreparedLinearGaussianModel {
             fill_ratio: backend.fill_ratio.unwrap_or(0.0),
             ordering: backend.ordering,
         }
+    }
+
+    /// Sparse operator/update sizes used to construct the cached posterior.
+    pub fn conditioning_diagnostics(&self) -> &LinearConditioningDiagnostics {
+        &self.conditioning_diagnostics
     }
 
     /// Condition using the observation values originally supplied to the builder.
@@ -1272,6 +1295,21 @@ pub(crate) fn prepare_linear_model_with_resource_report(
         .map(|(matrix, _)| ConstrainedPrecisionSolver::new(&factored.posterior_precision, matrix))
         .transpose()?;
     let public_precision = sparse_mat(&factored.posterior_precision);
+    let conditioning_diagnostics = LinearConditioningDiagnostics {
+        prior_precision_nonzeros: factored.stats.prior_precision_nnz,
+        posterior_precision_nonzeros: factored.stats.posterior_precision_nnz,
+        observation_terms: factored
+            .stats
+            .terms
+            .iter()
+            .map(|term| LinearObservationUpdateDiagnostics {
+                operator_rows: term.operator_rows,
+                operator_columns: term.operator_cols,
+                operator_nonzeros: term.operator_nnz,
+                precision_update_nonzeros: term.precision_update_nnz,
+            })
+            .collect(),
+    };
     let derived = builder
         .derived
         .into_iter()
@@ -1290,6 +1328,7 @@ pub(crate) fn prepare_linear_model_with_resource_report(
             default_values,
             posterior_precision: factored.posterior_precision,
             posterior_factor: factored.posterior_factor,
+            conditioning_diagnostics,
             public_precision,
             constraints,
             constraint_solver,

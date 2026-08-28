@@ -17,7 +17,8 @@ pub use crate::hodge::{
 };
 pub use crate::infer::{
     CholeskyOrderingKind, DirectPhaseResourceUsage, FactoredGaussianPrior,
-    FactorizationDiagnostics, HutchinsonVarianceConfig, MonteCarloVarianceConfig, Posterior,
+    FactorizationDiagnostics, HutchinsonVarianceConfig, LinearConditioningDiagnostics,
+    LinearObservationUpdateDiagnostics, MonteCarloVarianceConfig, Posterior,
     PreparedLinearGaussianModel, ProbeDistribution, RepeatedSolveResourceUsage,
     ResourceMeasurement, SparseCholeskyDiagnostics, SparseDirectResourceReport,
     SparseDirectSolverKind, VarianceEstimate, VarianceEstimator, VarianceFloor, VarianceMethod,
