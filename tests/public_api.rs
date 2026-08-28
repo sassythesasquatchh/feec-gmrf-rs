@@ -574,6 +574,18 @@ fn identity_pde_system() -> LinearPdeSystem {
 }
 
 #[test]
+fn downstream_user_can_build_a_proper_pde_induced_prior() {
+    let system = identity_pde_system();
+    let prior = system
+        .pde_induced_prior(PdeResidualNoise::mass_weighted_l2_standard_deviation(0.5).unwrap())
+        .unwrap();
+
+    assert_eq!(prior.mean(), [0.0, 0.0]);
+    assert_eq!(prior.precision(), &SparseMat::diagonal(2, 4.0));
+    assert!(LinearPdeModelBuilder::new(prior, &system).is_ok());
+}
+
+#[test]
 fn full_space_constraints_account_for_prescribed_values() {
     let prior = GaussianPrior::new(vec![0.0; 3], SparseMat::diagonal(3, 1.0))
         .unwrap()

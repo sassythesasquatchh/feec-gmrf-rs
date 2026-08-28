@@ -10,7 +10,10 @@ use crate::prior::{GaussianPrior, MassInversePolicy, MaternPriorBuilder};
 use crate::{FeecGmrfError, Result};
 use common::linalg::nalgebra::Vector as FeecVector;
 use formoniq::problems::reduced_linear::ReducedLinearPdeAssembly;
-use gmrf_core::{Solver, Vector as GmrfVector};
+use gmrf_core::{
+    observation::{ht_precision_weighted_h, ht_precision_weighted_observations},
+    Solver, Vector as GmrfVector,
+};
 
 /// Boundary-reduced affine linear PDE residual `K z + bias`.
 #[derive(Debug, Clone)]
@@ -168,6 +171,15 @@ impl LinearPdeSystem {
     }
 
     /// Build a Matérn prior from this system's reduced FEEC operators.
+    ///
+    /// This convenience assumes that `assembly.operator` is the weak matrix of
+    /// a self-adjoint, non-negative elliptic generator compatible with
+    /// `assembly.state_mass`--for example, a reduced Hodge Laplacian or
+    /// Laplace--Beltrami operator. The builder then interprets it as `L` in
+    /// `L + kappa^2 M` and applies the Lindgren recurrence. Symmetry and
+    /// coercivity are modelling assumptions and are intentionally not checked
+    /// here; callers with a general PDE residual should use
+    /// [`Self::pde_induced_prior`] instead.
     pub fn matern_prior_builder(&self) -> Result<MaternPriorBuilder<'static>> {
         let (degree, complex_dimension) = self.form_space.ok_or_else(|| {
             FeecGmrfError::InvalidParameter(
@@ -193,6 +205,46 @@ impl LinearPdeSystem {
                 MassInversePolicy::Provided(feg_infer::sparse::feec_csr_to_core_triplet(inverse)),
             ),
         )
+    }
+
+    /// Construct the proper Gaussian prior induced by this affine PDE residual.
+    ///
+    /// For residual `r(z) = A z + c` and residual precision `W`, this uses
+    ///
+    /// `Q = A^T W A`,
+    ///
+    /// and centers the prior at the weighted least-squares solution of
+    /// `A z + c = 0`. For mass-weighted residual noise with standard deviation
+    /// `sigma`, `W = M^{-1} / sigma^2`.
+    ///
+    /// This construction is valid for nonsymmetric and rectangular PDE
+    /// operators, but the resulting prior is proper only when `A` has full
+    /// column rank in the `W` inner product. Rank-deficient systems are rejected
+    /// when the induced precision is factorized. Intrinsic PDE precisions require
+    /// an explicit constraint or regularization and are not represented by this
+    /// convenience constructor.
+    pub fn pde_induced_prior(&self, noise: PdeResidualNoise) -> Result<GaussianPrior> {
+        let residual_precision = self.residual_precision(noise)?;
+        let operator = feg_infer::sparse::feec_csr_to_gmrf(&self.assembly.operator);
+        let residual_precision = crate::infer::gmrf_sparse(&residual_precision);
+        let precision = ht_precision_weighted_h(&operator, &residual_precision);
+        let target_minus_bias = GmrfVector::from_iterator(
+            self.assembly.residual_dimension(),
+            self.assembly.residual_bias.iter().map(|value| -*value),
+        );
+        let canonical =
+            ht_precision_weighted_observations(&operator, &target_minus_bias, &residual_precision);
+        let mean = precision.cholesky_sqrt_lower()?.solve(&canonical)?;
+        let precision = feg_infer::sparse::gmrf_sparse_to_core_triplet(&precision);
+        let mut prior = GaussianPrior::new(mean.iter().copied().collect(), precision)?;
+        if let Some((degree, _)) = self.form_space {
+            prior = prior.with_form_degree(degree);
+        }
+        if self.has_boundary_reduction() {
+            prior.with_boundary_elimination(self.boundary_elimination()?)
+        } else {
+            Ok(prior)
+        }
     }
 
     /// Construct a zero-mean scalar-diagonal prior on active coefficients.
@@ -272,6 +324,24 @@ impl LinearPdeSystem {
         !self.assembly.layout.prescribed_dofs.is_empty()
             || self.assembly.layout.active_dofs.len() != self.assembly.layout.full_dimension
     }
+
+    fn residual_precision(&self, noise: PdeResidualNoise) -> Result<crate::operator::SparseMat> {
+        match noise {
+            PdeResidualNoise::MassWeightedL2StandardDeviation(sigma) => self
+                .assembly
+                .state_mass_inverse
+                .as_ref()
+                .ok_or_else(|| {
+                    FeecGmrfError::Unsupported(
+                        "mass-weighted PDE residual requires a state-mass inverse".to_string(),
+                    )
+                })
+                .map(|inverse| {
+                    feg_infer::sparse::feec_csr_to_core_triplet(inverse)
+                        .scaled(1.0 / (sigma * sigma))
+                }),
+        }
+    }
 }
 
 /// Deterministic solution in both active and full FEEC orderings.
@@ -291,7 +361,10 @@ impl DeterministicLinearPdeSolution {
     }
 }
 
-/// Noise model for a weak affine PDE residual observation.
+/// Mass-weighted noise model for an affine PDE residual.
+///
+/// The same residual model can be used as a weak PDE likelihood or to construct
+/// a proper [`LinearPdeSystem::pde_induced_prior`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PdeResidualNoise {
     MassWeightedL2StandardDeviation(f64),
@@ -358,22 +431,7 @@ impl<'a> LinearPdeModelBuilder<'a> {
     }
 
     pub fn observe_weak_residual(mut self, noise: PdeResidualNoise) -> Result<Self> {
-        let precision = match noise {
-            PdeResidualNoise::MassWeightedL2StandardDeviation(sigma) => self
-                .system
-                .assembly
-                .state_mass_inverse
-                .as_ref()
-                .ok_or_else(|| {
-                    FeecGmrfError::Unsupported(
-                        "mass-weighted PDE residual requires a state-mass inverse".to_string(),
-                    )
-                })
-                .map(|inverse| {
-                    feg_infer::sparse::feec_csr_to_core_triplet(inverse)
-                        .scaled(1.0 / (sigma * sigma))
-                })?,
-        };
+        let precision = self.system.residual_precision(noise)?;
         let residual = self
             .system
             .residual_quantity("__pde_residual_observation")?;
@@ -465,6 +523,79 @@ mod tests {
             .observe_weak_residual(
                 PdeResidualNoise::mass_weighted_l2_standard_deviation(0.1).unwrap(),
             );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pde_induced_prior_uses_normal_precision_and_affine_pde_center() {
+        let mut operator = CooMatrix::new(2, 2);
+        operator.push(0, 0, 1.0);
+        operator.push(0, 1, 2.0);
+        operator.push(1, 1, 3.0);
+        let operator = CsrMatrix::from(&operator);
+        let mut identity = CooMatrix::new(2, 2);
+        identity.push(0, 0, 1.0);
+        identity.push(1, 1, 1.0);
+        let identity = CsrMatrix::from(&identity);
+        let system = LinearPdeSystem::from_reduced_assembly(ReducedLinearPdeAssembly {
+            operator: operator.clone(),
+            residual_bias: Vector::from_vec(vec![-5.0, -6.0]),
+            state_mass: identity.clone(),
+            state_mass_inverse: Some(identity),
+            layout: DofLayout::identity(2),
+            forcing_operator: operator.clone(),
+            neumann_operator: operator,
+        })
+        .unwrap()
+        .with_form_space(1, 2)
+        .unwrap();
+
+        let prior = system
+            .pde_induced_prior(PdeResidualNoise::mass_weighted_l2_standard_deviation(0.5).unwrap())
+            .unwrap();
+
+        assert!((prior.mean()[0] - 1.0).abs() < 1.0e-12);
+        assert!((prior.mean()[1] - 2.0).abs() < 1.0e-12);
+        assert_eq!(
+            prior.precision().apply_checked(&[1.0, 0.0]).unwrap(),
+            [4.0, 8.0]
+        );
+        assert_eq!(
+            prior.precision().apply_checked(&[0.0, 1.0]).unwrap(),
+            [8.0, 52.0]
+        );
+        assert_eq!(prior.form_degree(), Some(FormDegree::new(1, 2).unwrap()));
+    }
+
+    #[test]
+    fn pde_induced_prior_rejects_missing_residual_riesz_inverse() {
+        let result = diagonal_system(false)
+            .pde_induced_prior(PdeResidualNoise::mass_weighted_l2_standard_deviation(1.0).unwrap());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pde_induced_prior_rejects_rank_deficient_operator() {
+        let mut operator = CooMatrix::new(2, 2);
+        operator.push(0, 0, 1.0);
+        let operator = CsrMatrix::from(&operator);
+        let mut identity = CooMatrix::new(2, 2);
+        identity.push(0, 0, 1.0);
+        identity.push(1, 1, 1.0);
+        let identity = CsrMatrix::from(&identity);
+        let system = LinearPdeSystem::from_reduced_assembly(ReducedLinearPdeAssembly {
+            operator: operator.clone(),
+            residual_bias: Vector::zeros(2),
+            state_mass: identity.clone(),
+            state_mass_inverse: Some(identity),
+            layout: DofLayout::identity(2),
+            forcing_operator: operator.clone(),
+            neumann_operator: operator,
+        })
+        .unwrap();
+
+        let result = system
+            .pde_induced_prior(PdeResidualNoise::mass_weighted_l2_standard_deviation(1.0).unwrap());
         assert!(result.is_err());
     }
 
