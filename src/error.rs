@@ -41,6 +41,15 @@ pub enum FeecGmrfError {
         "exact eliminated reference requires dimension {dimension}, exceeding configured maximum {maximum}"
     )]
     ExactReferenceSizeExceeded { dimension: usize, maximum: usize },
+    /// Sparse support constraints are not independent.
+    #[error("supported Gaussian constraints are not full row-rank")]
+    SupportedConstraintRank,
+    /// The ambient energy is not positive definite on its constrained support.
+    #[error("supported Gaussian energy is not positive definite on the support")]
+    SupportedEnergyNotPositive,
+    /// The certified supported Gaussian KKT equations could not be factored.
+    #[error("certified supported Gaussian KKT factorization failed")]
+    SupportedKktFactorization,
     /// A proper Gaussian API was asked to construct an intrinsic or improper law.
     #[error("intrinsic model is unsupported by this proper-prior API: {0}")]
     IntrinsicModelUnsupported(String),
@@ -60,7 +69,17 @@ pub enum FeecGmrfError {
 
 impl From<gmrf_core::GmrfError> for FeecGmrfError {
     fn from(value: gmrf_core::GmrfError) -> Self {
-        Self::Inference(value.to_string())
+        match value {
+            gmrf_core::GmrfError::RankDeficientSupportConstraints => Self::SupportedConstraintRank,
+            gmrf_core::GmrfError::NonPositiveSupportedEnergy => Self::SupportedEnergyNotPositive,
+            gmrf_core::GmrfError::SupportedKktFactorizationFailed => {
+                Self::SupportedKktFactorization
+            }
+            gmrf_core::GmrfError::UnsupportedQuery(message) => {
+                Self::Unsupported(message.to_string())
+            }
+            other => Self::Inference(other.to_string()),
+        }
     }
 }
 

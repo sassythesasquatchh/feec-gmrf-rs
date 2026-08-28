@@ -1,5 +1,7 @@
 //! Geometry-independent Gaussian prior construction.
 
+pub mod supported;
+
 use crate::boundary::{
     EliminatedLinearMap, EssentialBoundaryConditions, EssentialBoundaryElimination,
 };
@@ -174,6 +176,8 @@ impl LowerAdjointMassInversePolicy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MassInverseKind {
     ExactMaterialized,
+    /// The exact metric relation is retained as an auxiliary support constraint.
+    ConstrainedSupport,
     WhitneyProjected,
     RowSumLumped,
     Diagonal,
@@ -208,6 +212,8 @@ pub enum InverseUse {
 pub enum MaternRepresentation {
     /// Exact full-metric eliminated law, materialized for reference-sized systems.
     ExactEliminatedReference,
+    /// Exact law represented by a sparse energy on a constrained support.
+    ExactSupported,
     /// Existing compact Whitney law with at least one approximate metric role.
     WhitneyApproximateEliminated,
     /// A collapsed Hodge operator supplied by the caller.
@@ -743,33 +749,19 @@ impl ExactMaternPriorBuilder {
             maximum_materialized_dimension,
         } = self;
 
-        if let Some(incoming) = operators.incoming() {
-            enforce_materialization_limit(
-                incoming.lower().dimension(),
-                maximum_materialized_dimension,
-            )?;
+        let blocks = assemble_exact_matern_blocks(&operators, parameters.kappa)?;
+        if let Some(lower) = &blocks.lower {
+            enforce_materialization_limit(lower.mass.nrows(), maximum_materialized_dimension)?;
         }
         if parameters.alpha != MaternAlpha::One {
-            enforce_materialization_limit(
-                operators.state().dimension(),
-                maximum_materialized_dimension,
-            )?;
+            enforce_materialization_limit(blocks.mass.nrows(), maximum_materialized_dimension)?;
         }
 
-        let mass = operators.state().mass();
-        let mut system = mass.scaled(parameters.kappa.powi(2));
-        if let Some(outgoing) = operators.outgoing() {
-            let derivative = outgoing.active_derivative().matrix();
-            let weighted = multiply_sparse(outgoing.upper().mass(), derivative)?;
-            let upper_term = multiply_sparse(&derivative.transpose(), &weighted)?;
-            system = add_sparse(&system, &upper_term)?;
-        }
-        let lower_use = if let Some(incoming) = operators.incoming() {
-            let derivative = incoming.active_derivative().matrix();
-            let coupling = multiply_sparse(mass, derivative)?;
-            let lower_inverse = materialize_exact_mass_inverse(incoming.lower().mass())?;
-            let solved = multiply_sparse(&coupling, &lower_inverse)?;
-            let lower_term = multiply_sparse(&solved, &coupling.transpose())?;
+        let mut system = blocks.local_system.clone();
+        let lower_use = if let Some(lower) = &blocks.lower {
+            let lower_inverse = materialize_exact_mass_inverse(&lower.mass)?;
+            let solved = multiply_sparse(&lower.coupling, &lower_inverse)?;
+            let lower_term = multiply_sparse(&solved, &lower.coupling.transpose())?;
             system = add_sparse(&system, &lower_term)?;
             InverseUse::Applied(MassInverseKind::ExactMaterialized)
         } else {
@@ -780,59 +772,20 @@ impl ExactMaternPriorBuilder {
         let (precision, recurrence_use) = if parameters.alpha == MaternAlpha::One {
             (system.scaled(parameters.tau.powi(2)), InverseUse::NotUsed)
         } else {
-            let mass_inverse = materialize_exact_mass_inverse(mass)?;
+            let mass_inverse = materialize_exact_mass_inverse(&blocks.mass)?;
             (
                 matern_recurrence(&system, &mass_inverse, parameters.alpha, parameters.tau)?,
                 InverseUse::Applied(MassInverseKind::ExactMaterialized),
             )
         };
 
-        let layouts = AdjacentBoundaryLayouts::from_exact(&operators);
-        let boundary = match operators.boundary_domain() {
-            ExactBoundaryDomain::HomogeneousFullRelative => {
-                MaternBoundarySemantics::AssembledHomogeneousFullRelative {
-                    layouts: layouts.clone(),
-                }
-            }
-            ExactBoundaryDomain::UserSuppliedCompatibleSubcomplex { name } => {
-                MaternBoundarySemantics::UserSuppliedCompatibleSubcomplex {
-                    name: name.clone(),
-                    layouts: layouts.clone(),
-                }
-            }
-        };
-        let operator_source = match operators.provenance() {
-            FormOperatorProvenance::FeecWhitneyHomogeneousFullRelative => {
-                MaternOperatorSource::FeecWhitney
-            }
-            FormOperatorProvenance::UserSuppliedAdjacentOperators { label } => {
-                MaternOperatorSource::UserSuppliedAdjacent {
-                    label: label.clone(),
-                }
-            }
-        };
-        let adjacent_dimensions = [
-            operators
-                .incoming()
-                .map(|branch| branch.lower().dimension()),
-            Some(operators.state().dimension()),
-            operators
-                .outgoing()
-                .map(|branch| branch.upper().dimension()),
-        ];
-        let metadata = MaternPriorMetadata {
-            representation: MaternRepresentation::ExactEliminatedReference,
-            operator_source,
-            boundary,
-            form_degree: operators.degree(),
-            complex_dimension: operators.complex_dimension(),
-            adjacent_dimensions,
+        let metadata = exact_matern_metadata(
+            &operators,
             parameters,
-            lower_adjoint_inverse: lower_use,
-            recurrence_inverse: recurrence_use,
-            normalization: PriorNormalization::None,
-            post_construction_precision_scale: 1.0,
-        };
+            MaternRepresentation::ExactEliminatedReference,
+            lower_use,
+            recurrence_use,
+        );
 
         let state_layout = operators.state().boundary_layout().clone();
         let needs_elimination = state_layout.full_dimension() != operators.state().dimension()
@@ -846,6 +799,110 @@ impl ExactMaternPriorBuilder {
         } else {
             Ok(prior)
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ExactMaternLowerBlocks {
+    mass: SparseMat,
+    coupling: SparseMat,
+}
+
+#[derive(Debug, Clone)]
+struct ExactMaternBlocks {
+    mass: SparseMat,
+    local_system: SparseMat,
+    lower: Option<ExactMaternLowerBlocks>,
+}
+
+/// Assemble the one canonical set of local blocks shared by exact eliminated
+/// and exact supported Matérn representations.
+fn assemble_exact_matern_blocks(
+    operators: &ExactFormOperators,
+    kappa: f64,
+) -> Result<ExactMaternBlocks> {
+    if !kappa.is_finite() || kappa <= 0.0 {
+        return Err(FeecGmrfError::InvalidParameter(
+            "exact Matérn block assembly requires finite positive kappa".to_string(),
+        ));
+    }
+    let mass = operators.state().mass().clone();
+    let mut local_system = mass.scaled(kappa.powi(2));
+    if let Some(outgoing) = operators.outgoing() {
+        let derivative = outgoing.active_derivative().matrix();
+        let weighted = multiply_sparse(outgoing.upper().mass(), derivative)?;
+        let upper_term = multiply_sparse(&derivative.transpose(), &weighted)?;
+        local_system = add_sparse(&local_system, &upper_term)?;
+    }
+    let lower = operators
+        .incoming()
+        .map(|incoming| -> Result<ExactMaternLowerBlocks> {
+            Ok(ExactMaternLowerBlocks {
+                mass: incoming.lower().mass().clone(),
+                coupling: multiply_sparse(&mass, incoming.active_derivative().matrix())?,
+            })
+        })
+        .transpose()?;
+    Ok(ExactMaternBlocks {
+        mass,
+        local_system,
+        lower,
+    })
+}
+
+/// Describe the shared FEEC law independently of its eliminated or supported
+/// finite-dimensional representation.
+fn exact_matern_metadata(
+    operators: &ExactFormOperators,
+    parameters: MaternParameters,
+    representation: MaternRepresentation,
+    lower_adjoint_inverse: InverseUse,
+    recurrence_inverse: InverseUse,
+) -> MaternPriorMetadata {
+    let layouts = AdjacentBoundaryLayouts::from_exact(operators);
+    let boundary = match operators.boundary_domain() {
+        ExactBoundaryDomain::HomogeneousFullRelative => {
+            MaternBoundarySemantics::AssembledHomogeneousFullRelative {
+                layouts: layouts.clone(),
+            }
+        }
+        ExactBoundaryDomain::UserSuppliedCompatibleSubcomplex { name } => {
+            MaternBoundarySemantics::UserSuppliedCompatibleSubcomplex {
+                name: name.clone(),
+                layouts: layouts.clone(),
+            }
+        }
+    };
+    let operator_source = match operators.provenance() {
+        FormOperatorProvenance::FeecWhitneyHomogeneousFullRelative => {
+            MaternOperatorSource::FeecWhitney
+        }
+        FormOperatorProvenance::UserSuppliedAdjacentOperators { label } => {
+            MaternOperatorSource::UserSuppliedAdjacent {
+                label: label.clone(),
+            }
+        }
+    };
+    MaternPriorMetadata {
+        representation,
+        operator_source,
+        boundary,
+        form_degree: operators.degree(),
+        complex_dimension: operators.complex_dimension(),
+        adjacent_dimensions: [
+            operators
+                .incoming()
+                .map(|branch| branch.lower().dimension()),
+            Some(operators.state().dimension()),
+            operators
+                .outgoing()
+                .map(|branch| branch.upper().dimension()),
+        ],
+        parameters,
+        lower_adjoint_inverse,
+        recurrence_inverse,
+        normalization: PriorNormalization::None,
+        post_construction_precision_scale: 1.0,
     }
 }
 

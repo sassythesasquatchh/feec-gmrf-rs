@@ -42,6 +42,10 @@ pub use crate::physical::{
     magnetic_field_map, outward_boundary_flux_map_3d, reconstructed_barycenter_1form_map,
     scalar_field_l2_rms_weights, MagneticFieldMaps3d, PhysicalMap, PhysicalRmsCalibration,
 };
+pub use crate::prior::supported::{
+    SupportedMaternDiagnostics, SupportedMaternLayout, SupportedMaternPosterior,
+    SupportedMaternPrior, SupportedMaternPriorBuilder,
+};
 pub use crate::prior::{
     AdjacentBoundaryLayouts, ExactMaternPriorBuilder, GaussianPrior, InverseUse,
     LowerAdjointMassInversePolicy, MassInverseKind, MassInversePolicy, MaternAlpha,

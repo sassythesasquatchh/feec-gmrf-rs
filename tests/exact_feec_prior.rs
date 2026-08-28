@@ -208,3 +208,24 @@ fn exact_operator_bundle_rejects_a_noncomplex_pair() {
     )
     .is_err());
 }
+
+#[test]
+fn caller_supplied_operators_cannot_claim_feec_assembled_boundary_provenance() {
+    let state = FormSpaceMetric::new(
+        FormDegree::new(0, 0).unwrap(),
+        SparseMat::diagonal(1, 1.0),
+        BoundaryLayout::identity(1),
+    )
+    .unwrap();
+    assert!(matches!(
+        ExactFormOperators::new(
+            0,
+            state,
+            None,
+            None,
+            ExactBoundaryDomain::HomogeneousFullRelative,
+            "spoofed provenance"
+        ),
+        Err(FeecGmrfError::InvalidParameter(_))
+    ));
+}

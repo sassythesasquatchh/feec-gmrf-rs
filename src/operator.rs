@@ -495,6 +495,15 @@ impl ExactFormOperators {
         boundary_domain: ExactBoundaryDomain,
         provenance_label: impl Into<String>,
     ) -> Result<Self> {
+        if matches!(
+            boundary_domain,
+            ExactBoundaryDomain::HomogeneousFullRelative
+        ) {
+            return Err(FeecGmrfError::InvalidParameter(
+                "caller-supplied operators must use UserSuppliedCompatibleSubcomplex; only the FEEC constructor certifies HomogeneousFullRelative"
+                    .to_string(),
+            ));
+        }
         Self::validate_and_construct(
             complex_dimension,
             state,
