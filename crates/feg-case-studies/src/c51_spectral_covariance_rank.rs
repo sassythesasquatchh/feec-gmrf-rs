@@ -4,13 +4,26 @@
 //! One checked maximum mixed eigenbasis is shared across nested ranks, so every
 //! row is permanently ineligible for a performance comparison.
 
-use common::linalg::nalgebra::{CsrMatrix, Matrix};
+#[cfg(any(feature = "external-solvers", test))]
+use crate::c51_magnetic_sensor_design::{
+    held_out_kernels, primary_observation_kernels, selection_kernels,
+    C51_PRIMARY_SCALAR_OBSERVATION_COUNT,
+};
+#[cfg(any(feature = "external-solvers", test))]
+use common::linalg::nalgebra::CsrMatrix;
+use common::linalg::nalgebra::Matrix;
+#[cfg(feature = "external-solvers")]
 use feec_gmrf::prelude::{
-    AuditedSupportedCovariance, EssentialBoundaryElimination, ExactFormOperators,
-    ExactMaternPriorBuilder, FeecGmrfError, GaussianNoise, LinearGaussianModelBuilder, LinearMap,
-    LinearObservation, MagneticFieldMaps3d, MagneticVolumeSensorBank3d, MaternAlpha,
-    MaternParameters, Result, SparseMat, SupportedCovarianceSymmetryAudit,
-    SupportedMaternPriorBuilder, WendlandC2Kernel3d,
+    AuditedSupportedCovariance, ExactFormOperators, ExactMaternPriorBuilder,
+    LinearGaussianModelBuilder, LinearObservation, MagneticFieldMaps3d,
+    SupportedCovarianceSymmetryAudit, SupportedMaternPriorBuilder,
+};
+#[cfg(any(feature = "external-solvers", test))]
+use feec_gmrf::prelude::{
+    EssentialBoundaryElimination, LinearMap, MagneticVolumeSensorBank3d, SparseMat,
+};
+use feec_gmrf::prelude::{
+    FeecGmrfError, GaussianNoise, MaternAlpha, MaternParameters, Result, WendlandC2Kernel3d,
     INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION,
     INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT,
 };
@@ -19,7 +32,9 @@ use feec_gmrf::spectral::{
     partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative,
     PartialMixedGeneralizedEigenbasisDiagnostics, PartialMixedGeneralizedEigensolverOptions,
 };
+#[cfg(feature = "external-solvers")]
 use feg_gp::{EigenBasis, SpectralMaternConfig, SpectralMaternGp};
+#[cfg(feature = "external-solvers")]
 use manifold::gen::cartesian::CartesianMeshInfo;
 use std::collections::BTreeSet;
 use std::fmt::Display;
@@ -48,11 +63,6 @@ pub const C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10: &str = "rank-extension-v1-n10
 pub const C51_SPECTRAL_RANK_EXTENSION_RATIONALE: &str = "post-primary extension frozen after publication-discovery-v1 left corrected alpha=2 5%/2% decisions unresolved; it may resolve registered thresholds but may not support method timing";
 
 const OUTPUT_DIMENSION: usize = 9;
-const OBSERVATION_GRID_POINTS_PER_AXIS: usize = 6;
-const OBSERVATION_CANDIDATE_COUNT: usize = 3
-    * OBSERVATION_GRID_POINTS_PER_AXIS
-    * OBSERVATION_GRID_POINTS_PER_AXIS
-    * OBSERVATION_GRID_POINTS_PER_AXIS;
 const EXACT_VARIANCE_RELATIVE_FLOOR: f64 = 1.0e-12;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -347,10 +357,11 @@ impl C51CovarianceDesign {
         }
     }
 
+    #[cfg(any(feature = "external-solvers", test))]
     fn observation_count(self, state_dimension: usize) -> usize {
         match self {
             Self::Prior => 0,
-            Self::Fixed32 => 32.min(OBSERVATION_CANDIDATE_COUNT),
+            Self::Fixed32 => 32.min(C51_PRIMARY_SCALAR_OBSERVATION_COUNT),
             Self::Density020 => (0.02 * state_dimension as f64).ceil() as usize,
             Self::Density100 => (0.10 * state_dimension as f64).ceil() as usize,
         }
@@ -1322,7 +1333,7 @@ fn run_refinement(
     let candidates = MagneticVolumeSensorBank3d::from_feec(
         &topology,
         &coordinates,
-        &observation_kernels(config.observation_kernel_radius)?,
+        &primary_observation_kernels(config.observation_kernel_radius)?,
     )?;
     archive
         .sensor_banks
@@ -1859,27 +1870,7 @@ fn build_designs(
         .collect()
 }
 
-fn selection_kernels(radius: f64) -> Result<Vec<WendlandC2Kernel3d>> {
-    kernels_from_centers(
-        &[[0.25, 0.25, 0.25], [0.75, 0.25, 0.75], [0.25, 0.75, 0.75]],
-        radius,
-    )
-}
-
-fn held_out_kernels(radius: f64) -> Result<Vec<WendlandC2Kernel3d>> {
-    kernels_from_centers(
-        &[[0.75, 0.75, 0.25], [0.25, 0.25, 0.75], [0.75, 0.25, 0.25]],
-        radius,
-    )
-}
-
-fn kernels_from_centers(centers: &[[f64; 3]], radius: f64) -> Result<Vec<WendlandC2Kernel3d>> {
-    centers
-        .iter()
-        .map(|center| WendlandC2Kernel3d::new(*center, radius))
-        .collect()
-}
-
+#[cfg(any(feature = "external-solvers", test))]
 fn sensor_bank_audit(
     refinement: usize,
     bank: &'static str,
@@ -1940,47 +1931,7 @@ fn sensor_bank_audit(
     })
 }
 
-fn observation_kernels(radius: f64) -> Result<Vec<WendlandC2Kernel3d>> {
-    let count = OBSERVATION_GRID_POINTS_PER_AXIS;
-    let spacing = (1.0 - 2.0 * radius) / (count - 1) as f64;
-    let mut remaining = (0..count)
-        .flat_map(|i| {
-            (0..count).flat_map(move |j| {
-                (0..count).map(move |k| {
-                    [
-                        radius + i as f64 * spacing,
-                        radius + j as f64 * spacing,
-                        radius + k as f64 * spacing,
-                    ]
-                })
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut ordered = Vec::<[f64; 3]>::with_capacity(remaining.len());
-    let first = remaining
-        .iter()
-        .enumerate()
-        .min_by(|(_, left), (_, right)| {
-            distance_squared(**left, [0.5; 3]).total_cmp(&distance_squared(**right, [0.5; 3]))
-        })
-        .map(|(index, _)| index)
-        .ok_or_else(|| invalid("C51 observation candidate grid is empty"))?;
-    ordered.push(remaining.swap_remove(first));
-    while !remaining.is_empty() {
-        let next = remaining
-            .iter()
-            .enumerate()
-            .max_by(|(_, left), (_, right)| {
-                nearest_distance_squared(**left, &ordered)
-                    .total_cmp(&nearest_distance_squared(**right, &ordered))
-            })
-            .map(|(index, _)| index)
-            .expect("nonempty candidate set has a farthest point");
-        ordered.push(remaining.swap_remove(next));
-    }
-    kernels_from_centers(&ordered, radius)
-}
-
+#[cfg(any(feature = "external-solvers", test))]
 fn distance_squared(left: [f64; 3], right: [f64; 3]) -> f64 {
     left.into_iter()
         .zip(right)
@@ -1988,13 +1939,7 @@ fn distance_squared(left: [f64; 3], right: [f64; 3]) -> f64 {
         .sum()
 }
 
-fn nearest_distance_squared(point: [f64; 3], selected: &[[f64; 3]]) -> f64 {
-    selected
-        .iter()
-        .map(|selected| distance_squared(point, *selected))
-        .fold(f64::INFINITY, f64::min)
-}
-
+#[cfg(any(feature = "external-solvers", test))]
 fn eliminate_homogeneous_map(
     elimination: &EssentialBoundaryElimination,
     map: &LinearMap,
@@ -2004,10 +1949,12 @@ fn eliminate_homogeneous_map(
         .map(|eliminated| eliminated.reduced().clone())
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn to_csr(map: &LinearMap) -> CsrMatrix {
     feg_infer::sparse::core_triplet_to_feec_csr(map.matrix())
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn latent_mass_probes(mass: &SparseMat) -> Result<[Vec<f64>; 2]> {
     let dimension = mass.nrows();
     if dimension == 0 || mass.ncols() != dimension {
@@ -2038,6 +1985,7 @@ fn latent_mass_probes(mass: &SparseMat) -> Result<[Vec<f64>; 2]> {
     Ok([first, second])
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn normalize_mass_vector(mass: &SparseMat, mut vector: Vec<f64>) -> Result<Vec<f64>> {
     let norm = mass_inner_product(mass, &vector, &vector)?.sqrt();
     if !norm.is_finite() || norm <= 0.0 {
@@ -2051,6 +1999,7 @@ fn normalize_mass_vector(mass: &SparseMat, mut vector: Vec<f64>) -> Result<Vec<f
     Ok(vector)
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn mass_inner_product(mass: &SparseMat, left: &[f64], right: &[f64]) -> Result<f64> {
     if left.len() != mass.nrows() || right.len() != mass.ncols() {
         return Err(FeecGmrfError::Dimension(
@@ -2071,10 +2020,12 @@ fn mass_inner_product(mass: &SparseMat, left: &[f64], right: &[f64]) -> Result<f
     Ok(value)
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn mass_apply(mass: &SparseMat, input: &[f64]) -> Result<Vec<f64>> {
     mass.apply_checked(input).map_err(FeecGmrfError::Dimension)
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn latent_action_errors(
     mass: &SparseMat,
     approximation: &[Vec<f64>],
@@ -2353,6 +2304,7 @@ fn successful_basis_attempt(
     }
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn append_censored_rows(
     archive: &mut C51SpectralCovarianceRankArchive,
     config: &C51SpectralCovarianceRankConfig,
@@ -2374,6 +2326,7 @@ fn append_censored_rows(
     }
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn append_censored_alpha_rows(
     archive: &mut C51SpectralCovarianceRankArchive,
     config: &C51SpectralCovarianceRankConfig,
@@ -2396,6 +2349,7 @@ fn append_censored_alpha_rows(
     }
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn append_censored_rank_rows(
     archive: &mut C51SpectralCovarianceRankArchive,
     refinement: usize,
@@ -2422,6 +2376,7 @@ fn append_censored_rank_rows(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(feature = "external-solvers", test))]
 fn append_censored_design_row(
     archive: &mut C51SpectralCovarianceRankArchive,
     refinement: usize,
@@ -2631,6 +2586,7 @@ fn write_yaml_usize_option(
     }
 }
 
+#[cfg(any(feature = "external-solvers", test))]
 fn spectral_error(error: impl Display) -> FeecGmrfError {
     FeecGmrfError::Inference(format!("C51 spectral covariance error: {error}"))
 }
@@ -2781,8 +2737,8 @@ mod tests {
 
     #[test]
     fn observation_candidates_are_fixed_stratified_and_sufficient_for_n10() {
-        let kernels = observation_kernels(0.16).unwrap();
-        assert_eq!(kernels.len() * 3, OBSERVATION_CANDIDATE_COUNT);
+        let kernels = primary_observation_kernels(0.16).unwrap();
+        assert_eq!(kernels.len() * 3, C51_PRIMARY_SCALAR_OBSERVATION_COUNT);
         assert!(C51CovarianceDesign::Density100.observation_count(6_130) <= kernels.len() * 3);
         let centers = kernels
             .iter()
