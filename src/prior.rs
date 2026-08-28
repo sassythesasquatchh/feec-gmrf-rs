@@ -3,7 +3,10 @@
 use crate::boundary::{
     EliminatedLinearMap, EssentialBoundaryConditions, EssentialBoundaryElimination,
 };
-use crate::operator::{add_sparse, FormDegree, FormOperators, LinearMap, SparseMat};
+use crate::operator::{
+    add_sparse, multiply_sparse, ExactBoundaryDomain, ExactFormOperators, FormDegree,
+    FormOperatorProvenance, FormOperators, LinearMap, SparseMat,
+};
 use crate::{FeecGmrfError, Result};
 pub use feg_core::MaternAlpha;
 use feg_core::SparseTriplet;
@@ -203,6 +206,8 @@ pub enum InverseUse {
 /// Finite-dimensional representation constructed by a Matérn builder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MaternRepresentation {
+    /// Exact full-metric eliminated law, materialized for reference-sized systems.
+    ExactEliminatedReference,
     /// Existing compact Whitney law with at least one approximate metric role.
     WhitneyApproximateEliminated,
     /// A collapsed Hodge operator supplied by the caller.
@@ -210,10 +215,45 @@ pub enum MaternRepresentation {
 }
 
 /// Origin of the operators used to construct a Matérn prior.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MaternOperatorSource {
     FeecWhitney,
+    UserSuppliedAdjacent { label: String },
     UserSuppliedCollapsed,
+}
+
+/// Boundary layouts for the lower, state, and upper spaces of one FEEC law.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AdjacentBoundaryLayouts {
+    lower: Option<crate::operator::BoundaryLayout>,
+    state: crate::operator::BoundaryLayout,
+    upper: Option<crate::operator::BoundaryLayout>,
+}
+
+impl AdjacentBoundaryLayouts {
+    fn from_exact(operators: &ExactFormOperators) -> Self {
+        Self {
+            lower: operators
+                .incoming()
+                .map(|branch| branch.lower().boundary_layout().clone()),
+            state: operators.state().boundary_layout().clone(),
+            upper: operators
+                .outgoing()
+                .map(|branch| branch.upper().boundary_layout().clone()),
+        }
+    }
+
+    pub fn lower(&self) -> Option<&crate::operator::BoundaryLayout> {
+        self.lower.as_ref()
+    }
+
+    pub fn state(&self) -> &crate::operator::BoundaryLayout {
+        &self.state
+    }
+
+    pub fn upper(&self) -> Option<&crate::operator::BoundaryLayout> {
+        self.upper.as_ref()
+    }
 }
 
 /// Boundary operation applied during or after Matérn construction.
@@ -221,6 +261,9 @@ pub enum MaternOperatorSource {
 pub enum MaternBoundarySemantics {
     /// No essential coefficients were removed from the supplied discrete space.
     UnrestrictedDiscreteComplex,
+    /// Adjacent spaces were assembled together on the homogeneous
+    /// full-relative FEEC subcomplex before either inverse was formed.
+    AssembledHomogeneousFullRelative { layouts: AdjacentBoundaryLayouts },
     /// An already collapsed operator was principally reduced before recurrence.
     PrincipalRestrictedCollapsedOperator {
         state_layout: crate::operator::BoundaryLayout,
@@ -229,7 +272,12 @@ pub enum MaternBoundarySemantics {
     ConditionedCompletedDiscreteLaw {
         state_layout: crate::operator::BoundaryLayout,
     },
-    /// The caller supplied an already reduced collapsed operator bundle.
+    /// A downstream caller supplied a compatible adjacent boundary subcomplex.
+    UserSuppliedCompatibleSubcomplex {
+        name: String,
+        layouts: AdjacentBoundaryLayouts,
+    },
+    /// The caller supplied an already reduced opaque collapsed operator bundle.
     UserSuppliedReducedCollapsedOperator {
         state_layout: crate::operator::BoundaryLayout,
     },
@@ -243,6 +291,7 @@ pub struct MaternPriorMetadata {
     boundary: MaternBoundarySemantics,
     form_degree: FormDegree,
     complex_dimension: usize,
+    adjacent_dimensions: [Option<usize>; 3],
     parameters: MaternParameters,
     lower_adjoint_inverse: InverseUse,
     recurrence_inverse: InverseUse,
@@ -255,8 +304,8 @@ impl MaternPriorMetadata {
         self.representation
     }
 
-    pub fn operator_source(&self) -> MaternOperatorSource {
-        self.operator_source
+    pub fn operator_source(&self) -> &MaternOperatorSource {
+        &self.operator_source
     }
 
     pub fn boundary(&self) -> &MaternBoundarySemantics {
@@ -269,6 +318,12 @@ impl MaternPriorMetadata {
 
     pub fn complex_dimension(&self) -> usize {
         self.complex_dimension
+    }
+
+    /// `[lower, state, upper]` active dimensions when the source exposes them.
+    /// Opaque collapsed sources report only the state dimension.
+    pub fn adjacent_dimensions(&self) -> [Option<usize>; 3] {
+        self.adjacent_dimensions
     }
 
     pub fn parameters(&self) -> MaternParameters {
@@ -626,6 +681,191 @@ impl GaussianPrior {
     }
 }
 
+/// Small-system constructor for the exact full-metric eliminated FEEC law.
+///
+/// Every required inverse is materialized without dropping entries. This is a
+/// reference implementation for theorem checks and comparator runs, not the
+/// scalable constrained representation.
+pub struct ExactMaternPriorBuilder {
+    operators: ExactFormOperators,
+    parameters: MaternParameters,
+    maximum_materialized_dimension: usize,
+}
+
+impl ExactMaternPriorBuilder {
+    const DEFAULT_MAXIMUM_MATERIALIZED_DIMENSION: usize = 1024;
+
+    /// Build from caller-supplied adjacent masses, derivatives, and layouts.
+    pub fn from_operators(operators: ExactFormOperators) -> Self {
+        Self {
+            operators,
+            parameters: MaternParameters::default(),
+            maximum_materialized_dimension: Self::DEFAULT_MAXIMUM_MATERIALIZED_DIMENSION,
+        }
+    }
+
+    /// Assemble compatible lowest-order Whitney spaces on the homogeneous
+    /// full-relative subcomplex before either inverse is formed.
+    pub fn from_feec_homogeneous_full_relative(
+        topology: &Complex,
+        metric: &MeshLengths,
+        degree: usize,
+    ) -> Result<Self> {
+        Ok(Self::from_operators(
+            ExactFormOperators::from_feec_homogeneous_full_relative(topology, metric, degree)?,
+        ))
+    }
+
+    /// Set direct `alpha`, `kappa`, and `tau` parameters.
+    pub fn parameters(mut self, parameters: MaternParameters) -> Self {
+        self.parameters = parameters;
+        self
+    }
+
+    /// Change the resource guard for each dense inverse that may be materialized.
+    ///
+    /// Raising this limit changes resource exposure, not the represented law.
+    pub fn maximum_materialized_dimension(mut self, maximum: usize) -> Result<Self> {
+        if maximum == 0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "maximum materialized dimension must be positive".to_string(),
+            ));
+        }
+        self.maximum_materialized_dimension = maximum;
+        Ok(self)
+    }
+
+    /// Assemble the centered exact eliminated precision.
+    pub fn build(self) -> Result<GaussianPrior> {
+        let Self {
+            operators,
+            parameters,
+            maximum_materialized_dimension,
+        } = self;
+
+        if let Some(incoming) = operators.incoming() {
+            enforce_materialization_limit(
+                incoming.lower().dimension(),
+                maximum_materialized_dimension,
+            )?;
+        }
+        if parameters.alpha != MaternAlpha::One {
+            enforce_materialization_limit(
+                operators.state().dimension(),
+                maximum_materialized_dimension,
+            )?;
+        }
+
+        let mass = operators.state().mass();
+        let mut system = mass.scaled(parameters.kappa.powi(2));
+        if let Some(outgoing) = operators.outgoing() {
+            let derivative = outgoing.active_derivative().matrix();
+            let weighted = multiply_sparse(outgoing.upper().mass(), derivative)?;
+            let upper_term = multiply_sparse(&derivative.transpose(), &weighted)?;
+            system = add_sparse(&system, &upper_term)?;
+        }
+        let lower_use = if let Some(incoming) = operators.incoming() {
+            let derivative = incoming.active_derivative().matrix();
+            let coupling = multiply_sparse(mass, derivative)?;
+            let lower_inverse = materialize_exact_mass_inverse(incoming.lower().mass())?;
+            let solved = multiply_sparse(&coupling, &lower_inverse)?;
+            let lower_term = multiply_sparse(&solved, &coupling.transpose())?;
+            system = add_sparse(&system, &lower_term)?;
+            InverseUse::Applied(MassInverseKind::ExactMaterialized)
+        } else {
+            InverseUse::NotApplicable
+        };
+        let system = crate::operator::validate_proper_precision("exact Matérn system", system)?;
+
+        let (precision, recurrence_use) = if parameters.alpha == MaternAlpha::One {
+            (system.scaled(parameters.tau.powi(2)), InverseUse::NotUsed)
+        } else {
+            let mass_inverse = materialize_exact_mass_inverse(mass)?;
+            (
+                matern_recurrence(&system, &mass_inverse, parameters.alpha, parameters.tau)?,
+                InverseUse::Applied(MassInverseKind::ExactMaterialized),
+            )
+        };
+
+        let layouts = AdjacentBoundaryLayouts::from_exact(&operators);
+        let boundary = match operators.boundary_domain() {
+            ExactBoundaryDomain::HomogeneousFullRelative => {
+                MaternBoundarySemantics::AssembledHomogeneousFullRelative {
+                    layouts: layouts.clone(),
+                }
+            }
+            ExactBoundaryDomain::UserSuppliedCompatibleSubcomplex { name } => {
+                MaternBoundarySemantics::UserSuppliedCompatibleSubcomplex {
+                    name: name.clone(),
+                    layouts: layouts.clone(),
+                }
+            }
+        };
+        let operator_source = match operators.provenance() {
+            FormOperatorProvenance::FeecWhitneyHomogeneousFullRelative => {
+                MaternOperatorSource::FeecWhitney
+            }
+            FormOperatorProvenance::UserSuppliedAdjacentOperators { label } => {
+                MaternOperatorSource::UserSuppliedAdjacent {
+                    label: label.clone(),
+                }
+            }
+        };
+        let adjacent_dimensions = [
+            operators
+                .incoming()
+                .map(|branch| branch.lower().dimension()),
+            Some(operators.state().dimension()),
+            operators
+                .outgoing()
+                .map(|branch| branch.upper().dimension()),
+        ];
+        let metadata = MaternPriorMetadata {
+            representation: MaternRepresentation::ExactEliminatedReference,
+            operator_source,
+            boundary,
+            form_degree: operators.degree(),
+            complex_dimension: operators.complex_dimension(),
+            adjacent_dimensions,
+            parameters,
+            lower_adjoint_inverse: lower_use,
+            recurrence_inverse: recurrence_use,
+            normalization: PriorNormalization::None,
+            post_construction_precision_scale: 1.0,
+        };
+
+        let state_layout = operators.state().boundary_layout().clone();
+        let needs_elimination = state_layout.full_dimension() != operators.state().dimension()
+            || !state_layout.fixed_dofs().is_empty();
+        let prior = GaussianPrior::new(vec![0.0; operators.state().dimension()], precision)?
+            .with_form_degree(operators.degree())
+            .with_matern_metadata(metadata);
+        if needs_elimination {
+            prior
+                .with_boundary_elimination(EssentialBoundaryElimination::from_layout(state_layout)?)
+        } else {
+            Ok(prior)
+        }
+    }
+}
+
+fn enforce_materialization_limit(dimension: usize, maximum: usize) -> Result<()> {
+    if dimension > maximum {
+        return Err(FeecGmrfError::ExactReferenceSizeExceeded { dimension, maximum });
+    }
+    Ok(())
+}
+
+fn materialize_exact_mass_inverse(mass: &SparseMat) -> Result<SparseMat> {
+    if mass.nrows() == 0 && mass.ncols() == 0 {
+        return Ok(SparseMat::new(0, 0));
+    }
+    let mass = feg_infer::sparse::core_triplet_to_feec_csr(mass);
+    let inverse = feg_infer::prior::matern::generic::build_exact_dense_mass_inverse(&mass)
+        .map_err(FeecGmrfError::Assembly)?;
+    Ok(feg_infer::sparse::feec_csr_to_core_triplet(&inverse))
+}
+
 enum MaternSource<'a> {
     Operators(Box<FormOperators>),
     Feec {
@@ -954,6 +1194,7 @@ impl<'a> MaternPriorBuilder<'a> {
             boundary: boundary_semantics,
             form_degree: operators.degree(),
             complex_dimension: operators.complex_dimension(),
+            adjacent_dimensions: [None, Some(operators.dimension()), None],
             parameters,
             lower_adjoint_inverse: lower_use,
             recurrence_inverse: recurrence_use,

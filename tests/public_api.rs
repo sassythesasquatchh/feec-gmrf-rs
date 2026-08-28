@@ -131,7 +131,7 @@ fn whitney_matern_metadata_records_both_inverse_roles_independently() {
     );
     assert_eq!(
         metadata.operator_source(),
-        MaternOperatorSource::FeecWhitney
+        &MaternOperatorSource::FeecWhitney
     );
     assert_eq!(
         metadata.lower_adjoint_inverse(),

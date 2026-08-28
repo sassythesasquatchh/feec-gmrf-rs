@@ -32,7 +32,9 @@ pub use crate::model::{
     LinearObservation, LinearObservationRow,
 };
 pub use crate::operator::{
-    sparse_mat_from_feec_csr, BoundaryLayout, FormDegree, FormOperators, LinearMap, SparseMat,
+    sparse_mat_from_feec_csr, BoundaryLayout, ExactBoundaryDomain, ExactFormOperators, FormDegree,
+    FormOperatorProvenance, FormOperators, FormSpaceMetric, IncomingFormOperator, LinearMap,
+    OutgoingFormOperator, SparseMat,
 };
 pub use crate::physical::{
     calibrate_prior_to_physical_rms, calibrate_prior_to_physical_rms_with_method,
@@ -41,10 +43,11 @@ pub use crate::physical::{
     scalar_field_l2_rms_weights, MagneticFieldMaps3d, PhysicalMap, PhysicalRmsCalibration,
 };
 pub use crate::prior::{
-    GaussianPrior, InverseUse, LowerAdjointMassInversePolicy, MassInverseKind, MassInversePolicy,
-    MaternAlpha, MaternBoundarySemantics, MaternOperatorSource, MaternParameterConvention,
-    MaternParameters, MaternPriorBuilder, MaternPriorMetadata, MaternRepresentation,
-    PriorMahalanobisCalibration, PriorNormalization, RecurrenceMassInversePolicy,
+    AdjacentBoundaryLayouts, ExactMaternPriorBuilder, GaussianPrior, InverseUse,
+    LowerAdjointMassInversePolicy, MassInverseKind, MassInversePolicy, MaternAlpha,
+    MaternBoundarySemantics, MaternOperatorSource, MaternParameterConvention, MaternParameters,
+    MaternPriorBuilder, MaternPriorMetadata, MaternRepresentation, PriorMahalanobisCalibration,
+    PriorNormalization, RecurrenceMassInversePolicy,
 };
 pub use crate::report::{
     write_console_report, write_csv, write_csv_directory, CochainVtuBuilder, ConsoleReportOptions,

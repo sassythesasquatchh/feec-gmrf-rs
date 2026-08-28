@@ -36,6 +36,11 @@ pub enum FeecGmrfError {
         matrix: &'static str,
         reason: String,
     },
+    /// A deliberately materialized exact reference exceeded its configured guard.
+    #[error(
+        "exact eliminated reference requires dimension {dimension}, exceeding configured maximum {maximum}"
+    )]
+    ExactReferenceSizeExceeded { dimension: usize, maximum: usize },
     /// A proper Gaussian API was asked to construct an intrinsic or improper law.
     #[error("intrinsic model is unsupported by this proper-prior API: {0}")]
     IntrinsicModelUnsupported(String),
