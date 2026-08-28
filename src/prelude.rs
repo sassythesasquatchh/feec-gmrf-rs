@@ -47,8 +47,8 @@ pub use crate::physical::{
     scalar_field_l2_rms_weights, MagneticFieldMaps3d, PhysicalMap, PhysicalRmsCalibration,
 };
 pub use crate::prior::supported::{
-    SupportedMaternDiagnostics, SupportedMaternLayout, SupportedMaternPosterior,
-    SupportedMaternPrior, SupportedMaternPriorBuilder,
+    PreparedSupportedMaternModel, SupportedMaternDiagnostics, SupportedMaternLayout,
+    SupportedMaternPosterior, SupportedMaternPrior, SupportedMaternPriorBuilder,
 };
 pub use crate::prior::{
     AdjacentBoundaryLayouts, AdjacentMaternPriorBuilder, EliminatedMassInversePolicy,

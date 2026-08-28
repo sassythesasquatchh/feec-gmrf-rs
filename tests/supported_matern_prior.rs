@@ -179,7 +179,9 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
             .unwrap()
             .condition()
             .unwrap();
-        let supported_observed = supported.condition(&[observation], &[]).unwrap();
+        let supported_observed = supported
+            .condition(std::slice::from_ref(&observation), &[])
+            .unwrap();
         assert_vector_close(
             supported_observed.mean(),
             exact_observed.mean(),
@@ -191,6 +193,39 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
                 .pushforward_covariance(&LinearMap::identity(2))
                 .unwrap(),
             &format!("alpha {alpha:?} observed covariance"),
+        );
+
+        let prepared_supported = supported.prepare(&[observation], &[]).unwrap();
+        assert_eq!(prepared_supported.observation_row_counts(), [1]);
+        assert_vector_close(
+            prepared_supported.condition().unwrap().mean(),
+            supported_observed.mean(),
+            &format!("alpha {alpha:?} prepared default mean"),
+        );
+        let replacement_values = vec![vec![-0.35]];
+        let replacement_observation = LinearObservation::new(
+            LinearMap::weighted_row(2, &[(0, 1.0), (1, -0.5)]).unwrap(),
+            replacement_values[0].clone(),
+            GaussianNoise::variance(0.6).unwrap(),
+        )
+        .unwrap();
+        let direct_replacement = supported
+            .condition(&[replacement_observation], &[])
+            .unwrap();
+        assert_vector_close(
+            &prepared_supported
+                .latent_mean_with_observation_values(&replacement_values)
+                .unwrap(),
+            direct_replacement.mean(),
+            &format!("alpha {alpha:?} prepared replacement mean"),
+        );
+        assert_vector_close(
+            prepared_supported
+                .condition_with_observation_values(&replacement_values)
+                .unwrap()
+                .mean(),
+            direct_replacement.mean(),
+            &format!("alpha {alpha:?} prepared replacement posterior"),
         );
 
         let constrained_observation = LinearObservation::new(

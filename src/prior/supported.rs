@@ -13,9 +13,10 @@ use crate::operator::{BoundaryLayout, ExactFormOperators, FormDegree, LinearMap,
 use crate::{FeecGmrfError, Result};
 use feg_core::SparseTriplet;
 use gmrf_core::{
-    linear_observation_update, LinearObservationTerm, SelectedCoordinates,
-    SparseCholeskyDiagnostics, SparseRowOperator, SupportedGaussianCertificateResiduals,
-    SupportedGaussianFactor, SupportedGaussianSystem, Vector,
+    ht_precision_weighted_observations, ht_weighted_observations, linear_observation_update,
+    LinearObservationTerm, SelectedCoordinates, SparseCholeskyDiagnostics, SparseMatrix,
+    SparseRowOperator, SupportedGaussianCertificateResiduals, SupportedGaussianFactor,
+    SupportedGaussianSystem, Vector,
 };
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 use std::ops::Range;
@@ -181,9 +182,22 @@ impl SupportedMaternPrior {
         observations: &[LinearObservation],
         constraints: &[LinearConstraint],
     ) -> Result<SupportedMaternPosterior> {
+        self.prepare(observations, constraints)?.condition()
+    }
+
+    /// Prepare a fixed observation/constraint design for repeated data vectors.
+    ///
+    /// Observation operators, noise, support constraints, and the indefinite
+    /// KKT factor are reused. Replacement data change only the information
+    /// vector and selected mean solve.
+    pub fn prepare(
+        &self,
+        observations: &[LinearObservation],
+        constraints: &[LinearConstraint],
+    ) -> Result<PreparedSupportedMaternModel> {
         let ambient_dimension = self.layout.ambient_dimension;
         let mut energy = self.system.energy().clone();
-        let mut information = Vector::zeros(ambient_dimension);
+        let mut prepared_observations = Vec::with_capacity(observations.len());
         for observation in observations {
             let eliminated = resolve_state_map(
                 &self.state_layout,
@@ -195,27 +209,44 @@ impl SupportedMaternPrior {
             let matrix = feg_infer::sparse::core_triplet_to_gmrf(&ambient_map);
             let values = Vector::from_vec(observation.values.clone());
             let bias = Vector::from_vec(eliminated.fixed_offset().to_vec());
-            let (update, update_information) = match &observation.noise {
+            let (update, _, noise) = match &observation.noise {
                 GaussianNoise::ScalarVariance(variance) => {
-                    linear_observation_update(&LinearObservationTerm::scalar_variance(
-                        &matrix,
-                        &values,
-                        Some(&bias),
-                        *variance,
-                    ))
+                    let (update, information) =
+                        linear_observation_update(&LinearObservationTerm::scalar_variance(
+                            &matrix,
+                            &values,
+                            Some(&bias),
+                            *variance,
+                        ));
+                    (
+                        update,
+                        information,
+                        PreparedSupportedNoise::ScalarVariance(*variance),
+                    )
                 }
                 GaussianNoise::Precision(precision) => {
                     let precision = feg_infer::sparse::core_triplet_to_gmrf(precision);
-                    linear_observation_update(&LinearObservationTerm::precision(
-                        &matrix,
-                        &values,
-                        Some(&bias),
-                        &precision,
-                    ))
+                    let (update, information) =
+                        linear_observation_update(&LinearObservationTerm::precision(
+                            &matrix,
+                            &values,
+                            Some(&bias),
+                            &precision,
+                        ));
+                    (
+                        update,
+                        information,
+                        PreparedSupportedNoise::Precision(precision),
+                    )
                 }
             };
             energy = gmrf_core::add_sparse(&energy, &update);
-            information += update_information;
+            prepared_observations.push(PreparedSupportedObservation {
+                matrix,
+                bias,
+                default_values: observation.values.clone(),
+                noise,
+            });
         }
 
         let (support_constraints, affine_rhs) = append_state_constraints(
@@ -230,12 +261,18 @@ impl SupportedMaternPrior {
             SupportedGaussianSystem::new_affine(energy, support_constraints, affine_rhs)?;
         let energy_nnz = posterior_system.energy().nnz();
         let constraint_nnz = posterior_system.constraints().nnz();
-        self.finish_factorization(
-            posterior_system.factorize()?,
-            information,
-            energy_nnz,
-            constraint_nnz,
-        )
+        let factor = posterior_system.factorize()?;
+        let selection = SelectedCoordinates::prefix(ambient_dimension, self.state_dimension())?;
+        let diagnostics = supported_matern_diagnostics(&factor, energy_nnz, constraint_nnz);
+        Ok(PreparedSupportedMaternModel {
+            factor,
+            selection,
+            observations: prepared_observations,
+            state_layout: self.state_layout.clone(),
+            form_degree: self.form_degree,
+            metadata: self.metadata.clone(),
+            diagnostics,
+        })
     }
 
     fn finish_factorization(
@@ -248,22 +285,7 @@ impl SupportedMaternPrior {
         let ambient_dimension = factor.ambient_dim();
         let selection = SelectedCoordinates::prefix(ambient_dimension, self.state_dimension())?;
         let mean = factor.selected_mean(&selection, &information)?;
-        let certificate = factor.certificate();
-        let constraint_gram_factor = certificate.constraint_gram_factor_diagnostics();
-        let supported_energy_factor = certificate.supported_energy_factor_diagnostics();
-        let diagnostics = SupportedMaternDiagnostics {
-            ambient_dimension,
-            support_dimension: factor.support_dim(),
-            constraint_dimension: factor.constraint_dim(),
-            ambient_energy_nnz: energy_nnz,
-            constraint_nnz,
-            constraint_gram_factor_nnz: certificate.constraint_gram_factor_nnz(),
-            supported_energy_factor_nnz: certificate.supported_energy_factor_nnz(),
-            constraint_gram_factor,
-            supported_energy_factor,
-            kkt_nnz: factor.kkt_nnz(),
-            certificate_residuals: certificate.residuals(),
-        };
+        let diagnostics = supported_matern_diagnostics(&factor, energy_nnz, constraint_nnz);
         Ok(SupportedMaternPosterior {
             factor,
             selection,
@@ -273,6 +295,144 @@ impl SupportedMaternPrior {
             metadata: self.metadata.clone(),
             diagnostics,
         })
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PreparedSupportedNoise {
+    ScalarVariance(f64),
+    Precision(SparseMatrix),
+}
+
+#[derive(Clone, Debug)]
+struct PreparedSupportedObservation {
+    matrix: SparseMatrix,
+    bias: Vector,
+    default_values: Vec<f64>,
+    noise: PreparedSupportedNoise,
+}
+
+/// Fixed exact-supported design with one reusable KKT factorization.
+#[derive(Clone, Debug)]
+pub struct PreparedSupportedMaternModel {
+    factor: SupportedGaussianFactor,
+    selection: SelectedCoordinates,
+    observations: Vec<PreparedSupportedObservation>,
+    state_layout: BoundaryLayout,
+    form_degree: FormDegree,
+    metadata: MaternPriorMetadata,
+    diagnostics: SupportedMaternDiagnostics,
+}
+
+impl PreparedSupportedMaternModel {
+    /// Observation row counts expected by replacement data vectors.
+    pub fn observation_row_counts(&self) -> Vec<usize> {
+        self.observations
+            .iter()
+            .map(|observation| observation.matrix.nrows())
+            .collect()
+    }
+
+    /// Setup diagnostics for the cached constrained factorization.
+    pub fn diagnostics(&self) -> SupportedMaternDiagnostics {
+        self.diagnostics
+    }
+
+    /// Condition using the data supplied when the design was prepared.
+    pub fn condition(&self) -> Result<SupportedMaternPosterior> {
+        let values = self
+            .observations
+            .iter()
+            .map(|observation| observation.default_values.clone())
+            .collect::<Vec<_>>();
+        self.condition_with_observation_values(&values)
+    }
+
+    /// Reuse the fixed KKT factor and return only the selected state mean.
+    pub fn latent_mean_with_observation_values(&self, values: &[Vec<f64>]) -> Result<Vec<f64>> {
+        let information = self.information_with_observation_values(values)?;
+        let mean = self.factor.selected_mean(&self.selection, &information)?;
+        Ok(mean.iter().copied().collect())
+    }
+
+    /// Reuse the fixed KKT factor for replacement observation values.
+    pub fn condition_with_observation_values(
+        &self,
+        values: &[Vec<f64>],
+    ) -> Result<SupportedMaternPosterior> {
+        let mean = self.latent_mean_with_observation_values(values)?;
+        Ok(SupportedMaternPosterior {
+            factor: self.factor.clone(),
+            selection: self.selection.clone(),
+            mean,
+            state_layout: self.state_layout.clone(),
+            form_degree: self.form_degree,
+            metadata: self.metadata.clone(),
+            diagnostics: self.diagnostics,
+        })
+    }
+
+    fn information_with_observation_values(&self, values: &[Vec<f64>]) -> Result<Vector> {
+        if values.len() != self.observations.len() {
+            return Err(FeecGmrfError::Dimension(format!(
+                "prepared supported model expects {} observation vectors, received {}",
+                self.observations.len(),
+                values.len()
+            )));
+        }
+        let mut information = Vector::zeros(self.factor.ambient_dim());
+        for (term_index, (observation, values)) in self.observations.iter().zip(values).enumerate()
+        {
+            if values.len() != observation.matrix.nrows() {
+                return Err(FeecGmrfError::Dimension(format!(
+                    "prepared supported observation term {term_index} expects {} rows, received {}",
+                    observation.matrix.nrows(),
+                    values.len()
+                )));
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(FeecGmrfError::InvalidParameter(format!(
+                    "prepared supported observation term {term_index} contains a non-finite value"
+                )));
+            }
+            let centered = Vector::from_iterator(
+                values.len(),
+                values
+                    .iter()
+                    .zip(observation.bias.iter())
+                    .map(|(value, bias)| value - bias),
+            );
+            information += match &observation.noise {
+                PreparedSupportedNoise::ScalarVariance(variance) => {
+                    ht_weighted_observations(&observation.matrix, &centered, 1.0 / variance)
+                }
+                PreparedSupportedNoise::Precision(precision) => {
+                    ht_precision_weighted_observations(&observation.matrix, &centered, precision)
+                }
+            };
+        }
+        Ok(information)
+    }
+}
+
+fn supported_matern_diagnostics(
+    factor: &SupportedGaussianFactor,
+    energy_nnz: usize,
+    constraint_nnz: usize,
+) -> SupportedMaternDiagnostics {
+    let certificate = factor.certificate();
+    SupportedMaternDiagnostics {
+        ambient_dimension: factor.ambient_dim(),
+        support_dimension: factor.support_dim(),
+        constraint_dimension: factor.constraint_dim(),
+        ambient_energy_nnz: energy_nnz,
+        constraint_nnz,
+        constraint_gram_factor_nnz: certificate.constraint_gram_factor_nnz(),
+        supported_energy_factor_nnz: certificate.supported_energy_factor_nnz(),
+        constraint_gram_factor: certificate.constraint_gram_factor_diagnostics(),
+        supported_energy_factor: certificate.supported_energy_factor_diagnostics(),
+        kkt_nnz: factor.kkt_nnz(),
+        certificate_residuals: certificate.residuals(),
     }
 }
 
