@@ -34,6 +34,10 @@ rand_distr = { workspace = true }
 libm = "0.2"
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf"] }
 
+[[example]]
+name = "c50_split_inverse_sites"
+required-features = ["experimental"]
+
 [[test]]
 name = "heavy_planar_holes"
 path = "tests/heavy_planar_holes.rs"

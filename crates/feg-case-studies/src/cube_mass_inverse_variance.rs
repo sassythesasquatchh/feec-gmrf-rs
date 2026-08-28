@@ -713,7 +713,10 @@ pub fn symmetric_extreme_eigenvalues(matrix: &FeecCsr) -> Result<CubeEigenStats,
     })
 }
 
-fn smooth_polynomial_one_form_cochain(topology: &Complex, coords: &MeshCoords) -> FeecVector {
+pub(crate) fn smooth_polynomial_one_form_cochain(
+    topology: &Complex,
+    coords: &MeshCoords,
+) -> FeecVector {
     let omega = DiffFormClosure::one_form(
         |p| {
             FeecVector::from_vec(vec![
