@@ -413,6 +413,98 @@ pub(crate) fn validate_sparse(matrix: &SparseMat) -> Result<()> {
     Ok(())
 }
 
+/// Validate and canonicalize a public proper-Gaussian precision.
+///
+/// Duplicate coordinates are summed, exact zeros are removed, and entries are
+/// sorted by `(row, column)`. This preserves the represented linear operator;
+/// it does not symmetrize, clip, jitter, or otherwise alter its values. The
+/// returned precision has passed an unshifted sparse Cholesky factorization.
+pub(crate) fn validate_proper_precision(
+    matrix_name: &'static str,
+    matrix: SparseMat,
+) -> Result<SparseMat> {
+    if matrix.nrows() != matrix.ncols() {
+        return Err(FeecGmrfError::Dimension(format!(
+            "{matrix_name} must be square, got {}x{}",
+            matrix.nrows(),
+            matrix.ncols()
+        )));
+    }
+
+    let mut entries = BTreeMap::<(usize, usize), f64>::new();
+    for (row, column, value) in matrix.triplet_iter() {
+        if row >= matrix.nrows() || column >= matrix.ncols() {
+            return Err(FeecGmrfError::Dimension(format!(
+                "sparse entry ({row}, {column}) lies outside {}x{} {matrix_name}",
+                matrix.nrows(),
+                matrix.ncols()
+            )));
+        }
+        if !value.is_finite() {
+            return Err(FeecGmrfError::NonFiniteMatrixEntry {
+                matrix: matrix_name,
+                row,
+                column,
+            });
+        }
+        let total = entries.entry((row, column)).or_default();
+        *total += value;
+        if !total.is_finite() {
+            return Err(FeecGmrfError::NonFiniteMatrixEntry {
+                matrix: matrix_name,
+                row,
+                column,
+            });
+        }
+    }
+    entries.retain(|_, value| *value != 0.0);
+
+    let entry_scale = entries
+        .values()
+        .fold(0.0_f64, |scale, value| scale.max(value.abs()));
+    // Sparse products assembled through different traversal orders can differ
+    // by a few ulps. Keep this tolerance strictly relative to matrix scale so
+    // rescaling a valid precision does not change the symmetry decision.
+    let symmetry_tolerance = 64.0 * f64::EPSILON * entry_scale;
+    let (asymmetry_row, asymmetry_column, max_abs_difference) =
+        entries
+            .iter()
+            .fold((0, 0, 0.0_f64), |current, (&(row, column), &value)| {
+                let difference =
+                    (value - entries.get(&(column, row)).copied().unwrap_or(0.0)).abs();
+                if difference > current.2 {
+                    (row, column, difference)
+                } else {
+                    current
+                }
+            });
+    if max_abs_difference > symmetry_tolerance {
+        return Err(FeecGmrfError::MatrixNotSymmetric {
+            matrix: matrix_name,
+            row: asymmetry_row,
+            column: asymmetry_column,
+            max_abs_difference,
+            tolerance: symmetry_tolerance,
+        });
+    }
+
+    let canonical = SparseMat::from_triplets(
+        matrix.nrows(),
+        matrix.ncols(),
+        entries
+            .into_iter()
+            .map(|((row, col), value)| SparseTriplet { row, col, value }),
+    );
+    let backend = feg_infer::sparse::core_triplet_to_gmrf(&canonical);
+    backend
+        .cholesky_sqrt_lower()
+        .map_err(|error| FeecGmrfError::PrecisionNotPositiveDefinite {
+            matrix: matrix_name,
+            reason: error.to_string(),
+        })?;
+    Ok(canonical)
+}
+
 pub(crate) fn validate_square_same_shape(lhs: &SparseMat, rhs: &SparseMat) -> Result<()> {
     if lhs.nrows() != lhs.ncols() || rhs.nrows() != rhs.ncols() {
         return Err(FeecGmrfError::Dimension(

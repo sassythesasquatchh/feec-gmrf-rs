@@ -35,14 +35,16 @@ impl GaussianNoise {
         Self::variance(standard_deviation * standard_deviation)
     }
 
-    /// Construct a correlated noise model from an observation precision.
+    /// Construct a proper correlated noise model from an observation precision.
+    ///
+    /// This performs the same finite-entry, scale-aware symmetry, sparse
+    /// canonicalization, and unshifted Cholesky validation as
+    /// [`GaussianPrior::new`](crate::prior::GaussianPrior::new). The validation
+    /// factor is not cached. No symmetrization, shift, clipping, or jitter is
+    /// applied.
     pub fn precision(precision: crate::operator::SparseMat) -> Result<Self> {
-        if precision.nrows() != precision.ncols() {
-            return Err(FeecGmrfError::Dimension(
-                "observation precision must be square".to_string(),
-            ));
-        }
-        crate::operator::validate_sparse(&precision)?;
+        let precision =
+            crate::operator::validate_proper_precision("observation precision", precision)?;
         Ok(Self::Precision(precision))
     }
 

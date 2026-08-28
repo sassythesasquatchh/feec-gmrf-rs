@@ -11,6 +11,31 @@ pub enum FeecGmrfError {
     /// A model parameter is non-finite or outside its mathematical domain.
     #[error("invalid parameter: {0}")]
     InvalidParameter(String),
+    /// A matrix entry is non-finite, including after duplicate entries are summed.
+    #[error("{matrix} contains a non-finite entry at ({row}, {column})")]
+    NonFiniteMatrixEntry {
+        matrix: &'static str,
+        row: usize,
+        column: usize,
+    },
+    /// A matrix declared to be symmetric differs from its transpose beyond roundoff.
+    #[error(
+        "{matrix} is not symmetric at ({row}, {column}): absolute transpose difference \
+         {max_abs_difference:.6e} exceeds the scale-aware tolerance {tolerance:.6e}"
+    )]
+    MatrixNotSymmetric {
+        matrix: &'static str,
+        row: usize,
+        column: usize,
+        max_abs_difference: f64,
+        tolerance: f64,
+    },
+    /// A precision matrix failed an unshifted sparse Cholesky factorization.
+    #[error("{matrix} is not positive definite: {reason}")]
+    PrecisionNotPositiveDefinite {
+        matrix: &'static str,
+        reason: String,
+    },
     /// A proper Gaussian API was asked to construct an intrinsic or improper law.
     #[error("intrinsic model is unsupported by this proper-prior API: {0}")]
     IntrinsicModelUnsupported(String),

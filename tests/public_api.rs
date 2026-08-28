@@ -454,6 +454,118 @@ fn observation_and_variance_conveniences_reject_invalid_inputs() {
 }
 
 #[test]
+fn proper_precision_constructors_reject_scale_relative_asymmetry() {
+    for scale in [1.0e-12, 1.0, 1.0e12] {
+        let precision = SparseMat::from_rows(
+            2,
+            &[
+                vec![(0, 2.0 * scale), (1, 0.5 * scale)],
+                vec![(0, (0.5 + 1.0e-8) * scale), (1, 2.0 * scale)],
+            ],
+        )
+        .unwrap();
+        assert!(matches!(
+            GaussianPrior::new(vec![0.0; 2], precision.clone()),
+            Err(FeecGmrfError::MatrixNotSymmetric { .. })
+        ));
+        assert!(matches!(
+            GaussianNoise::precision(precision),
+            Err(FeecGmrfError::MatrixNotSymmetric { .. })
+        ));
+    }
+}
+
+#[test]
+fn proper_precision_constructors_reject_symmetric_indefinite_inputs() {
+    let precision =
+        SparseMat::from_rows(2, &[vec![(0, 1.0), (1, 2.0)], vec![(0, 2.0), (1, 1.0)]]).unwrap();
+    assert!(matches!(
+        GaussianPrior::new(vec![0.0; 2], precision.clone()),
+        Err(FeecGmrfError::PrecisionNotPositiveDefinite { .. })
+    ));
+    assert!(matches!(
+        GaussianNoise::precision(precision),
+        Err(FeecGmrfError::PrecisionNotPositiveDefinite { .. })
+    ));
+}
+
+#[test]
+fn malformed_proper_precisions_return_typed_errors_without_panicking() {
+    let mut nonfinite = SparseMat::diagonal(2, 1.0);
+    nonfinite.push(0, 1, f64::NAN);
+    let prior_result =
+        std::panic::catch_unwind(|| GaussianPrior::new(vec![0.0; 2], nonfinite.clone()));
+    assert!(matches!(
+        prior_result,
+        Ok(Err(FeecGmrfError::NonFiniteMatrixEntry {
+            row: 0,
+            column: 1,
+            ..
+        }))
+    ));
+    let noise_result = std::panic::catch_unwind(|| GaussianNoise::precision(nonfinite));
+    assert!(matches!(
+        noise_result,
+        Ok(Err(FeecGmrfError::NonFiniteMatrixEntry {
+            row: 0,
+            column: 1,
+            ..
+        }))
+    ));
+
+    let mut out_of_bounds = SparseMat::diagonal(2, 1.0);
+    out_of_bounds.push(2, 0, 1.0);
+    let bounds_result =
+        std::panic::catch_unwind(|| GaussianPrior::new(vec![0.0; 2], out_of_bounds));
+    assert!(matches!(
+        bounds_result,
+        Ok(Err(FeecGmrfError::Dimension(_)))
+    ));
+}
+
+#[test]
+fn proper_precision_constructors_canonicalize_duplicates_before_validation() {
+    let mut precision = SparseMat::new(2, 2);
+    precision.push(1, 1, 3.0);
+    precision.push(0, 1, 0.25);
+    precision.push(0, 0, 1.25);
+    precision.push(1, 0, 1.0);
+    precision.push(0, 1, 0.75);
+    precision.push(0, 0, 0.75);
+    precision.push(1, 1, 4.0);
+    precision.push(1, 1, -4.0);
+
+    let prior = GaussianPrior::new(vec![0.0; 2], precision.clone()).unwrap();
+    let expected = vec![(0, 0, 2.0), (0, 1, 1.0), (1, 0, 1.0), (1, 1, 3.0)];
+    assert_eq!(
+        prior.precision().triplet_iter().collect::<Vec<_>>(),
+        expected
+    );
+
+    let GaussianNoise::Precision(noise_precision) = GaussianNoise::precision(precision).unwrap()
+    else {
+        panic!("explicit precision constructor must retain precision representation");
+    };
+    assert_eq!(noise_precision.triplet_iter().collect::<Vec<_>>(), expected);
+}
+
+#[test]
+fn proper_precision_constructors_accept_valid_spd_inputs_across_scales() {
+    for scale in [1.0e-12, 1.0, 1.0e12] {
+        let precision = SparseMat::from_rows(
+            2,
+            &[
+                vec![(0, 2.0 * scale), (1, 0.5 * scale)],
+                vec![(0, 0.5 * scale), (1, 3.0 * scale)],
+            ],
+        )
+        .unwrap();
+        assert!(GaussianPrior::new(vec![0.0; 2], precision.clone()).is_ok());
+        assert!(GaussianNoise::precision(precision).is_ok());
+    }
+}
+
+#[test]
 fn state_only_pde_facade_supports_scalar_and_precision_sensor_noise() {
     let system = identity_pde_system()
         .with_right_hand_side(&[0.0, 0.0])

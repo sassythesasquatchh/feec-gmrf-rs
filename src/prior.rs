@@ -323,7 +323,14 @@ pub struct PriorMahalanobisCalibration {
 }
 
 impl GaussianPrior {
-    /// Construct a prior from an explicit mean and precision.
+    /// Construct a proper prior from an explicit mean and precision.
+    ///
+    /// Construction validates finite entries and scale-aware symmetry, merges
+    /// duplicate sparse coordinates, and performs an unshifted sparse Cholesky
+    /// factorization to establish positive definiteness. The factorization can
+    /// incur dimension-dependent fill and is not cached by this constructor;
+    /// call [`Self::factor`] when a reusable factor is required. No
+    /// symmetrization, diagonal shift, clipping, or jitter is applied.
     pub fn new(mean: Vec<f64>, precision: SparseMat) -> Result<Self> {
         if precision.nrows() != precision.ncols() || mean.len() != precision.nrows() {
             return Err(FeecGmrfError::Dimension(format!(
@@ -338,6 +345,7 @@ impl GaussianPrior {
                 "prior mean must contain only finite values".to_string(),
             ));
         }
+        let precision = crate::operator::validate_proper_precision("prior precision", precision)?;
         Ok(Self {
             mean,
             precision,
