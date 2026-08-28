@@ -16,7 +16,9 @@ use gmrf_core::{
     ConstrainedPrecisionSolver, Gmrf, ProbeBatchConfig, SparseRowOperator, TransformedVarianceMode,
 };
 pub use gmrf_core::{
-    CholeskyOrderingKind, ProbeDistribution, SparseCholeskyDiagnostics, VarianceFloor,
+    CholeskyOrderingKind, DirectPhaseResourceUsage, ProbeDistribution, RepeatedSolveResourceUsage,
+    ResourceMeasurement, SparseCholeskyDiagnostics, SparseDirectResourceReport,
+    SparseDirectSolverKind, VarianceFloor,
 };
 use rand::Rng;
 use std::collections::BTreeMap;
@@ -431,6 +433,36 @@ impl FactoredGaussianPrior {
         })
     }
 
+    pub(crate) fn new_with_resource_report(
+        prior: crate::prior::GaussianPrior,
+    ) -> Result<(Self, SparseDirectResourceReport)> {
+        let precision = gmrf_sparse(prior.precision());
+        let mean_vector = Vector::from_vec(prior.mean().to_vec());
+        let (factor, report) =
+            precision.cholesky_sqrt_lower_with_resource_report(gmrf_core::CholeskyOrdering::Amd)?;
+        let gmrf = Gmrf::from_mean_and_precision_with_sqrt(mean_vector, precision, factor)?;
+        let mean = prior.mean().to_vec();
+        let boundary_elimination = prior.boundary_elimination().cloned();
+        let cochain_mean = match &boundary_elimination {
+            Some(elimination) => elimination.lift_state(&mean)?,
+            None => mean.clone(),
+        };
+        Ok((
+            Self {
+                posterior: Posterior {
+                    gmrf,
+                    mean,
+                    cochain_mean,
+                    precision: prior.precision().clone(),
+                    constraints: None,
+                    derived: BTreeMap::new(),
+                    boundary_elimination,
+                },
+            },
+            report,
+        ))
+    }
+
     /// Prior mean in active coordinates.
     pub fn mean(&self) -> &[f64] {
         self.posterior.mean()
@@ -452,6 +484,26 @@ impl FactoredGaussianPrior {
     /// materialized.
     pub fn covariance_action(&mut self, rhs: &[f64]) -> Result<Vec<f64>> {
         self.posterior.covariance_action(rhs)
+    }
+
+    /// Apply the prior covariance and append the solve time to the matching
+    /// resource report returned by `GaussianPrior::factor_with_resource_report`.
+    pub fn covariance_action_with_resource_report(
+        &self,
+        rhs: &[f64],
+        report: &mut SparseDirectResourceReport,
+    ) -> Result<Vec<f64>> {
+        if rhs.len() != self.posterior.mean.len() {
+            return Err(FeecGmrfError::Dimension(format!(
+                "covariance-action right-hand side length {} does not match latent dimension {}",
+                rhs.len(),
+                self.posterior.mean.len()
+            )));
+        }
+        let factor = self.posterior.required_factor()?;
+        let mut action = Vector::from_vec(rhs.to_vec());
+        factor.solve_in_place_with_resource_report(&mut action, report)?;
+        Ok(action.iter().copied().collect())
     }
 
     /// Estimate active-coordinate marginal variances.

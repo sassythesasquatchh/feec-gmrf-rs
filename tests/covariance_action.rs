@@ -23,6 +23,43 @@ fn factored_prior_covariance_action_matches_exact_inverse() {
 }
 
 #[test]
+fn factored_prior_reports_factor_and_repeated_solve_resources() {
+    let precision =
+        SparseMat::from_rows(2, &[vec![(0, 4.0), (1, 1.0)], vec![(0, 1.0), (1, 3.0)]]).unwrap();
+    let prior = GaussianPrior::new(vec![0.25, -0.5], precision).unwrap();
+    let (factored, mut resources) = prior.factor_with_resource_report().unwrap();
+
+    assert_eq!(factored.mean(), &[0.25, -0.5]);
+    assert_eq!(resources.solver, SparseDirectSolverKind::Cholesky);
+    assert_eq!(resources.dimension, 2);
+    assert_eq!(resources.coefficient_nnz, 4);
+    assert!(matches!(
+        resources.factor_storage_nonzeros,
+        ResourceMeasurement::Measured(_)
+    ));
+    assert!(matches!(
+        resources.analysis.wall_time,
+        ResourceMeasurement::Measured(_)
+    ));
+    assert!(matches!(
+        resources.numeric_factorization.wall_time,
+        ResourceMeasurement::Measured(_)
+    ));
+    assert_eq!(resources.solve.calls, 0);
+
+    let action = factored
+        .covariance_action_with_resource_report(&[2.0, -1.0], &mut resources)
+        .unwrap();
+    assert_close(&action, &[7.0 / 11.0, -6.0 / 11.0]);
+    assert_eq!(resources.solve.calls, 1);
+    assert_eq!(resources.solve.right_hand_sides, 1);
+    assert!(matches!(
+        resources.solve.wall_time,
+        ResourceMeasurement::Measured(_)
+    ));
+}
+
+#[test]
 fn posterior_covariance_action_includes_observations() {
     let prior = GaussianPrior::new(vec![0.0, 0.0], SparseMat::diagonal(2, 1.0)).unwrap();
     let observation =

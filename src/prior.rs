@@ -522,6 +522,21 @@ impl GaussianPrior {
         crate::infer::FactoredGaussianPrior::new(self.clone())
     }
 
+    /// Factor the prior while separately recording symbolic analysis and
+    /// numeric-factorization wall time and actual factor storage.
+    ///
+    /// Peak RSS is intentionally attached later from an external fresh-process
+    /// monitor. Subsequent covariance actions can append solve timings through
+    /// [`crate::infer::FactoredGaussianPrior::covariance_action_with_resource_report`].
+    pub fn factor_with_resource_report(
+        &self,
+    ) -> Result<(
+        crate::infer::FactoredGaussianPrior,
+        crate::infer::SparseDirectResourceReport,
+    )> {
+        crate::infer::FactoredGaussianPrior::new_with_resource_report(self.clone())
+    }
+
     /// Estimate active-coordinate marginal variances.
     pub fn latent_variance_estimate(
         &self,

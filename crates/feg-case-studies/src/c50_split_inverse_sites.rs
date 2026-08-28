@@ -441,8 +441,7 @@ mod tests {
                 .weighted_magnetic_covariance_action_relative_error
                 .is_finite());
             assert!(row.weighted_magnetic_functional_variance > 0.0);
-            if row.lower_adjoint_inverse
-                == SplitInverseRealization::ProjectedPosthocRestricted
+            if row.lower_adjoint_inverse == SplitInverseRealization::ProjectedPosthocRestricted
                 && row.recurrence_inverse == SplitInverseRealization::ExactMaterialized
             {
                 // The canonical magnetic map begins with D1, so it annihilates
