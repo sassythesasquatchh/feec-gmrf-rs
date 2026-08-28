@@ -34,6 +34,7 @@ rand = { workspace = true }
 rand_distr = { workspace = true }
 libm = "0.2"
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf"] }
+csv = { workspace = true }
 
 [[example]]
 name = "c50_split_inverse_sites"
@@ -42,6 +43,10 @@ required-features = ["experimental"]
 [[example]]
 name = "c51_benchmark"
 required-features = ["experimental"]
+
+[[example]]
+name = "c51_spectral_covariance_rank"
+required-features = ["experimental", "external-solvers"]
 
 [[test]]
 name = "heavy_planar_holes"

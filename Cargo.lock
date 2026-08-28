@@ -614,6 +614,7 @@ name = "feg-case-studies"
 version = "0.1.0"
 dependencies = [
  "common",
+ "csv",
  "ddf",
  "exterior",
  "faer",
