@@ -38,6 +38,8 @@ pub mod nonlinear_eddy_current;
 #[cfg(feature = "experimental")]
 pub mod planar_holes_hodge_flow;
 #[cfg(feature = "experimental")]
+pub mod projected_inverse_boundary_ablation;
+#[cfg(feature = "experimental")]
 pub mod sparse_anchor_branch_functional_convergence;
 pub mod sphere_branch_observable_convergence;
 #[cfg(feature = "experimental")]
@@ -114,6 +116,7 @@ pub mod experimental {
     pub use crate::nc1_matern_convergence;
     pub use crate::nonlinear_eddy_current;
     pub use crate::planar_holes_hodge_flow;
+    pub use crate::projected_inverse_boundary_ablation;
     pub use crate::sparse_anchor_branch_functional_convergence;
     pub use crate::sphere_branch_pushforward_convergence;
     pub use crate::sphere_nc1_matern_spectral_reference;
