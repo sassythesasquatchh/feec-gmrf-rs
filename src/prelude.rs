@@ -48,8 +48,11 @@ pub use crate::physical::{
     PhysicalRmsCalibration, WendlandC2Kernel3d,
 };
 pub use crate::prior::supported::{
-    PreparedSupportedMaternModel, SupportedMaternDiagnostics, SupportedMaternLayout,
-    SupportedMaternPosterior, SupportedMaternPrior, SupportedMaternPriorBuilder,
+    AuditedSupportedCovariance, PreparedSupportedMaternModel, SupportedCovarianceSymmetryAudit,
+    SupportedMaternDiagnostics, SupportedMaternLayout, SupportedMaternPosterior,
+    SupportedMaternPrior, SupportedMaternPriorBuilder,
+    INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION,
+    INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT,
 };
 pub use crate::prior::{
     AdjacentBoundaryLayouts, AdjacentMaternPriorBuilder, EliminatedMassInversePolicy,

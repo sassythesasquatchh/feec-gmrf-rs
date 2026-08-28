@@ -21,6 +21,62 @@ use gmrf_core::{
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 use std::ops::Range;
 
+/// Version of the interim scale-relative transformed-covariance audit.
+///
+/// This policy records and projects small sparse-KKT roundoff, but it is not
+/// residual-aware. A future policy must replace it once KKT action residuals
+/// are exposed by `gmrf-core`.
+pub const INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION: &str =
+    "supported-transformed-covariance-interim-v1";
+
+/// Frozen relative-skew limit for the interim transformed-covariance audit.
+///
+/// This is an explicit numerical policy, not a claim about KKT forward error.
+/// It must not be increased to accommodate a failing study.
+pub const INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT: f64 = 1.0e-10;
+
+/// Diagnostics for the interim audit of a materialized transformed covariance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SupportedCovarianceSymmetryAudit {
+    /// Stable identifier for the numerical policy that accepted the matrix.
+    pub policy_version: &'static str,
+    /// Output covariance dimension.
+    pub dimension: usize,
+    /// Largest absolute entry in the raw covariance.
+    pub raw_scale: f64,
+    /// Largest absolute difference between transposed raw entries.
+    pub raw_maximum_absolute_skew: f64,
+    /// Maximum raw skew divided by [`Self::raw_scale`], or zero for a zero matrix.
+    pub raw_maximum_relative_skew: f64,
+    /// Row of the pair attaining [`Self::raw_maximum_absolute_skew`].
+    pub raw_maximum_skew_row: usize,
+    /// Column of the pair attaining [`Self::raw_maximum_absolute_skew`].
+    pub raw_maximum_skew_column: usize,
+    /// Frozen relative-skew acceptance limit.
+    pub relative_skew_limit: f64,
+    /// Largest absolute entry changed by the symmetric projection.
+    pub projection_maximum_absolute_correction: f64,
+    /// Frobenius norm of the symmetric-projection correction.
+    pub projection_frobenius_correction: f64,
+    /// Whether KKT residuals participated in this audit.
+    pub residual_aware: bool,
+    /// Explicit status explaining the residual-awareness limitation.
+    pub residual_status: &'static str,
+    /// Acceptance status for machine-readable study archives.
+    pub status: &'static str,
+}
+
+/// Raw and audited-symmetric forms of a small transformed covariance matrix.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AuditedSupportedCovariance {
+    /// Direct column-by-column covariance actions before symmetry projection.
+    pub raw: Vec<Vec<f64>>,
+    /// Pairwise symmetric projection used as the covariance result.
+    pub symmetric: Vec<Vec<f64>>,
+    /// Numerical audit associated with the projection.
+    pub audit: SupportedCovarianceSymmetryAudit,
+}
+
 /// Ambient block ordering of an exact supported Matérn construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SupportedMaternLayout {
@@ -183,6 +239,14 @@ impl SupportedMaternPrior {
     /// should retain the factored posterior instead.
     pub fn pushforward_covariance(&self, map: &LinearMap) -> Result<Vec<Vec<f64>>> {
         self.factor()?.pushforward_covariance(map)
+    }
+
+    /// Audited exact covariance of a small active- or full-cochain prior output.
+    pub fn pushforward_covariance_audited(
+        &self,
+        map: &LinearMap,
+    ) -> Result<AuditedSupportedCovariance> {
+        self.factor()?.pushforward_covariance_audited(map)
     }
 
     /// Condition state-coordinate observations and append exact state constraints.
@@ -525,6 +589,15 @@ impl SupportedMaternPosterior {
     /// the certified selected covariance action on the supported state; no
     /// ambient covariance or dense inverse is formed.
     pub fn pushforward_covariance(&self, map: &LinearMap) -> Result<Vec<Vec<f64>>> {
+        Ok(self.pushforward_covariance_audited(map)?.symmetric)
+    }
+
+    /// Materialize covariance actions without enforcing or repairing symmetry.
+    ///
+    /// This diagnostic API exists so numerical studies can retain the raw KKT
+    /// output. Most callers should use [`Self::pushforward_covariance`] or
+    /// [`Self::pushforward_covariance_audited`].
+    pub fn pushforward_covariance_raw(&self, map: &LinearMap) -> Result<Vec<Vec<f64>>> {
         let eliminated = resolve_state_map(
             &self.state_layout,
             self.mean.len(),
@@ -549,8 +622,19 @@ impl SupportedMaternPosterior {
                 covariance[row][column] = value;
             }
         }
-        validate_transformed_covariance_symmetry(&covariance)?;
         Ok(covariance)
+    }
+
+    /// Materialize, audit, and symmetrically project a small output covariance.
+    ///
+    /// The current named interim audit uses a frozen scale-relative skew limit
+    /// and records that KKT residuals are not yet available. No covariance is
+    /// projected unless the raw matrix passes that explicit audit.
+    pub fn pushforward_covariance_audited(
+        &self,
+        map: &LinearMap,
+    ) -> Result<AuditedSupportedCovariance> {
+        audit_transformed_covariance(self.pushforward_covariance_raw(map)?)
     }
 
     /// Sampling is not available until a support-aware square root is implemented.
@@ -788,20 +872,26 @@ fn append_state_constraints(
     ))
 }
 
-fn validate_transformed_covariance_symmetry(covariance: &[Vec<f64>]) -> Result<()> {
+fn audit_transformed_covariance(covariance: Vec<Vec<f64>>) -> Result<AuditedSupportedCovariance> {
     let dimension = covariance.len();
     let scale = covariance
         .iter()
         .flatten()
         .map(|value| value.abs())
         .fold(0.0, f64::max);
-    let tolerance = 4_096.0 * f64::EPSILON * dimension.max(1) as f64 * scale.max(f64::MIN_POSITIVE);
     let mut maximum = (0_usize, 0_usize, 0.0_f64);
     for (row, values) in covariance.iter().enumerate() {
         if values.len() != dimension {
             return Err(FeecGmrfError::Dimension(
                 "supported transformed covariance is not square".to_string(),
             ));
+        }
+        if let Some(column) = values.iter().position(|value| !value.is_finite()) {
+            return Err(FeecGmrfError::NonFiniteMatrixEntry {
+                matrix: "supported transformed covariance",
+                row,
+                column,
+            });
         }
         for (column, transpose_values) in covariance.iter().enumerate().skip(row + 1) {
             let difference = (values[column] - transpose_values[row]).abs();
@@ -810,6 +900,8 @@ fn validate_transformed_covariance_symmetry(covariance: &[Vec<f64>]) -> Result<(
             }
         }
     }
+    let relative_skew = if scale == 0.0 { 0.0 } else { maximum.2 / scale };
+    let tolerance = INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT * scale;
     if maximum.2 > tolerance {
         return Err(FeecGmrfError::MatrixNotSymmetric {
             matrix: "supported transformed covariance",
@@ -819,7 +911,40 @@ fn validate_transformed_covariance_symmetry(covariance: &[Vec<f64>]) -> Result<(
             tolerance,
         });
     }
-    Ok(())
+    let mut symmetric = covariance.clone();
+    let mut correction_squared = 0.0;
+    let mut maximum_correction = 0.0_f64;
+    for row in 0..dimension {
+        for column in (row + 1)..dimension {
+            let projected = 0.5 * covariance[row][column] + 0.5 * covariance[column][row];
+            for (target_row, target_column) in [(row, column), (column, row)] {
+                let correction = projected - covariance[target_row][target_column];
+                maximum_correction = maximum_correction.max(correction.abs());
+                correction_squared += correction * correction;
+                symmetric[target_row][target_column] = projected;
+            }
+        }
+    }
+    Ok(AuditedSupportedCovariance {
+        raw: covariance,
+        symmetric,
+        audit: SupportedCovarianceSymmetryAudit {
+            policy_version: INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION,
+            dimension,
+            raw_scale: scale,
+            raw_maximum_absolute_skew: maximum.2,
+            raw_maximum_relative_skew: relative_skew,
+            raw_maximum_skew_row: maximum.0,
+            raw_maximum_skew_column: maximum.1,
+            relative_skew_limit: INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT,
+            projection_maximum_absolute_correction: maximum_correction,
+            projection_frobenius_correction: correction_squared.sqrt(),
+            residual_aware: false,
+            residual_status:
+                "unavailable: gmrf-core KKT covariance-action residuals are not exposed",
+            status: "accepted_interim_scale_relative_and_projected",
+        },
+    })
 }
 
 #[cfg(test)]
@@ -827,17 +952,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn transformed_covariance_symmetry_is_scale_relative_and_never_repaired() {
-        validate_transformed_covariance_symmetry(&[
-            vec![2.0e-20, 3.0e-21],
-            vec![3.0e-21 + 1.0e-34, 4.0e-20],
+    fn transformed_covariance_audit_records_and_projects_accepted_skew() {
+        let accepted = audit_transformed_covariance(vec![
+            vec![2.0e-3, 3.0e-4],
+            vec![3.0e-4 + 1.0e-14, 4.0e-3],
         ])
         .unwrap();
-        let error = validate_transformed_covariance_symmetry(&[
-            vec![2.0e-20, 3.0e-21],
-            vec![3.1e-21, 4.0e-20],
-        ])
-        .unwrap_err();
+        assert_eq!(accepted.raw[0][1], 3.0e-4);
+        assert_eq!(accepted.symmetric[0][1], accepted.symmetric[1][0]);
+        assert!(accepted.audit.raw_maximum_absolute_skew > 0.0);
+        assert!(accepted.audit.raw_maximum_relative_skew < 1.0e-10);
+        assert!(!accepted.audit.residual_aware);
+        assert_eq!(
+            accepted.audit.policy_version,
+            INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION
+        );
+        assert!(
+            (accepted.audit.projection_maximum_absolute_correction
+                - 0.5 * accepted.audit.raw_maximum_absolute_skew)
+                .abs()
+                <= f64::EPSILON * accepted.audit.raw_scale
+        );
+    }
+
+    #[test]
+    fn transformed_covariance_audit_is_scale_invariant_and_rejects_material_skew() {
+        for scale in [1.0e-20, 1.0, 1.0e20] {
+            let accepted = audit_transformed_covariance(vec![
+                vec![2.0 * scale, 0.3 * scale],
+                vec![(0.3 + 2.0e-11) * scale, 4.0 * scale],
+            ])
+            .unwrap();
+            assert!(accepted.audit.raw_maximum_relative_skew < 1.1e-11);
+        }
+        let error =
+            audit_transformed_covariance(vec![vec![2.0e-20, 3.0e-21], vec![3.1e-21, 4.0e-20]])
+                .unwrap_err();
         assert!(matches!(
             error,
             FeecGmrfError::MatrixNotSymmetric {

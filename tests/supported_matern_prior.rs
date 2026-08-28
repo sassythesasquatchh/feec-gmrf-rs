@@ -155,10 +155,16 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
             &exact_covariance,
             &format!("alpha {alpha:?} prior convenience covariance"),
         );
+        let audited_supported_covariance = supported_factor
+            .pushforward_covariance_audited(&LinearMap::identity(2))
+            .unwrap();
+        assert_eq!(
+            audited_supported_covariance.symmetric[0][1],
+            audited_supported_covariance.symmetric[1][0]
+        );
+        assert!(!audited_supported_covariance.audit.residual_aware);
         assert_covariance_close(
-            &supported_factor
-                .pushforward_covariance(&LinearMap::identity(2))
-                .unwrap(),
+            &audited_supported_covariance.symmetric,
             &exact_covariance,
             &format!("alpha {alpha:?} prior covariance"),
         );
@@ -317,9 +323,17 @@ fn supported_feec_prior_preserves_full_relative_boundary_layout() {
     let cochain_variances = posterior
         .pushforward_variances(&LinearMap::identity(prior.cochain_dimension()))
         .unwrap();
-    let full_covariance = posterior
-        .pushforward_covariance(&LinearMap::identity(prior.cochain_dimension()))
+    let audited_full_covariance = posterior
+        .pushforward_covariance_audited(&LinearMap::identity(prior.cochain_dimension()))
         .unwrap();
+    let full_covariance = audited_full_covariance.symmetric;
+    assert!(full_covariance
+        .iter()
+        .enumerate()
+        .all(|(row, values)| values
+            .iter()
+            .enumerate()
+            .all(|(column, value)| *value == full_covariance[column][row])));
     for (fixed, _) in layouts.state().fixed_dofs() {
         assert_eq!(cochain_variances[*fixed], 0.0);
         assert!(full_covariance[*fixed].iter().all(|value| *value == 0.0));

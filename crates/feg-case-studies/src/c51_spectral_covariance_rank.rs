@@ -6,10 +6,13 @@
 
 use common::linalg::nalgebra::{CsrMatrix, Matrix};
 use feec_gmrf::prelude::{
-    EssentialBoundaryElimination, ExactFormOperators, ExactMaternPriorBuilder, FeecGmrfError,
-    GaussianNoise, LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d,
-    MagneticVolumeSensorBank3d, MaternAlpha, MaternParameters, Result, SparseMat,
+    AuditedSupportedCovariance, EssentialBoundaryElimination, ExactFormOperators,
+    ExactMaternPriorBuilder, FeecGmrfError, GaussianNoise, LinearGaussianModelBuilder, LinearMap,
+    LinearObservation, MagneticFieldMaps3d, MagneticVolumeSensorBank3d, MaternAlpha,
+    MaternParameters, Result, SparseMat, SupportedCovarianceSymmetryAudit,
     SupportedMaternPriorBuilder, WendlandC2Kernel3d,
+    INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION,
+    INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT,
 };
 #[cfg(feature = "external-solvers")]
 use feec_gmrf::spectral::{
@@ -18,6 +21,7 @@ use feec_gmrf::spectral::{
 };
 use feg_gp::{EigenBasis, SpectralMaternConfig, SpectralMaternGp};
 use manifold::gen::cartesian::CartesianMeshInfo;
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
@@ -352,6 +356,28 @@ pub struct C51OutputCovarianceRecord {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct C51ExactCovarianceAuditRecord {
+    pub refinement: usize,
+    pub alpha: u32,
+    pub design: C51CovarianceDesign,
+    pub bank: &'static str,
+    pub policy_version: &'static str,
+    pub status: &'static str,
+    pub residual_aware: bool,
+    pub residual_status: &'static str,
+    pub projection_applied: bool,
+    pub dimension: usize,
+    pub raw_scale: f64,
+    pub raw_maximum_absolute_skew: f64,
+    pub raw_maximum_relative_skew: f64,
+    pub raw_maximum_skew_row: usize,
+    pub raw_maximum_skew_column: usize,
+    pub relative_skew_limit: f64,
+    pub projection_maximum_absolute_correction: f64,
+    pub projection_frobenius_correction: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct C51SensorBankAudit {
     pub refinement: usize,
     pub bank: &'static str,
@@ -384,6 +410,7 @@ pub struct C51SpectralCovarianceRankArchive {
     pub basis_attempts: Vec<C51SpectralBasisAttempt>,
     pub rows: Vec<C51SpectralCovarianceRankRow>,
     pub covariances: Vec<C51OutputCovarianceRecord>,
+    pub exact_covariance_audits: Vec<C51ExactCovarianceAuditRecord>,
     pub sensor_banks: Vec<C51SensorBankAudit>,
     pub plumbing_gates: Vec<C51FullRankPlumbingGate>,
 }
@@ -435,6 +462,57 @@ impl C51SpectralCovarianceRankArchive {
                 ));
             }
         }
+        let mut audit_keys = BTreeSet::new();
+        for audit in &self.exact_covariance_audits {
+            if !audit_keys.insert((audit.refinement, audit.alpha, audit.design, audit.bank)) {
+                return Err(invalid("C51 exact covariance audits must be unique"));
+            }
+            if !["selection", "held_out"].contains(&audit.bank)
+                || audit.policy_version != INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION
+                || audit.status != "accepted_interim_scale_relative_and_projected"
+                || audit.residual_aware
+                || audit.residual_status.is_empty()
+                || !audit.projection_applied
+                || audit.dimension != OUTPUT_DIMENSION
+                || audit.raw_maximum_skew_row >= audit.dimension
+                || audit.raw_maximum_skew_column >= audit.dimension
+                || audit.relative_skew_limit != INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT
+                || audit.raw_maximum_relative_skew > audit.relative_skew_limit
+                || [
+                    audit.raw_scale,
+                    audit.raw_maximum_absolute_skew,
+                    audit.raw_maximum_relative_skew,
+                    audit.relative_skew_limit,
+                    audit.projection_maximum_absolute_correction,
+                    audit.projection_frobenius_correction,
+                ]
+                .into_iter()
+                .any(|value| !value.is_finite() || value < 0.0)
+            {
+                return Err(invalid(
+                    "C51 exact covariance audit does not satisfy the frozen interim policy",
+                ));
+            }
+            for representation in ["exact_supported_raw", "exact_supported_symmetric"] {
+                let entries = self
+                    .covariances
+                    .iter()
+                    .filter(|entry| {
+                        entry.refinement == audit.refinement
+                            && entry.alpha == audit.alpha
+                            && entry.design == audit.design
+                            && entry.rank.is_none()
+                            && entry.bank == audit.bank
+                            && entry.representation == representation
+                    })
+                    .count();
+                if entries != audit.dimension * audit.dimension {
+                    return Err(invalid(
+                        "C51 audited exact covariance must archive complete raw and symmetric matrices",
+                    ));
+                }
+            }
+        }
         if self
             .plumbing_gates
             .iter()
@@ -483,6 +561,15 @@ impl C51SpectralCovarianceRankArchive {
                     "censored spectral rank row lacks typed stage/reason",
                 ));
             }
+            if measured {
+                for bank in ["selection", "held_out"] {
+                    if !audit_keys.contains(&(row.refinement, row.alpha, row.design, bank)) {
+                        return Err(invalid(
+                            "measured C51 row lacks an accepted exact covariance audit",
+                        ));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -492,6 +579,7 @@ impl C51SpectralCovarianceRankArchive {
         fs::create_dir_all(directory)?;
         self.write_rows(&directory.join("rows.csv"))?;
         self.write_covariances(&directory.join("covariances.csv"))?;
+        self.write_exact_covariance_audits(&directory.join("exact_covariance_audits.csv"))?;
         self.write_basis_attempts(&directory.join("basis_attempts.csv"))?;
         self.write_sensor_banks(&directory.join("sensor_banks.csv"))?;
         self.write_sensor_overlaps(&directory.join("sensor_overlaps.csv"))?;
@@ -602,6 +690,58 @@ impl C51SpectralCovarianceRankArchive {
                     value.row.to_string(),
                     value.column.to_string(),
                     format_float(value.value),
+                ])
+                .map_err(csv_error)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_exact_covariance_audits(&self, path: &Path) -> Result<()> {
+        let mut writer = csv::Writer::from_path(path).map_err(csv_error)?;
+        writer
+            .write_record([
+                "refinement",
+                "alpha",
+                "design",
+                "bank",
+                "policy_version",
+                "status",
+                "residual_aware",
+                "residual_status",
+                "projection_applied",
+                "dimension",
+                "raw_scale",
+                "raw_maximum_absolute_skew",
+                "raw_maximum_relative_skew",
+                "raw_maximum_skew_row",
+                "raw_maximum_skew_column",
+                "relative_skew_limit",
+                "projection_maximum_absolute_correction",
+                "projection_frobenius_correction",
+            ])
+            .map_err(csv_error)?;
+        for audit in &self.exact_covariance_audits {
+            writer
+                .write_record([
+                    audit.refinement.to_string(),
+                    audit.alpha.to_string(),
+                    audit.design.as_str().to_string(),
+                    audit.bank.to_string(),
+                    audit.policy_version.to_string(),
+                    audit.status.to_string(),
+                    audit.residual_aware.to_string(),
+                    audit.residual_status.to_string(),
+                    audit.projection_applied.to_string(),
+                    audit.dimension.to_string(),
+                    format_float(audit.raw_scale),
+                    format_float(audit.raw_maximum_absolute_skew),
+                    format_float(audit.raw_maximum_relative_skew),
+                    audit.raw_maximum_skew_row.to_string(),
+                    audit.raw_maximum_skew_column.to_string(),
+                    format_float(audit.relative_skew_limit),
+                    format_float(audit.projection_maximum_absolute_correction),
+                    format_float(audit.projection_frobenius_correction),
                 ])
                 .map_err(csv_error)?;
         }
@@ -852,6 +992,21 @@ impl C51SpectralCovarianceRankArchive {
         }
         writeln!(writer, "rows_csv: rows.csv")?;
         writeln!(writer, "covariances_csv: covariances.csv")?;
+        writeln!(
+            writer,
+            "exact_covariance_audits_csv: exact_covariance_audits.csv"
+        )?;
+        writeln!(
+            writer,
+            "exact_covariance_audit_policy: {}",
+            INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION
+        )?;
+        writeln!(
+            writer,
+            "exact_covariance_relative_skew_limit: {:.17e}",
+            INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT
+        )?;
+        writeln!(writer, "exact_covariance_audit_residual_aware: false")?;
         writeln!(writer, "basis_attempts_csv: basis_attempts.csv")?;
         writeln!(writer, "sensor_banks_csv: sensor_banks.csv")?;
         writeln!(writer, "sensor_overlaps_csv: sensor_overlaps.csv")?;
@@ -876,6 +1031,7 @@ pub fn run_c51_spectral_covariance_rank(
         basis_attempts: Vec::new(),
         rows: Vec::new(),
         covariances: Vec::new(),
+        exact_covariance_audits: Vec::new(),
         sensor_banks: Vec::new(),
         plumbing_gates,
     };
@@ -1237,6 +1393,7 @@ fn run_refinement(
     for &alpha in &config.alphas {
         let row_start = archive.rows.len();
         let covariance_start = archive.covariances.len();
+        let audit_start = archive.exact_covariance_audits.len();
         if let Err(error) = run_alpha(
             config,
             refinement,
@@ -1253,6 +1410,7 @@ fn run_refinement(
         ) {
             archive.rows.truncate(row_start);
             archive.covariances.truncate(covariance_start);
+            archive.exact_covariance_audits.truncate(audit_start);
             append_censored_alpha_rows(
                 archive,
                 config,
@@ -1297,8 +1455,8 @@ fn run_alpha(
         design: C51CovarianceDesign::Prior,
         observation_count: 0,
         observation_reduced: None,
-        selection: prior_factor.pushforward_covariance(selection_full)?,
-        held_out: prior_factor.pushforward_covariance(held_out_full)?,
+        selection: prior_factor.pushforward_covariance_audited(selection_full)?,
+        held_out: prior_factor.pushforward_covariance_audited(held_out_full)?,
         latent_actions: latent_probe_rhs
             .iter()
             .map(|rhs| prior_factor.covariance_action(rhs))
@@ -1315,8 +1473,8 @@ fn run_alpha(
             design: design.kind,
             observation_count: design.count,
             observation_reduced: Some(to_csr(&design.reduced)),
-            selection: posterior.pushforward_covariance(selection_full)?,
-            held_out: posterior.pushforward_covariance(held_out_full)?,
+            selection: posterior.pushforward_covariance_audited(selection_full)?,
+            held_out: posterior.pushforward_covariance_audited(held_out_full)?,
             latent_actions: latent_probe_rhs
                 .iter()
                 .map(|rhs| posterior.covariance_action(rhs))
@@ -1324,26 +1482,22 @@ fn run_alpha(
         });
     }
     for exact in &exact_designs {
-        validate_reference_covariance(&exact.selection, "selection")?;
-        validate_reference_covariance(&exact.held_out, "held-out")?;
-        archive_covariance(
-            &mut archive.covariances,
+        validate_reference_covariance(&exact.selection.symmetric, "selection")?;
+        validate_reference_covariance(&exact.held_out.symmetric, "held-out")?;
+        archive_audited_exact_covariance(
+            archive,
             refinement,
             alpha,
             exact.design,
-            None,
             "selection",
-            "exact_supported",
             &exact.selection,
         );
-        archive_covariance(
-            &mut archive.covariances,
+        archive_audited_exact_covariance(
+            archive,
             refinement,
             alpha,
             exact.design,
-            None,
             "held_out",
-            "exact_supported",
             &exact.held_out,
         );
     }
@@ -1455,9 +1609,9 @@ fn run_alpha(
                     }
                 };
                 let selection_metrics =
-                    covariance_error_metrics(&selection_covariance, &exact.selection)?;
+                    covariance_error_metrics(&selection_covariance, &exact.selection.symmetric)?;
                 let held_out_metrics =
-                    covariance_error_metrics(&held_out_covariance, &exact.held_out)?;
+                    covariance_error_metrics(&held_out_covariance, &exact.held_out.symmetric)?;
                 let latent_mass_action_relative_errors = latent_action_errors(
                     operators.state().mass(),
                     &approximate_latent_actions,
@@ -1545,8 +1699,8 @@ struct ExactDesignCovariance {
     design: C51CovarianceDesign,
     observation_count: usize,
     observation_reduced: Option<CsrMatrix>,
-    selection: Vec<Vec<f64>>,
-    held_out: Vec<Vec<f64>>,
+    selection: AuditedSupportedCovariance,
+    held_out: AuditedSupportedCovariance,
     latent_actions: Vec<Vec<f64>>,
 }
 
@@ -2184,6 +2338,76 @@ fn append_censored_design_row(
 }
 
 #[cfg(feature = "external-solvers")]
+fn archive_audited_exact_covariance(
+    archive: &mut C51SpectralCovarianceRankArchive,
+    refinement: usize,
+    alpha: MaternAlpha,
+    design: C51CovarianceDesign,
+    bank: &'static str,
+    covariance: &AuditedSupportedCovariance,
+) {
+    archive_covariance(
+        &mut archive.covariances,
+        refinement,
+        alpha,
+        design,
+        None,
+        bank,
+        "exact_supported_raw",
+        &covariance.raw,
+    );
+    archive_covariance(
+        &mut archive.covariances,
+        refinement,
+        alpha,
+        design,
+        None,
+        bank,
+        "exact_supported_symmetric",
+        &covariance.symmetric,
+    );
+    archive
+        .exact_covariance_audits
+        .push(exact_covariance_audit_record(
+            refinement,
+            alpha,
+            design,
+            bank,
+            &covariance.audit,
+        ));
+}
+
+#[cfg(feature = "external-solvers")]
+fn exact_covariance_audit_record(
+    refinement: usize,
+    alpha: MaternAlpha,
+    design: C51CovarianceDesign,
+    bank: &'static str,
+    audit: &SupportedCovarianceSymmetryAudit,
+) -> C51ExactCovarianceAuditRecord {
+    C51ExactCovarianceAuditRecord {
+        refinement,
+        alpha: alpha.as_u32(),
+        design,
+        bank,
+        policy_version: audit.policy_version,
+        status: audit.status,
+        residual_aware: audit.residual_aware,
+        residual_status: audit.residual_status,
+        projection_applied: true,
+        dimension: audit.dimension,
+        raw_scale: audit.raw_scale,
+        raw_maximum_absolute_skew: audit.raw_maximum_absolute_skew,
+        raw_maximum_relative_skew: audit.raw_maximum_relative_skew,
+        raw_maximum_skew_row: audit.raw_maximum_skew_row,
+        raw_maximum_skew_column: audit.raw_maximum_skew_column,
+        relative_skew_limit: audit.relative_skew_limit,
+        projection_maximum_absolute_correction: audit.projection_maximum_absolute_correction,
+        projection_frobenius_correction: audit.projection_frobenius_correction,
+    }
+}
+
+#[cfg(feature = "external-solvers")]
 #[allow(clippy::too_many_arguments)]
 fn archive_covariance(
     output: &mut Vec<C51OutputCovarianceRecord>,
@@ -2432,6 +2656,7 @@ mod tests {
             }],
             rows: Vec::new(),
             covariances: Vec::new(),
+            exact_covariance_audits: Vec::new(),
             sensor_banks: ["selection", "held_out", "observation_candidates"]
                 .into_iter()
                 .map(|bank| C51SensorBankAudit {
@@ -2486,6 +2711,7 @@ mod tests {
             basis_attempts: Vec::new(),
             rows: Vec::new(),
             covariances: Vec::new(),
+            exact_covariance_audits: Vec::new(),
             sensor_banks: vec![C51SensorBankAudit {
                 refinement: 4,
                 bank: "observation_candidates",
@@ -2515,6 +2741,51 @@ mod tests {
         assert!(!weights.contains("overlapping_kernel_pairs"));
         assert_eq!(overlaps.lines().count(), 2);
         assert!(overlaps.contains("4,observation_candidates,0,1"));
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn exact_covariance_audit_csv_records_interim_policy_and_raw_defect() {
+        let directory =
+            std::env::temp_dir().join(format!("c51-exact-covariance-audit-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let archive = C51SpectralCovarianceRankArchive {
+            metadata: C51SpectralCovarianceRankMetadata::discovery("test"),
+            config: C51SpectralCovarianceRankConfig::smoke(),
+            basis_attempts: Vec::new(),
+            rows: Vec::new(),
+            covariances: Vec::new(),
+            exact_covariance_audits: vec![C51ExactCovarianceAuditRecord {
+                refinement: 8,
+                alpha: 3,
+                design: C51CovarianceDesign::Prior,
+                bank: "selection",
+                policy_version: INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION,
+                status: "accepted_interim_scale_relative_and_projected",
+                residual_aware: false,
+                residual_status:
+                    "unavailable: gmrf-core KKT covariance-action residuals are not exposed",
+                projection_applied: true,
+                dimension: OUTPUT_DIMENSION,
+                raw_scale: 1.369_730_048_8e-3,
+                raw_maximum_absolute_skew: 4.944_989e-14,
+                raw_maximum_relative_skew: 3.610_19e-11,
+                raw_maximum_skew_row: 4,
+                raw_maximum_skew_column: 5,
+                relative_skew_limit: INTERIM_SUPPORTED_COVARIANCE_RELATIVE_SKEW_LIMIT,
+                projection_maximum_absolute_correction: 2.472_494_5e-14,
+                projection_frobenius_correction: 3.496_636_3e-14,
+            }],
+            sensor_banks: Vec::new(),
+            plumbing_gates: Vec::new(),
+        };
+        let path = directory.join("exact_covariance_audits.csv");
+        archive.write_exact_covariance_audits(&path).unwrap();
+        let csv = std::fs::read_to_string(path).unwrap();
+        assert!(csv.contains(INTERIM_SUPPORTED_COVARIANCE_AUDIT_POLICY_VERSION));
+        assert!(csv.contains("8,3,prior,selection"));
+        assert!(csv.contains("false,unavailable:"));
+        assert!(csv.contains("4.944989000000000"));
         std::fs::remove_dir_all(directory).unwrap();
     }
 }
