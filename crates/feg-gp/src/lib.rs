@@ -3980,9 +3980,7 @@ mod tests {
             .collect::<Vec<_>>();
         let covariance = gp.covariance_matrix();
         let prior_state_input = [0.3, -0.6, 0.2, 1.1];
-        let prior_state_action = gp
-            .prior_covariance_action(&prior_state_input)
-            .unwrap();
+        let prior_state_action = gp.prior_covariance_action(&prior_state_input).unwrap();
         for row in 0..4 {
             let expected = (0..4)
                 .map(|column| covariance[(idx(row), idx(column))] * prior_state_input[column])
