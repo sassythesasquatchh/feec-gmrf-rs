@@ -20,22 +20,27 @@ pub fn feec_csr_to_gmrf(mat: &FeecCsr) -> GmrfSparse {
 /// The integration crate owns this conversion between `feg-core` and
 /// `gmrf-core` matrix types.
 pub fn core_triplet_to_gmrf(matrix: &SparseTripletMatrix) -> GmrfSparse {
-    feec_csr_to_gmrf(&core_triplet_to_feec_csr(matrix))
+    let mut coo = GmrfCoo::new(matrix.nrows(), matrix.ncols());
+    for (row, col, value) in matrix.triplet_iter() {
+        coo.push(row, col, value);
+    }
+    GmrfSparse::from(&coo)
 }
 
 /// Convert a GMRF sparse matrix to the integration sparse contract.
 pub fn gmrf_sparse_to_core_triplet(matrix: &GmrfSparse) -> SparseTripletMatrix {
-    SparseTripletMatrix::from_triplets(
-        matrix.nrows(),
-        matrix.ncols(),
-        matrix
-            .triplet_iter()
-            .map(|(row, col, value)| SparseTriplet {
-                row,
-                col,
-                value: *value,
-            }),
-    )
+    // faer exposes CSC traversal order. Canonicalize the backend-neutral
+    // boundary representation so callers do not observe backend storage order.
+    let mut triplets = matrix
+        .triplet_iter()
+        .map(|(row, col, value)| SparseTriplet {
+            row,
+            col,
+            value: *value,
+        })
+        .collect::<Vec<_>>();
+    triplets.sort_unstable_by_key(|entry| (entry.row, entry.col));
+    SparseTripletMatrix::from_triplets(matrix.nrows(), matrix.ncols(), triplets)
 }
 
 pub fn feec_vec_to_gmrf(vec: &FeecVector) -> GmrfVector {

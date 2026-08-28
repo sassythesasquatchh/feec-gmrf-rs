@@ -123,7 +123,7 @@ impl LinearMap {
                 inner.input_dimension()
             )));
         }
-        Self::new(multiply_sparse(&self.matrix, &inner.matrix))
+        Self::new(multiply_sparse(&self.matrix, &inner.matrix)?)
     }
 
     /// Stack maps with a shared domain vertically.
@@ -435,39 +435,18 @@ pub(crate) fn add_sparse(lhs: &SparseMat, rhs: &SparseMat) -> Result<SparseMat> 
             "sparse addition requires equal shapes".to_string(),
         ));
     }
-    let mut entries = BTreeMap::<(usize, usize), f64>::new();
-    for (row, col, value) in lhs.triplet_iter().chain(rhs.triplet_iter()) {
-        *entries.entry((row, col)).or_default() += value;
-    }
-    Ok(SparseMat::from_triplets(
-        lhs.nrows(),
-        lhs.ncols(),
-        entries
-            .into_iter()
-            .filter(|(_, value)| *value != 0.0)
-            .map(|((row, col), value)| SparseTriplet { row, col, value }),
+    let lhs = feg_infer::sparse::core_triplet_to_gmrf(lhs);
+    let rhs = feg_infer::sparse::core_triplet_to_gmrf(rhs);
+    Ok(feg_infer::sparse::gmrf_sparse_to_core_triplet(
+        &gmrf_core::add_sparse(&lhs, &rhs),
     ))
 }
 
-pub(crate) fn multiply_sparse(lhs: &SparseMat, rhs: &SparseMat) -> SparseMat {
-    let mut rhs_rows = vec![Vec::<(usize, f64)>::new(); rhs.nrows()];
-    for (row, col, value) in rhs.triplet_iter() {
-        rhs_rows[row].push((col, value));
-    }
-    let mut entries = BTreeMap::<(usize, usize), f64>::new();
-    for (row, middle, lhs_value) in lhs.triplet_iter() {
-        for &(col, rhs_value) in &rhs_rows[middle] {
-            *entries.entry((row, col)).or_default() += lhs_value * rhs_value;
-        }
-    }
-    SparseMat::from_triplets(
-        lhs.nrows(),
-        rhs.ncols(),
-        entries
-            .into_iter()
-            .filter(|(_, value)| *value != 0.0)
-            .map(|((row, col), value)| SparseTriplet { row, col, value }),
-    )
+pub(crate) fn multiply_sparse(lhs: &SparseMat, rhs: &SparseMat) -> Result<SparseMat> {
+    let lhs = feg_infer::sparse::core_triplet_to_gmrf(lhs);
+    let rhs = feg_infer::sparse::core_triplet_to_gmrf(rhs);
+    let product = gmrf_core::multiply_sparse(&lhs, &rhs)?;
+    Ok(feg_infer::sparse::gmrf_sparse_to_core_triplet(&product))
 }
 
 #[cfg(test)]
@@ -485,6 +464,69 @@ mod tests {
             stacked.apply(&[1.0, 3.0]).unwrap(),
             vec![2.0, 6.0, 2.0, 6.0]
         );
+    }
+
+    #[test]
+    fn rectangular_sparse_composition_matches_sequential_application() {
+        let inner = LinearMap::weighted_rows(
+            4,
+            &[
+                vec![(0, 1.0), (1, 2.0)],
+                vec![(1, -1.0), (2, 3.0)],
+                vec![(0, 2.0), (3, 1.0)],
+            ],
+        )
+        .unwrap();
+        let outer =
+            LinearMap::weighted_rows(3, &[vec![(0, 2.0), (1, 1.0)], vec![(0, -1.0), (2, 0.5)]])
+                .unwrap();
+        let input = [1.0, -2.0, 0.5, 4.0];
+
+        let composed = outer.compose(&inner).unwrap();
+        let sequential = outer.apply(&inner.apply(&input).unwrap()).unwrap();
+
+        assert_eq!(composed.output_dimension(), 2);
+        assert_eq!(composed.input_dimension(), 4);
+        assert_eq!(composed.apply(&input).unwrap(), sequential);
+    }
+
+    #[test]
+    fn sparse_addition_cancels_entries_after_backend_conversion() {
+        let left = SparseMat::from_triplets(
+            2,
+            2,
+            [
+                SparseTriplet {
+                    row: 0,
+                    col: 1,
+                    value: 3.0,
+                },
+                SparseTriplet {
+                    row: 1,
+                    col: 0,
+                    value: 2.0,
+                },
+            ],
+        );
+        let right = SparseMat::from_triplets(
+            2,
+            2,
+            [
+                SparseTriplet {
+                    row: 0,
+                    col: 1,
+                    value: -3.0,
+                },
+                SparseTriplet {
+                    row: 1,
+                    col: 1,
+                    value: 5.0,
+                },
+            ],
+        );
+
+        let sum = add_sparse(&left, &right).unwrap();
+        assert_eq!(sum.apply_checked(&[2.0, 4.0]).unwrap(), [0.0, 24.0]);
     }
 
     #[test]
