@@ -4,7 +4,10 @@ use crate::model::DerivedQuantity;
 use crate::operator::LinearMap;
 use crate::prior::GaussianPrior;
 use crate::{FeecGmrfError, Result};
-use manifold::{geometry::coord::mesh::MeshCoords, topology::complex::Complex};
+use manifold::{
+    geometry::coord::{mesh::MeshCoords, simplex::SimplexHandleExt},
+    topology::complex::Complex,
+};
 
 /// A named physical pushforward from latent cochains to reported values.
 #[derive(Debug, Clone, PartialEq)]
@@ -17,10 +20,182 @@ pub struct PhysicalMap {
 #[derive(Debug, Clone, PartialEq)]
 pub struct MagneticFieldMaps3d {
     pub flux_cochain: LinearMap,
+    /// Cell-major Whitney 2-form vector proxy:
+    /// `[Bx_cell0, By_cell0, Bz_cell0, Bx_cell1, ...]`.
+    /// This differs from the component-major 1-form reconstruction API.
     pub magnetic_field: PhysicalMap,
     pub volume_average_components: [LinearMap; 3],
     pub vector_rms_weights: Vec<f64>,
     pub domain_volume: f64,
+}
+
+/// Compactly supported, mesh-independent Wendland C2 sensor kernel in 3D.
+///
+/// At distance `d` from `center`, the unnormalized weight is
+/// `(1-q)^4 (4q+1)` for `q=d/radius < 1`, and zero otherwise.  The magnetic
+/// sensor builder normalizes its discrete volume quadrature, so the kernel's
+/// absolute scale does not affect the reported average.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WendlandC2Kernel3d {
+    center: [f64; 3],
+    radius: f64,
+}
+
+impl WendlandC2Kernel3d {
+    /// Construct a fixed physical kernel.
+    pub fn new(center: [f64; 3], radius: f64) -> Result<Self> {
+        if center.iter().any(|coordinate| !coordinate.is_finite()) {
+            return Err(FeecGmrfError::InvalidParameter(
+                "Wendland kernel center coordinates must be finite".to_string(),
+            ));
+        }
+        if !radius.is_finite() || radius <= 0.0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "Wendland kernel radius must be finite and positive".to_string(),
+            ));
+        }
+        Ok(Self { center, radius })
+    }
+
+    pub fn center(self) -> [f64; 3] {
+        self.center
+    }
+
+    pub fn radius(self) -> f64 {
+        self.radius
+    }
+
+    /// Evaluate the unnormalized radial weight at a physical point.
+    pub fn evaluate(self, point: [f64; 3]) -> Result<f64> {
+        if point.iter().any(|coordinate| !coordinate.is_finite()) {
+            return Err(FeecGmrfError::InvalidParameter(
+                "Wendland kernel evaluation point must be finite".to_string(),
+            ));
+        }
+        let distance = point
+            .iter()
+            .zip(self.center)
+            .map(|(coordinate, center)| (coordinate - center).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        let q = distance / self.radius;
+        Ok(if q < 1.0 {
+            (1.0 - q).powi(4) * (4.0 * q + 1.0)
+        } else {
+            0.0
+        })
+    }
+
+    /// Analytic integral over R3, useful for quadrature diagnostics when the
+    /// support ball lies wholly inside the physical domain.
+    pub fn whole_space_integral(self) -> f64 {
+        2.0 * std::f64::consts::PI * self.radius.powi(3) / 21.0
+    }
+}
+
+/// Fixed-footprint magnetic volume sensors using the canonical `A -> D1 -> B`
+/// FEEC pushforward.
+///
+/// Outputs are kernel-major, with `[Bx, By, Bz]` for each kernel.  The stored
+/// normalizations are the mesh quadrature approximations to each kernel
+/// integral and allow cross-mesh quadrature auditing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MagneticVolumeSensorBank3d {
+    kernels: Vec<WendlandC2Kernel3d>,
+    quadrature_normalizations: Vec<f64>,
+    magnetic_volume_averages: PhysicalMap,
+}
+
+impl MagneticVolumeSensorBank3d {
+    /// Assemble fixed physical-volume averages from cell-barycenter
+    /// quadrature of the canonical Whitney 2-form magnetic reconstruction.
+    pub fn from_feec(
+        topology: &Complex,
+        coords: &MeshCoords,
+        kernels: &[WendlandC2Kernel3d],
+    ) -> Result<Self> {
+        if topology.dim() != 3 || coords.dim() != 3 {
+            return Err(FeecGmrfError::Dimension(
+                "3D magnetic volume sensors require a 3D topology and coordinates".to_string(),
+            ));
+        }
+        if kernels.is_empty() {
+            return Err(FeecGmrfError::InvalidParameter(
+                "magnetic volume sensor bank requires at least one kernel".to_string(),
+            ));
+        }
+
+        let magnetic = MagneticFieldMaps3d::from_feec(topology, coords)?;
+        let cell_geometry = topology
+            .cells()
+            .handle_iter()
+            .map(|cell| {
+                let simplex = cell.coord_simplex(coords);
+                let barycenter = simplex.barycenter();
+                let volume = simplex.vol();
+                ([barycenter[0], barycenter[1], barycenter[2]], volume)
+            })
+            .collect::<Vec<_>>();
+        if cell_geometry
+            .iter()
+            .any(|(_, volume)| !volume.is_finite() || *volume <= 0.0)
+        {
+            return Err(FeecGmrfError::Assembly(
+                "magnetic volume sensor mesh contains a non-positive or non-finite cell volume"
+                    .to_string(),
+            ));
+        }
+
+        let mut rows = Vec::with_capacity(3 * kernels.len());
+        let mut quadrature_normalizations = Vec::with_capacity(kernels.len());
+        for (kernel_index, kernel) in kernels.iter().copied().enumerate() {
+            let unnormalized = cell_geometry
+                .iter()
+                .map(|(point, volume)| kernel.evaluate(*point).map(|weight| weight * volume))
+                .collect::<Result<Vec<_>>>()?;
+            let normalization = unnormalized.iter().sum::<f64>();
+            if !normalization.is_finite() || normalization <= 0.0 {
+                return Err(FeecGmrfError::InvalidParameter(format!(
+                    "magnetic volume kernel {kernel_index} has zero support under the mesh quadrature"
+                )));
+            }
+            quadrature_normalizations.push(normalization);
+            for component in 0..3 {
+                rows.push(
+                    unnormalized
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .filter(|(_, weight)| *weight != 0.0)
+                        .map(|(cell, weight)| (3 * cell + component, weight / normalization))
+                        .collect(),
+                );
+            }
+        }
+        let averaging =
+            LinearMap::weighted_rows(magnetic.magnetic_field.map().output_dimension(), &rows)?;
+        let magnetic_volume_averages = PhysicalMap::new(
+            "fixed_footprint_magnetic_volume_averages",
+            averaging.compose(magnetic.magnetic_field.map())?,
+        )?;
+        Ok(Self {
+            kernels: kernels.to_vec(),
+            quadrature_normalizations,
+            magnetic_volume_averages,
+        })
+    }
+
+    pub fn kernels(&self) -> &[WendlandC2Kernel3d] {
+        &self.kernels
+    }
+
+    pub fn quadrature_normalizations(&self) -> &[f64] {
+        &self.quadrature_normalizations
+    }
+
+    pub fn map(&self) -> &PhysicalMap {
+        &self.magnetic_volume_averages
+    }
 }
 
 impl MagneticFieldMaps3d {
@@ -409,6 +584,59 @@ mod tests {
             .iter()
             .all(|map| map.output_dimension() == 1));
         assert!((maps.vector_rms_weights.iter().sum::<f64>() - 3.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn fixed_footprint_magnetic_sensors_preserve_constant_fields() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 3, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let kernels = [
+            WendlandC2Kernel3d::new([0.35, 0.35, 0.35], 0.3).unwrap(),
+            WendlandC2Kernel3d::new([0.65, 0.65, 0.65], 0.3).unwrap(),
+        ];
+        let sensors = MagneticVolumeSensorBank3d::from_feec(&topology, &coords, &kernels).unwrap();
+        let field = exterior::field::DiffFormClosure::one_form(
+            |point| common::linalg::nalgebra::Vector::from_column_slice(&[0.0, 0.0, point[1]]),
+            3,
+        );
+        let cochain = ddf::cochain::cochain_projection(&field, &topology, &coords, None);
+        let values = sensors.map().apply(cochain.coeffs.as_slice()).unwrap();
+        assert_eq!(values.len(), 6);
+        for kernel in 0..2 {
+            assert!((values[3 * kernel] - 1.0).abs() < 1.0e-10);
+            assert!(values[3 * kernel + 1].abs() < 1.0e-10);
+            assert!(values[3 * kernel + 2].abs() < 1.0e-10);
+        }
+    }
+
+    #[test]
+    fn fixed_footprint_kernel_quadrature_converges_to_whole_space_integral() {
+        let kernel = WendlandC2Kernel3d::new([0.5; 3], 0.35).unwrap();
+        let exact = kernel.whole_space_integral();
+        let approximation = |resolution| {
+            let mesh = CartesianMeshInfo::new_unit_scaled(3, resolution, 1.0);
+            let (topology, coords) = mesh.compute_coord_complex();
+            MagneticVolumeSensorBank3d::from_feec(&topology, &coords, &[kernel])
+                .unwrap()
+                .quadrature_normalizations()[0]
+        };
+        let coarse_error = (approximation(2) - exact).abs();
+        let fine_error = (approximation(8) - exact).abs();
+        assert!(
+            fine_error < coarse_error,
+            "refined fixed-kernel quadrature error {fine_error:.6e} did not improve over {coarse_error:.6e}"
+        );
+        assert!(fine_error / exact < 0.1);
+    }
+
+    #[test]
+    fn fixed_footprint_kernels_validate_parameters_and_mesh_support() {
+        assert!(WendlandC2Kernel3d::new([f64::NAN, 0.0, 0.0], 1.0).is_err());
+        assert!(WendlandC2Kernel3d::new([0.0; 3], 0.0).is_err());
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 1, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let outside = WendlandC2Kernel3d::new([4.0; 3], 0.1).unwrap();
+        assert!(MagneticVolumeSensorBank3d::from_feec(&topology, &coords, &[outside]).is_err());
     }
 
     #[test]

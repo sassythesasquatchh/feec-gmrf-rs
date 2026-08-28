@@ -176,6 +176,15 @@ impl SupportedMaternPrior {
         )
     }
 
+    /// Exact covariance matrix of a small active- or full-cochain prior output.
+    ///
+    /// This convenience method factors the certified support once and delegates
+    /// to [`SupportedMaternPosterior::pushforward_covariance`]. Repeated queries
+    /// should retain the factored posterior instead.
+    pub fn pushforward_covariance(&self, map: &LinearMap) -> Result<Vec<Vec<f64>>> {
+        self.factor()?.pushforward_covariance(map)
+    }
+
     /// Condition state-coordinate observations and append exact state constraints.
     pub fn condition(
         &self,
@@ -508,6 +517,39 @@ impl SupportedMaternPosterior {
         )?;
         let variances = self.factor.exact_transformed_variances(&operator)?;
         Ok(variances.iter().copied().collect())
+    }
+
+    /// Exact covariance matrix of a small active- or full-cochain output map.
+    ///
+    /// Only the requested output covariance is materialized. Each column uses
+    /// the certified selected covariance action on the supported state; no
+    /// ambient covariance or dense inverse is formed.
+    pub fn pushforward_covariance(&self, map: &LinearMap) -> Result<Vec<Vec<f64>>> {
+        let eliminated = resolve_state_map(
+            &self.state_layout,
+            self.mean.len(),
+            map,
+            &vec![0.0; map.output_dimension()],
+        )?;
+        let reduced = eliminated.reduced();
+        let output_dimension = reduced.output_dimension();
+        let mut covariance = vec![vec![0.0; output_dimension]; output_dimension];
+        for column in 0..output_dimension {
+            let mut output_basis = vec![0.0; output_dimension];
+            output_basis[column] = 1.0;
+            let state_rhs = reduced.apply_transpose(&output_basis)?;
+            let state_action = self.covariance_action(&state_rhs)?;
+            let output_action = reduced.apply(&state_action)?;
+            for (row, value) in output_action.into_iter().enumerate() {
+                if !value.is_finite() {
+                    return Err(FeecGmrfError::Inference(format!(
+                        "supported transformed covariance entry ({row}, {column}) is non-finite"
+                    )));
+                }
+                covariance[row][column] = value;
+            }
+        }
+        Ok(covariance)
     }
 
     /// Sampling is not available until a support-aware square root is implemented.

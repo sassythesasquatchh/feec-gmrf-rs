@@ -1463,6 +1463,32 @@ impl SpectralMaternGp {
         diagonal_from_feature_matrix(&self.feature_matrix())
     }
 
+    /// Prior covariance after a sparse output map.
+    ///
+    /// Only the requested output covariance is materialized. The ambient
+    /// coefficient covariance is never constructed.
+    pub fn prior_output_covariance(&self, output_matrix: &CsrMatrix) -> Result<Mat<f64>, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.feature_matrix())?;
+        Ok(full_covariance_from_feature_matrix(&output_features))
+    }
+
+    /// Apply the prior covariance in a requested sparse output space.
+    pub fn prior_output_covariance_action(
+        &self,
+        output_matrix: &CsrMatrix,
+        input: &[f64],
+    ) -> Result<Vec<f64>, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.feature_matrix())?;
+        if input.len() != output_features.nrows() {
+            return Err(GpError::OutputVectorDimensionMismatch {
+                expected: output_features.nrows(),
+                got: input.len(),
+            });
+        }
+        let latent_input = dense_transpose_times_vector(&output_features, input);
+        Ok(dense_matrix_times_vector(&output_features, &latent_input))
+    }
+
     pub fn sample_from_standard_normal(&self, z: &[f64]) -> Result<Vec<f64>, GpError> {
         let k = self.weights.len();
         if z.len() != k {
@@ -3973,6 +3999,25 @@ mod tests {
         output.push(1, 1, 0.3);
         output.push(1, 3, 1.2);
         let output = CsrMatrix::from(&output);
+        let prior_output_covariance = gp.prior_output_covariance(&output).unwrap();
+        let expected_prior_output_covariance = sparse_covariance_pushforward(&output, &covariance);
+        assert_matrix_close(
+            &prior_output_covariance,
+            &expected_prior_output_covariance,
+            5.0e-13,
+        );
+        let prior_output_input = [0.4, -0.9];
+        let prior_output_action = gp
+            .prior_output_covariance_action(&output, &prior_output_input)
+            .unwrap();
+        for row in 0..2 {
+            let expected = (0..2)
+                .map(|col| {
+                    expected_prior_output_covariance[(idx(row), idx(col))] * prior_output_input[col]
+                })
+                .sum::<f64>();
+            assert_close(prior_output_action[row], expected, 5.0e-13);
+        }
         let output_moments = prepared
             .output_moments_with_covariance(&output, &values)
             .unwrap();

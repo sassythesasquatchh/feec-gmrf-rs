@@ -62,20 +62,6 @@ fn assert_vector_close(actual: &[f64], expected: &[f64], context: &str) {
     }
 }
 
-fn supported_covariance(posterior: &SupportedMaternPosterior) -> Vec<Vec<f64>> {
-    let dimension = posterior.mean().len();
-    let mut covariance = vec![vec![0.0; dimension]; dimension];
-    for column in 0..dimension {
-        let mut basis = vec![0.0; dimension];
-        basis[column] = 1.0;
-        let action = posterior.covariance_action(&basis).unwrap();
-        for row in 0..dimension {
-            covariance[row][column] = action[row];
-        }
-    }
-    covariance
-}
-
 fn assert_covariance_close(actual: &[Vec<f64>], expected: &[Vec<f64>], context: &str) {
     assert_eq!(actual.len(), expected.len(), "{context}: row mismatch");
     for (row, (actual, expected)) in actual.iter().zip(expected).enumerate() {
@@ -163,7 +149,16 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
             .pushforward_covariance(&LinearMap::identity(2))
             .unwrap();
         assert_covariance_close(
-            &supported_covariance(&supported_factor),
+            &supported
+                .pushforward_covariance(&LinearMap::identity(2))
+                .unwrap(),
+            &exact_covariance,
+            &format!("alpha {alpha:?} prior convenience covariance"),
+        );
+        assert_covariance_close(
+            &supported_factor
+                .pushforward_covariance(&LinearMap::identity(2))
+                .unwrap(),
             &exact_covariance,
             &format!("alpha {alpha:?} prior covariance"),
         );
@@ -188,7 +183,9 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
             &format!("alpha {alpha:?} observed mean"),
         );
         assert_covariance_close(
-            &supported_covariance(&supported_observed),
+            &supported_observed
+                .pushforward_covariance(&LinearMap::identity(2))
+                .unwrap(),
             &exact_observed
                 .pushforward_covariance(&LinearMap::identity(2))
                 .unwrap(),
@@ -255,7 +252,9 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
             &format!("alpha {alpha:?} constrained mean"),
         );
         assert_covariance_close(
-            &supported_covariance(&supported_constrained),
+            &supported_constrained
+                .pushforward_covariance(&LinearMap::identity(2))
+                .unwrap(),
             &exact_constrained
                 .pushforward_covariance(&LinearMap::identity(2))
                 .unwrap(),
@@ -272,6 +271,16 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
             supported_variance[0],
             exact_variance[0][0],
             &format!("alpha {alpha:?} constrained transformed variance"),
+        );
+        let outputs =
+            LinearMap::weighted_rows(2, &[vec![(0, 1.25), (1, -0.75)], vec![(0, -0.4), (1, 0.9)]])
+                .unwrap();
+        assert_covariance_close(
+            &supported_constrained
+                .pushforward_covariance(&outputs)
+                .unwrap(),
+            &exact_constrained.pushforward_covariance(&outputs).unwrap(),
+            &format!("alpha {alpha:?} constrained output covariance"),
         );
     }
 }

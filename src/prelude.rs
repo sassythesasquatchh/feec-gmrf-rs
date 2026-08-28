@@ -44,7 +44,8 @@ pub use crate::physical::{
     calibrate_prior_to_physical_rms, calibrate_prior_to_physical_rms_with_method,
     calibrate_prior_to_weighted_physical_rms, calibrate_prior_to_weighted_physical_rms_with_method,
     magnetic_field_map, outward_boundary_flux_map_3d, reconstructed_barycenter_1form_map,
-    scalar_field_l2_rms_weights, MagneticFieldMaps3d, PhysicalMap, PhysicalRmsCalibration,
+    scalar_field_l2_rms_weights, MagneticFieldMaps3d, MagneticVolumeSensorBank3d, PhysicalMap,
+    PhysicalRmsCalibration, WendlandC2Kernel3d,
 };
 pub use crate::prior::supported::{
     PreparedSupportedMaternModel, SupportedMaternDiagnostics, SupportedMaternLayout,
