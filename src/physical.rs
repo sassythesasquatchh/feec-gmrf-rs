@@ -26,6 +26,25 @@ pub struct MagneticFieldMaps3d {
 impl MagneticFieldMaps3d {
     /// Assemble the full-space FEEC magnetic chain and its common QoI maps.
     pub fn from_feec(topology: &Complex, coords: &MeshCoords) -> Result<Self> {
+        if topology.dim() != 3 || coords.dim() != 3 {
+            return Err(FeecGmrfError::Dimension(
+                "3D magnetic maps require a 3D topology and coordinates".to_string(),
+            ));
+        }
+        let selected_cells = (0..topology.nsimplices(3)).collect::<Vec<_>>();
+        Self::from_feec_with_volume_average_cells(topology, coords, &selected_cells)
+    }
+
+    /// Assemble the magnetic chain with volume averages over selected cells.
+    ///
+    /// The full cellwise magnetic-field map is unchanged. Only the three
+    /// volume-average component maps and their normalized RMS weights are
+    /// restricted to the supplied physical region.
+    pub fn from_feec_with_volume_average_cells(
+        topology: &Complex,
+        coords: &MeshCoords,
+        selected_cells: &[usize],
+    ) -> Result<Self> {
         let flux_cochain = linear_map_from_rows(
             feg_infer::physical::build_exterior_derivative_1_operator(topology)
                 .map_err(FeecGmrfError::Assembly)?,
@@ -37,9 +56,12 @@ impl MagneticFieldMaps3d {
                     .map_err(FeecGmrfError::Assembly)?,
             )?,
         )?;
-        let averages =
-            feg_infer::physical::build_magnetic_flux_density_averages_3d(topology, coords)
-                .map_err(FeecGmrfError::Assembly)?;
+        let averages = feg_infer::physical::build_selected_cell_magnetic_flux_density_averages_3d(
+            topology,
+            coords,
+            selected_cells,
+        )
+        .map_err(FeecGmrfError::Assembly)?;
         Ok(Self {
             flux_cochain,
             magnetic_field,
@@ -371,6 +393,23 @@ mod tests {
     use super::*;
     use crate::boundary::EssentialBoundaryConditions;
     use crate::operator::SparseMat;
+    use manifold::gen::cartesian::CartesianMeshInfo;
+
+    #[test]
+    fn selected_cell_magnetic_average_is_exposed_by_root_api() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let maps =
+            MagneticFieldMaps3d::from_feec_with_volume_average_cells(&topology, &coords, &[0])
+                .unwrap();
+        assert!(maps.domain_volume > 0.0 && maps.domain_volume < 1.0);
+        assert_eq!(maps.volume_average_components.len(), 3);
+        assert!(maps
+            .volume_average_components
+            .iter()
+            .all(|map| map.output_dimension() == 1));
+        assert!((maps.vector_rms_weights.iter().sum::<f64>() - 3.0).abs() < 1.0e-12);
+    }
 
     #[test]
     fn magnetic_map_is_explicit_operator_composition() {

@@ -1,44 +1,54 @@
 //! Reusable C51 accuracy--resource benchmark harness.
 //!
 //! The smoke profile is deliberately small. It checks the archive schema and
-//! compares three production construction routes on a three-dimensional
+//! compares three precision construction routes and a bounded spectral
+//! reference on a three-dimensional
 //! Whitney 1-form problem:
 //!
 //! - `FM-DIRECT`: exact eliminated full-metric precision;
 //! - `FM-AUG`: the same finite Gaussian law on a sparse constrained support;
 //! - `WHITNEY-COMPACT`: the projected-inverse Whitney approximation.
 //!
-//! A spectral row is always present. Until the frozen generalized-eigenbasis
-//! adapter is available it is recorded as typed `unavailable`; it is never
-//! silently skipped or assigned zero cost. Tiny timings validate
-//! instrumentation only and are not evidence of a performance advantage.
+//! Full-rank spectral rows represent the same finite Gaussian law as
+//! `FM-DIRECT`; truncated spectral rows are approximation baselines and are
+//! never described as the same law. Tiny timings validate instrumentation
+//! only and are not evidence of a performance advantage.
 
 use feec_gmrf::prelude::{
     CholeskyOrderingKind, EssentialBoundaryConditions, EssentialBoundaryElimination,
     ExactFormOperators, ExactMaternPriorBuilder, FeecGmrfError, GaussianNoise, GaussianPrior,
     LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d, MaternAlpha,
-    MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SupportedMaternPrior,
-    SupportedMaternPriorBuilder, VarianceMethod,
+    MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
+    SupportedMaternPrior, SupportedMaternPriorBuilder, VarianceMethod,
 };
-use manifold::gen::cartesian::CartesianMeshInfo;
+use feg_gp::{
+    dense_reference_generalized_hodge_eigenbasis, DenseReferenceEigensolverOptions, EigenBasis,
+    LowRankConditioningStrategy, SpectralMaternConfig, SpectralMaternGp,
+};
+use manifold::{
+    gen::cartesian::CartesianMeshInfo, geometry::coord::simplex::SimplexHandleExt,
+    topology::complex::Complex,
+};
 use rand::{rngs::StdRng, SeedableRng};
+use rand_distr::{Distribution, StandardNormal};
+use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v1";
+pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v2";
 pub const C51_STUDY_ID: &str = "c51/accuracy-resource";
 
 const EXACT_REFERENCE_MAXIMUM_DIMENSION: usize = 1_024;
 const PHYSICAL_QOI_OUTPUT_COUNT: usize = 3;
 const UPDATE_NNZ_PENDING_REASON: &str =
     "supported-law observation-update nnz is not yet exposed by the root API";
-const SPECTRAL_PENDING_REASON: &str =
-    "the frozen generalized-eigenbasis spectral adapter is not available in this smoke harness";
 const KKT_FILL_UNAVAILABLE_REASON: &str =
     "faer 0.21.9 does not expose sparse LU numeric factor storage";
+const SPECTRAL_SPARSE_PRECISION_REASON: &str =
+    "a spectral feature model does not assemble a sparse coefficient precision";
 
 /// A resource or accuracy quantity with explicit availability semantics.
 #[derive(Debug, Clone, PartialEq)]
@@ -105,23 +115,18 @@ pub enum C51MethodId {
     FullMetricDirect,
     FullMetricAugmented,
     WhitneyCompact,
-    Spectral,
+    SpectralFullRank,
+    SpectralLowRank,
 }
 
 impl C51MethodId {
-    pub const ALL: [Self; 4] = [
-        Self::FullMetricDirect,
-        Self::FullMetricAugmented,
-        Self::WhitneyCompact,
-        Self::Spectral,
-    ];
-
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::FullMetricDirect => "fm_direct",
             Self::FullMetricAugmented => "fm_aug",
             Self::WhitneyCompact => "whitney_compact",
-            Self::Spectral => "spectral_r",
+            Self::SpectralFullRank => "spectral_full_rank",
+            Self::SpectralLowRank => "spectral_low_rank",
         }
     }
 }
@@ -204,12 +209,19 @@ pub struct C51BenchmarkConfig {
     pub observation_noise_variance: f64,
     /// Local bounded-support sensor counts.
     pub local_sensor_counts: Vec<usize>,
+    /// Local sensor targets as fractions of the active state dimension.
+    pub local_sensor_density_targets: Vec<f64>,
     /// Number of replacement data vectors solved against a fixed design.
     pub repeated_data_counts: Vec<usize>,
     /// Add one dense, mesh-global observation row as a locality control.
     pub include_global_row: bool,
-    /// Requested spectral rank. The smoke row is typed unavailable until its adapter lands.
-    pub spectral_rank: usize,
+    /// Fixed physical region for the three volume-average magnetic QoIs.
+    pub physical_qoi_region_lower: [f64; 3],
+    pub physical_qoi_region_upper: [f64; 3],
+    /// Requested truncated spectral ranks. Full rank is always added separately.
+    pub spectral_low_ranks: Vec<usize>,
+    /// Explicit ceiling for the dense generalized eigensolver.
+    pub spectral_reference_maximum_dimension: usize,
     /// Posterior samples included in each available full-UQ row.
     pub posterior_sample_count: usize,
     pub seed: u64,
@@ -226,12 +238,31 @@ impl C51BenchmarkConfig {
             kappa: 4.0,
             tau: 1.0,
             observation_noise_variance: 0.05,
-            local_sensor_counts: vec![2, 4],
+            local_sensor_counts: vec![32],
+            local_sensor_density_targets: vec![0.02, 0.10],
             repeated_data_counts: vec![1, 2],
             include_global_row: true,
-            spectral_rank: 8,
+            physical_qoi_region_lower: [0.25; 3],
+            physical_qoi_region_upper: [0.75; 3],
+            spectral_low_ranks: vec![8],
+            spectral_reference_maximum_dimension: 512,
             posterior_sample_count: 4,
             seed: 0xC510_2026,
+        }
+    }
+
+    /// Bounded discovery ladder. It is not a preregistered evidence profile.
+    pub fn reference_ladder() -> Self {
+        Self {
+            refinements: vec![2, 3, 4],
+            local_sensor_counts: vec![32],
+            local_sensor_density_targets: vec![0.02, 0.10],
+            repeated_data_counts: vec![1, 10, 100],
+            spectral_low_ranks: vec![8, 16, 32, 64],
+            spectral_reference_maximum_dimension: 1_024,
+            posterior_sample_count: 8,
+            seed: 0xC511_2026,
+            ..Self::smoke()
         }
     }
 
@@ -252,19 +283,51 @@ impl C51BenchmarkConfig {
                 "C51 requires at least one positive local sensor count".to_string(),
             ));
         }
+        if self.local_sensor_density_targets.is_empty()
+            || self
+                .local_sensor_density_targets
+                .iter()
+                .any(|density| !density.is_finite() || *density <= 0.0 || *density > 1.0)
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 local sensor densities must lie in (0, 1]".to_string(),
+            ));
+        }
         if self.repeated_data_counts.is_empty() || self.repeated_data_counts.contains(&0) {
             return Err(FeecGmrfError::InvalidParameter(
                 "C51 requires at least one positive repeated-data count".to_string(),
             ));
         }
-        if self.spectral_rank == 0 {
+        if self.spectral_low_ranks.is_empty() || self.spectral_low_ranks.contains(&0) {
             return Err(FeecGmrfError::InvalidParameter(
-                "C51 spectral rank must be positive".to_string(),
+                "C51 spectral low-rank grid must contain positive ranks".to_string(),
+            ));
+        }
+        if self.spectral_reference_maximum_dimension == 0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 spectral reference dimension cap must be positive".to_string(),
             ));
         }
         if self.posterior_sample_count == 0 {
             return Err(FeecGmrfError::InvalidParameter(
                 "C51 posterior sample count must be positive".to_string(),
+            ));
+        }
+        if self
+            .physical_qoi_region_lower
+            .iter()
+            .zip(self.physical_qoi_region_upper)
+            .any(|(lower, upper)| {
+                !lower.is_finite()
+                    || !upper.is_finite()
+                    || *lower < 0.0
+                    || upper > 1.0
+                    || *lower >= upper
+            })
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 physical-QoI region bounds must define a nonempty subset of the unit cube"
+                    .to_string(),
             ));
         }
         MaternParameters::new(self.alpha, self.kappa, self.tau)?;
@@ -290,6 +353,8 @@ pub struct C51BenchmarkRow {
     pub kappa: f64,
     pub tau: f64,
     pub observation_class: C51ObservationClass,
+    pub physical_qoi_selected_cell_count: usize,
+    pub physical_qoi_selected_volume_fraction: f64,
     pub sensor_count: usize,
     pub sensor_density: f64,
     pub repeated_data_count: usize,
@@ -310,10 +375,19 @@ pub struct C51BenchmarkRow {
     pub fill_ratio: C51Measurement<f64>,
     pub spectral_rank: C51Measurement<usize>,
     pub spectral_basis_storage_values: C51Measurement<usize>,
+    pub spectral_gp_storage_values: C51Measurement<usize>,
+    pub spectral_prepared_storage_values: C51Measurement<usize>,
+    pub spectral_dense_factor_values: C51Measurement<usize>,
+    pub spectral_state_feature_values: C51Measurement<usize>,
+    pub spectral_observation_feature_values: C51Measurement<usize>,
+    pub spectral_sampling_normal_dimension: C51Measurement<usize>,
     pub solver: String,
     pub ordering: String,
     pub feec_assembly_ns: C51Measurement<u128>,
     pub prior_build_ns: C51Measurement<u128>,
+    pub spectral_operator_recovery_ns: C51Measurement<u128>,
+    pub spectral_eigensolve_ns: C51Measurement<u128>,
+    pub spectral_gp_build_ns: C51Measurement<u128>,
     pub observation_update_assembly_ns: C51Measurement<u128>,
     pub observation_update_and_factor_ns: C51Measurement<u128>,
     pub symbolic_analysis_ns: C51Measurement<u128>,
@@ -332,6 +406,10 @@ pub struct C51BenchmarkRow {
     pub physical_variance_relative_error: C51Measurement<f64>,
     pub physical_transformed_variance_relative_error: C51Measurement<f64>,
     pub physical_mean_relative_error: C51Measurement<f64>,
+    /// Minimum raw transformed variance before any downstream presentation policy.
+    pub physical_transformed_variance_min_raw: C51Measurement<f64>,
+    /// Count of raw transformed variances below zero; values are never clamped here.
+    pub physical_transformed_variance_negative_count: C51Measurement<usize>,
 }
 
 impl C51BenchmarkRow {
@@ -364,19 +442,20 @@ impl C51BenchmarkArchive {
             ));
         }
         for row in &self.rows {
-            if row.method == C51MethodId::Spectral {
-                if row.available || row.unavailable_reason.is_empty() {
-                    return Err(FeecGmrfError::InvalidParameter(
-                        "unimplemented spectral rows must be explicitly unavailable".to_string(),
-                    ));
-                }
-                continue;
-            }
             if !row.available || row.latent_dimension == 0 || row.observation_nnz == 0 {
                 return Err(FeecGmrfError::InvalidParameter(format!(
                     "available C51 method {} has an incomplete row",
                     row.method.as_str()
                 )));
+            }
+            if row.physical_qoi_selected_cell_count == 0
+                || !row.physical_qoi_selected_volume_fraction.is_finite()
+                || row.physical_qoi_selected_volume_fraction <= 0.0
+                || row.physical_qoi_selected_volume_fraction >= 1.0
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "C51 physical-QoI region metadata is missing or degenerate".to_string(),
+                ));
             }
             if row.method == C51MethodId::FullMetricAugmented {
                 if !matches!(row.factor_storage_nnz, C51Measurement::Unavailable { .. })
@@ -384,6 +463,35 @@ impl C51BenchmarkArchive {
                 {
                     return Err(FeecGmrfError::InvalidParameter(
                         "FM-AUG must distinguish KKT input nnz from unavailable LU fill"
+                            .to_string(),
+                    ));
+                }
+            } else if matches!(
+                row.method,
+                C51MethodId::SpectralFullRank | C51MethodId::SpectralLowRank
+            ) {
+                if !matches!(
+                    row.spectral_prepared_storage_values,
+                    C51Measurement::Measured(_)
+                ) || !matches!(row.sampling_ns, C51Measurement::Measured(_))
+                    || !matches!(row.variance_estimation_ns, C51Measurement::Measured(_))
+                {
+                    return Err(FeecGmrfError::InvalidParameter(format!(
+                        "spectral method {} is missing prepared storage or full-UQ work",
+                        row.method.as_str()
+                    )));
+                }
+                if row.method == C51MethodId::SpectralFullRank
+                    && (!row.same_discrete_law_eligible || full_rank_maximum_error(row) > 1.0e-8)
+                {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "full-rank spectral reference does not reproduce the exact finite law"
+                            .to_string(),
+                    ));
+                }
+                if row.method == C51MethodId::SpectralLowRank && row.same_discrete_law_eligible {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "a truncated spectral row cannot be labeled as the same finite law"
                             .to_string(),
                     ));
                 }
@@ -468,6 +576,7 @@ impl C51BenchmarkArchive {
         for frame in self.comparison_frames {
             writeln!(writer, "  - {}", yaml_scalar(frame.as_str()))?;
         }
+        writeln!(writer, "study_status: discovery_in_process")?;
         writeln!(writer, "axes:")?;
         writeln!(
             writer,
@@ -481,6 +590,11 @@ impl C51BenchmarkArchive {
         )?;
         writeln!(
             writer,
+            "  local_sensor_density_targets: {}",
+            yaml_f64_list(&self.config.local_sensor_density_targets)
+        )?;
+        writeln!(
+            writer,
             "  repeated_data_counts: {}",
             yaml_usize_list(&self.config.repeated_data_counts)
         )?;
@@ -489,7 +603,26 @@ impl C51BenchmarkArchive {
             "  include_global_row: {}",
             self.config.include_global_row
         )?;
-        writeln!(writer, "  spectral_rank: {}", self.config.spectral_rank)?;
+        writeln!(
+            writer,
+            "  physical_qoi_region_lower: {}",
+            yaml_f64_list(&self.config.physical_qoi_region_lower)
+        )?;
+        writeln!(
+            writer,
+            "  physical_qoi_region_upper: {}",
+            yaml_f64_list(&self.config.physical_qoi_region_upper)
+        )?;
+        writeln!(
+            writer,
+            "  spectral_low_ranks: {}",
+            yaml_usize_list(&self.config.spectral_low_ranks)
+        )?;
+        writeln!(
+            writer,
+            "  spectral_reference_maximum_dimension: {}",
+            self.config.spectral_reference_maximum_dimension
+        )?;
         writeln!(
             writer,
             "  posterior_sample_count: {}",
@@ -575,6 +708,15 @@ struct ProblemMaps {
     physical_qoi: LinearMap,
     physical_observation: LinearMap,
     latent_probe: Vec<f64>,
+    physical_qoi_selected_cell_count: usize,
+    physical_qoi_selected_volume_fraction: f64,
+}
+
+struct SpectralReference {
+    basis: EigenBasis,
+    operator_recovery: Duration,
+    eigensolve: Duration,
+    basis_storage_values: usize,
 }
 
 #[derive(Clone)]
@@ -612,7 +754,17 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
         &metric,
         config.form_degree,
     )?;
-    let physical_maps = MagneticFieldMaps3d::from_feec(&topology, &coordinates)?;
+    let (physical_qoi_cells, physical_qoi_volume_fraction) = physical_qoi_region_cells(
+        &topology,
+        &coordinates,
+        config.physical_qoi_region_lower,
+        config.physical_qoi_region_upper,
+    )?;
+    let physical_maps = MagneticFieldMaps3d::from_feec_with_volume_average_cells(
+        &topology,
+        &coordinates,
+        &physical_qoi_cells,
+    )?;
     let elimination =
         EssentialBoundaryElimination::from_layout(operators.state().boundary_layout().clone())?;
     let physical_observation = elimination
@@ -622,14 +774,26 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
         )?
         .reduced()
         .clone();
-    let physical_qoi = select_physical_qoi(&physical_observation)?;
+    let volume_average_components = physical_maps
+        .volume_average_components
+        .iter()
+        .map(|map| {
+            elimination
+                .eliminate_map(map, &[0.0])
+                .map(|eliminated| eliminated.reduced().clone())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let physical_qoi = LinearMap::stack(&volume_average_components)?;
     let feec_assembly = assembly_start.elapsed();
     let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
     let priors = build_priors(config, &topology, &metric, &operators, parameters)?;
+    let spectral = build_spectral_reference(config, &operators)?;
     let problem = ProblemMaps {
         physical_qoi,
         physical_observation,
         latent_probe: deterministic_probe(operators.state().dimension(), config.seed),
+        physical_qoi_selected_cell_count: physical_qoi_cells.len(),
+        physical_qoi_selected_volume_fraction: physical_qoi_volume_fraction,
     };
     let designs = observation_designs(
         config,
@@ -679,14 +843,32 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
                 )?
                 .0,
             );
-            rows.push(unavailable_spectral_row(
+            rows.push(run_spectral_method(
+                C51MethodId::SpectralFullRank,
+                spectral.basis.len(),
+                &spectral,
+                feec_assembly,
                 config,
                 refinement,
                 &design,
                 repeated_data_count,
-                operators.state().dimension(),
-                feec_assembly,
-            ));
+                &problem,
+                &reference,
+            )?);
+            for rank in spectral_low_ranks(config, spectral.basis.len()) {
+                rows.push(run_spectral_method(
+                    C51MethodId::SpectralLowRank,
+                    rank,
+                    &spectral,
+                    feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &problem,
+                    &reference,
+                )?);
+            }
         }
     }
     Ok(rows)
@@ -737,6 +919,69 @@ fn build_priors(
         compact_build,
         supported_build,
     })
+}
+
+/// Recover the exact weak Hodge--Laplacian from the canonical alpha-one
+/// system, then solve the checked generalized eigenproblem on that identical
+/// active space. This is intentionally bounded dense reference work.
+fn build_spectral_reference(
+    config: &C51BenchmarkConfig,
+    operators: &ExactFormOperators,
+) -> Result<SpectralReference> {
+    let dimension = operators.state().dimension();
+    if dimension > config.spectral_reference_maximum_dimension {
+        return Err(FeecGmrfError::ExactReferenceSizeExceeded {
+            dimension,
+            maximum: config.spectral_reference_maximum_dimension,
+        });
+    }
+    let recovery_start = Instant::now();
+    let alpha_one = ExactMaternPriorBuilder::from_operators(operators.clone())
+        .parameters(MaternParameters::new(MaternAlpha::One, config.kappa, 1.0)?)
+        .maximum_materialized_dimension(config.spectral_reference_maximum_dimension)?
+        .build()?;
+    let mut weak_hodge = SparseMat::new(dimension, dimension);
+    for (row, col, value) in alpha_one.precision().triplet_iter() {
+        weak_hodge.push(row, col, value);
+    }
+    for (row, col, value) in operators.state().mass().triplet_iter() {
+        weak_hodge.push(row, col, -config.kappa.powi(2) * value);
+    }
+    let mass = feg_infer::sparse::core_triplet_to_feec_csr(operators.state().mass());
+    let weak_hodge = feg_infer::sparse::core_triplet_to_feec_csr(&weak_hodge);
+    let operator_recovery = recovery_start.elapsed();
+    let eigensolve_start = Instant::now();
+    let basis = dense_reference_generalized_hodge_eigenbasis(
+        &mass,
+        &weak_hodge,
+        DenseReferenceEigensolverOptions::new(config.spectral_reference_maximum_dimension),
+    )
+    .map_err(spectral_error)?;
+    let eigensolve = eigensolve_start.elapsed();
+    if basis.nrows() != dimension || basis.len() != dimension {
+        return Err(FeecGmrfError::Dimension(format!(
+            "C51 full spectral basis is {}x{} for active dimension {dimension}",
+            basis.nrows(),
+            basis.len()
+        )));
+    }
+    Ok(SpectralReference {
+        basis,
+        operator_recovery,
+        eigensolve,
+        basis_storage_values: dimension * dimension + dimension,
+    })
+}
+
+fn spectral_low_ranks(config: &C51BenchmarkConfig, full_rank: usize) -> Vec<usize> {
+    config
+        .spectral_low_ranks
+        .iter()
+        .copied()
+        .filter(|rank| *rank < full_rank)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 // These arguments are the frozen method/problem/observation axes of one row;
@@ -803,7 +1048,7 @@ fn run_spd_method(
     let sample_start = Instant::now();
     let mut rng = StdRng::seed_from_u64(config.seed ^ method_seed(method));
     for _ in 0..config.posterior_sample_count {
-        let _ = posterior.sample_cochain(&mut rng)?;
+        let _ = posterior.sample(&mut rng)?;
     }
     let sample_elapsed = sample_start.elapsed();
     let answers = ReferenceAnswers {
@@ -834,6 +1079,8 @@ fn run_spd_method(
         kappa: config.kappa,
         tau: config.tau,
         observation_class: design.class,
+        physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
+        physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
         sensor_count: design.sensor_count,
         sensor_density: design.sensor_count as f64 / prior.dimension() as f64,
         repeated_data_count,
@@ -858,10 +1105,19 @@ fn run_spd_method(
         fill_ratio: C51Measurement::Measured(factor.fill_ratio),
         spectral_rank: C51Measurement::NotRecorded,
         spectral_basis_storage_values: C51Measurement::NotRecorded,
+        spectral_gp_storage_values: C51Measurement::NotRecorded,
+        spectral_prepared_storage_values: C51Measurement::NotRecorded,
+        spectral_dense_factor_values: C51Measurement::NotRecorded,
+        spectral_state_feature_values: C51Measurement::NotRecorded,
+        spectral_observation_feature_values: C51Measurement::NotRecorded,
+        spectral_sampling_normal_dimension: C51Measurement::NotRecorded,
         solver: "sparse_cholesky".to_string(),
         ordering: ordering_name(factor.ordering).to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
         prior_build_ns: duration_measurement(prior_build),
+        spectral_operator_recovery_ns: C51Measurement::NotRecorded,
+        spectral_eigensolve_ns: C51Measurement::NotRecorded,
+        spectral_gp_build_ns: C51Measurement::NotRecorded,
         observation_update_assembly_ns: duration_resource_measurement(
             &resource_report.assembly.wall_time,
         ),
@@ -886,6 +1142,12 @@ fn run_spd_method(
         physical_variance_relative_error: errors.physical_variance,
         physical_transformed_variance_relative_error: errors.physical_transformed_variance,
         physical_mean_relative_error: errors.physical_mean,
+        physical_transformed_variance_min_raw: C51Measurement::Measured(minimum_raw(
+            &answers.physical_transformed_variances,
+        )),
+        physical_transformed_variance_negative_count: C51Measurement::Measured(negative_count(
+            &answers.physical_transformed_variances,
+        )),
     };
     Ok((row, answers))
 }
@@ -962,6 +1224,8 @@ fn run_supported_method(
         kappa: config.kappa,
         tau: config.tau,
         observation_class: design.class,
+        physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
+        physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
         sensor_count: design.sensor_count,
         sensor_density: design.sensor_count as f64 / prior.state_dimension() as f64,
         repeated_data_count,
@@ -988,10 +1252,19 @@ fn run_supported_method(
         fill_ratio: C51Measurement::unavailable(KKT_FILL_UNAVAILABLE_REASON),
         spectral_rank: C51Measurement::NotRecorded,
         spectral_basis_storage_values: C51Measurement::NotRecorded,
+        spectral_gp_storage_values: C51Measurement::NotRecorded,
+        spectral_prepared_storage_values: C51Measurement::NotRecorded,
+        spectral_dense_factor_values: C51Measurement::NotRecorded,
+        spectral_state_feature_values: C51Measurement::NotRecorded,
+        spectral_observation_feature_values: C51Measurement::NotRecorded,
+        spectral_sampling_normal_dimension: C51Measurement::NotRecorded,
         solver: "sparse_lu_kkt".to_string(),
         ordering: "backend_partial_pivoting".to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
         prior_build_ns: duration_measurement(prior_build),
+        spectral_operator_recovery_ns: C51Measurement::NotRecorded,
+        spectral_eigensolve_ns: C51Measurement::NotRecorded,
+        spectral_gp_build_ns: C51Measurement::NotRecorded,
         observation_update_assembly_ns: C51Measurement::unavailable(
             "the supported-law API currently exposes combined observation assembly and KKT setup",
         ),
@@ -1018,29 +1291,143 @@ fn run_supported_method(
         physical_variance_relative_error: errors.physical_variance,
         physical_transformed_variance_relative_error: errors.physical_transformed_variance,
         physical_mean_relative_error: errors.physical_mean,
+        physical_transformed_variance_min_raw: C51Measurement::Measured(minimum_raw(
+            &answers.physical_transformed_variances,
+        )),
+        physical_transformed_variance_negative_count: C51Measurement::Measured(negative_count(
+            &answers.physical_transformed_variances,
+        )),
     })
 }
 
-fn unavailable_spectral_row(
+#[allow(clippy::too_many_arguments)]
+fn run_spectral_method(
+    method: C51MethodId,
+    rank: usize,
+    source: &SpectralReference,
+    feec_assembly: Duration,
     config: &C51BenchmarkConfig,
     refinement: usize,
     design: &ObservationDesign,
     repeated_data_count: usize,
-    latent_dimension: usize,
-    feec_assembly: Duration,
-) -> C51BenchmarkRow {
-    let unavailable_usize = || C51Measurement::unavailable(SPECTRAL_PENDING_REASON);
-    let unavailable_u128 = || C51Measurement::unavailable(SPECTRAL_PENDING_REASON);
-    let unavailable_u64 = || C51Measurement::unavailable(SPECTRAL_PENDING_REASON);
-    let unavailable_f64 = || C51Measurement::unavailable(SPECTRAL_PENDING_REASON);
-    C51BenchmarkRow {
-        method: C51MethodId::Spectral,
-        available: false,
-        unavailable_reason: SPECTRAL_PENDING_REASON.to_string(),
-        discrete_law_id: "exact_full_metric_whitney_truncated_spectral_target".to_string(),
-        same_discrete_law_eligible: true,
+    problem: &ProblemMaps,
+    reference: &ReferenceAnswers,
+) -> Result<C51BenchmarkRow> {
+    if !matches!(
+        method,
+        C51MethodId::SpectralFullRank | C51MethodId::SpectralLowRank
+    ) {
+        return Err(FeecGmrfError::InvalidParameter(
+            "run_spectral_method requires a spectral method identifier".to_string(),
+        ));
+    }
+    let full_rank = source.basis.len();
+    if rank == 0
+        || rank > full_rank
+        || (method == C51MethodId::SpectralFullRank && rank != full_rank)
+    {
+        return Err(FeecGmrfError::InvalidParameter(format!(
+            "invalid C51 spectral rank {rank} for method {} and full rank {full_rank}",
+            method.as_str()
+        )));
+    }
+    let gp_start = Instant::now();
+    let gp = SpectralMaternGp::from_eigenbasis(
+        source.basis.clone(),
+        SpectralMaternConfig {
+            kappa: config.kappa,
+            alpha: f64::from(config.alpha.as_u32()),
+            tau: config.tau,
+            k: rank,
+        },
+    )
+    .map_err(spectral_error)?;
+    let gp_build = gp_start.elapsed();
+    let observation = feg_infer::sparse::core_triplet_to_feec_csr(design.operator.matrix());
+    let physical_qoi = feg_infer::sparse::core_triplet_to_feec_csr(problem.physical_qoi.matrix());
+    let setup_start = Instant::now();
+    let prepared = gp
+        .prepare_linear_observations(&observation, config.observation_noise_variance)
+        .map_err(spectral_error)?;
+    let setup_elapsed = setup_start.elapsed();
+    let diagnostics = prepared.diagnostics();
+    let values = repeated_observation_values(design.sensor_count, repeated_data_count, config.seed);
+    let repeated_start = Instant::now();
+    let mut mean = Vec::new();
+    for data in &values {
+        mean = prepared.state_mean(data).map_err(spectral_error)?;
+    }
+    let repeated_elapsed = repeated_start.elapsed();
+    let final_values = values
+        .last()
+        .expect("positive repeated-data count has final values");
+    let covariance_start = Instant::now();
+    let covariance_action = prepared
+        .state_covariance_action(&problem.latent_probe)
+        .map_err(spectral_error)?;
+    let covariance_elapsed = covariance_start.elapsed();
+    let physical_rhs = problem.physical_qoi.apply_transpose(&[1.0, -0.5, 0.25])?;
+    let physical_start = Instant::now();
+    let physical_covariance_action = prepared
+        .state_covariance_action(&physical_rhs)
+        .map_err(spectral_error)?;
+    let physical_output_action = prepared
+        .output_covariance_action(&physical_qoi, &[1.0, -0.5, 0.25])
+        .map_err(spectral_error)?;
+    let physical_variance = dot(&[1.0, -0.5, 0.25], &physical_output_action)?;
+    let full_output = prepared
+        .output_moments_with_covariance(&physical_qoi, final_values)
+        .map_err(spectral_error)?;
+    let physical_elapsed = physical_start.elapsed();
+    let variance_start = Instant::now();
+    let output = prepared
+        .output_moments(&physical_qoi, final_values)
+        .map_err(spectral_error)?;
+    let variance_elapsed = variance_start.elapsed();
+    if full_output.covariance.nrows() != PHYSICAL_QOI_OUTPUT_COUNT
+        || full_output.covariance.ncols() != PHYSICAL_QOI_OUTPUT_COUNT
+        || relative_l2(&full_output.mean, &output.mean)? > 1.0e-12
+        || relative_l2(
+            &mean,
+            &prepared.state_mean(final_values).map_err(spectral_error)?,
+        )? > 1.0e-12
+    {
+        return Err(FeecGmrfError::Inference(
+            "C51 prepared spectral output/state mean routes disagree".to_string(),
+        ));
+    }
+    let sample_start = Instant::now();
+    let mut rng = StdRng::seed_from_u64(config.seed ^ method_seed(method) ^ rank as u64);
+    for _ in 0..config.posterior_sample_count {
+        let standard_normal = (0..diagnostics.sampling_standard_normal_dimension)
+            .map(|_| StandardNormal.sample(&mut rng))
+            .collect::<Vec<f64>>();
+        prepared
+            .state_sample_from_standard_normal(final_values, &standard_normal)
+            .map_err(spectral_error)?;
+    }
+    let sampling_elapsed = sample_start.elapsed();
+    let answers = ReferenceAnswers {
+        mean,
+        covariance_action,
+        physical_covariance_action,
+        physical_variance,
+        physical_transformed_variances: output.variance,
+        physical_mean: output.mean,
+    };
+    let errors = errors_against(&answers, Some(reference))?;
+    Ok(C51BenchmarkRow {
+        method,
+        available: true,
+        unavailable_reason: String::new(),
+        discrete_law_id: if method == C51MethodId::SpectralFullRank {
+            "exact_full_metric_whitney".to_string()
+        } else {
+            "truncated_exact_full_metric_whitney_spectral".to_string()
+        },
+        same_discrete_law_eligible: method == C51MethodId::SpectralFullRank,
         matched_physical_qoi_eligible: true,
-        full_uq_workload_eligible: false,
+        full_uq_workload_eligible: true,
         refinement,
         spatial_dimension: config.spatial_dimension,
         form_degree: config.form_degree,
@@ -1048,49 +1435,94 @@ fn unavailable_spectral_row(
         kappa: config.kappa,
         tau: config.tau,
         observation_class: design.class,
+        physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
+        physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
         sensor_count: design.sensor_count,
-        sensor_density: design.sensor_count as f64 / latent_dimension as f64,
+        sensor_density: design.sensor_count as f64 / diagnostics.ambient_dimension as f64,
         repeated_data_count,
         posterior_sample_count: config.posterior_sample_count,
         seed: config.seed,
-        latent_dimension,
-        ambient_dimension: latent_dimension,
+        latent_dimension: diagnostics.latent_dimension,
+        ambient_dimension: diagnostics.ambient_dimension,
         constraint_dimension: 0,
-        observation_nnz: design.operator.matrix().nnz(),
-        prior_precision_nnz: unavailable_usize(),
-        observation_update_nnz: unavailable_usize(),
-        posterior_precision_nnz: unavailable_usize(),
-        ambient_energy_nnz: unavailable_usize(),
-        constraint_nnz: unavailable_usize(),
+        observation_nnz: diagnostics.observation_operator_nonzeros,
+        prior_precision_nnz: C51Measurement::unavailable(SPECTRAL_SPARSE_PRECISION_REASON),
+        observation_update_nnz: C51Measurement::unavailable(SPECTRAL_SPARSE_PRECISION_REASON),
+        posterior_precision_nnz: C51Measurement::unavailable(SPECTRAL_SPARSE_PRECISION_REASON),
+        ambient_energy_nnz: C51Measurement::NotRecorded,
+        constraint_nnz: C51Measurement::NotRecorded,
         kkt_input_nnz: C51Measurement::NotRecorded,
-        factor_storage_nnz: unavailable_usize(),
+        factor_storage_nnz: C51Measurement::unavailable(
+            "spectral conditioning uses a dense low-rank factor; see spectral storage fields",
+        ),
         certificate_factor_storage_nnz: C51Measurement::NotRecorded,
-        fill_ratio: unavailable_f64(),
-        spectral_rank: C51Measurement::Measured(config.spectral_rank.min(latent_dimension)),
-        spectral_basis_storage_values: unavailable_usize(),
-        solver: "spectral_unavailable".to_string(),
+        fill_ratio: C51Measurement::unavailable(
+            "sparse Cholesky fill is not applicable to spectral conditioning",
+        ),
+        spectral_rank: C51Measurement::Measured(rank),
+        spectral_basis_storage_values: C51Measurement::Measured(source.basis_storage_values),
+        spectral_gp_storage_values: C51Measurement::Measured(
+            diagnostics.ambient_dimension * rank + 2 * rank,
+        ),
+        spectral_prepared_storage_values: C51Measurement::Measured(
+            diagnostics.persistent_f64_entries,
+        ),
+        spectral_dense_factor_values: C51Measurement::Measured(
+            diagnostics.dense_factor_allocated_entries,
+        ),
+        spectral_state_feature_values: C51Measurement::Measured(diagnostics.state_feature_entries),
+        spectral_observation_feature_values: C51Measurement::Measured(
+            diagnostics.observation_feature_entries,
+        ),
+        spectral_sampling_normal_dimension: C51Measurement::Measured(
+            diagnostics.sampling_standard_normal_dimension,
+        ),
+        solver: match diagnostics.conditioning_strategy {
+            LowRankConditioningStrategy::ObservationSpace => {
+                "spectral_observation_space_dense_cholesky"
+            }
+            LowRankConditioningStrategy::LatentSpace => "spectral_latent_space_dense_cholesky",
+        }
+        .to_string(),
         ordering: "not_applicable".to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
-        prior_build_ns: unavailable_u128(),
-        observation_update_assembly_ns: unavailable_u128(),
-        observation_update_and_factor_ns: unavailable_u128(),
-        symbolic_analysis_ns: unavailable_u128(),
-        numeric_factor_ns: unavailable_u128(),
-        combined_factor_setup_ns: unavailable_u128(),
-        repeated_data_ns: unavailable_u128(),
-        covariance_action_ns: unavailable_u128(),
-        physical_qoi_ns: unavailable_u128(),
-        sampling_ns: unavailable_u128(),
-        variance_estimation_ns: unavailable_u128(),
-        factor_external_peak_rss_bytes: unavailable_u64(),
-        query_external_peak_rss_bytes: unavailable_u64(),
-        posterior_mean_relative_error: unavailable_f64(),
-        covariance_action_relative_error: unavailable_f64(),
-        physical_covariance_action_relative_error: unavailable_f64(),
-        physical_variance_relative_error: unavailable_f64(),
-        physical_transformed_variance_relative_error: unavailable_f64(),
-        physical_mean_relative_error: unavailable_f64(),
-    }
+        prior_build_ns: duration_measurement(
+            source.operator_recovery + source.eigensolve + gp_build,
+        ),
+        spectral_operator_recovery_ns: duration_measurement(source.operator_recovery),
+        spectral_eigensolve_ns: duration_measurement(source.eigensolve),
+        spectral_gp_build_ns: duration_measurement(gp_build),
+        observation_update_assembly_ns: C51Measurement::unavailable(
+            "prepared spectral API exposes combined feature projection and dense factor setup",
+        ),
+        observation_update_and_factor_ns: duration_measurement(setup_elapsed),
+        symbolic_analysis_ns: C51Measurement::unavailable(
+            "symbolic sparse analysis is not applicable to dense spectral conditioning",
+        ),
+        numeric_factor_ns: C51Measurement::unavailable(
+            "prepared spectral API exposes combined dense setup time",
+        ),
+        combined_factor_setup_ns: duration_measurement(setup_elapsed),
+        repeated_data_ns: duration_measurement(repeated_elapsed),
+        covariance_action_ns: duration_measurement(covariance_elapsed),
+        physical_qoi_ns: duration_measurement(physical_elapsed),
+        sampling_ns: duration_measurement(sampling_elapsed),
+        variance_estimation_ns: duration_measurement(variance_elapsed),
+        factor_external_peak_rss_bytes: C51Measurement::NotRecorded,
+        query_external_peak_rss_bytes: C51Measurement::NotRecorded,
+        posterior_mean_relative_error: errors.posterior_mean,
+        covariance_action_relative_error: errors.covariance_action,
+        physical_covariance_action_relative_error: errors.physical_covariance_action,
+        physical_variance_relative_error: errors.physical_variance,
+        physical_transformed_variance_relative_error: errors.physical_transformed_variance,
+        physical_mean_relative_error: errors.physical_mean,
+        physical_transformed_variance_min_raw: C51Measurement::Measured(minimum_raw(
+            &answers.physical_transformed_variances,
+        )),
+        physical_transformed_variance_negative_count: C51Measurement::Measured(negative_count(
+            &answers.physical_transformed_variances,
+        )),
+    })
 }
 
 fn observation_designs(
@@ -1099,7 +1531,7 @@ fn observation_designs(
     physical_observation: &LinearMap,
 ) -> Result<Vec<ObservationDesign>> {
     let mut designs = Vec::new();
-    for &requested in &config.local_sensor_counts {
+    for requested in local_sensor_targets(config, dimension) {
         let sensor_count = requested.min(dimension);
         let physical_sensor_count = requested.min(physical_observation.output_dimension());
         let physical_rows = evenly_spaced_indices(
@@ -1135,14 +1567,49 @@ fn observation_designs(
     Ok(designs)
 }
 
-fn select_physical_qoi(map: &LinearMap) -> Result<LinearMap> {
-    if map.output_dimension() < PHYSICAL_QOI_OUTPUT_COUNT {
-        return Err(FeecGmrfError::Dimension(
-            "the canonical magnetic map has fewer than three outputs".to_string(),
+fn local_sensor_targets(config: &C51BenchmarkConfig, dimension: usize) -> Vec<usize> {
+    let mut targets = config
+        .local_sensor_counts
+        .iter()
+        .map(|count| (*count).min(dimension))
+        .collect::<BTreeSet<_>>();
+    for density in &config.local_sensor_density_targets {
+        let count = (*density * dimension as f64).ceil() as usize;
+        targets.insert(count.clamp(1, dimension));
+    }
+    targets.into_iter().collect()
+}
+
+fn physical_qoi_region_cells(
+    topology: &Complex,
+    coordinates: &manifold::geometry::coord::mesh::MeshCoords,
+    lower: [f64; 3],
+    upper: [f64; 3],
+) -> Result<(Vec<usize>, f64)> {
+    let mut selected = Vec::new();
+    let mut selected_volume = 0.0;
+    let mut total_volume = 0.0;
+    for cell in topology.cells().handle_iter() {
+        let simplex = cell.coord_simplex(coordinates);
+        let volume = simplex.vol();
+        let barycenter = simplex.barycenter();
+        if !volume.is_finite() || volume <= 0.0 {
+            return Err(FeecGmrfError::Assembly(
+                "C51 mesh contains a non-positive or non-finite cell volume".to_string(),
+            ));
+        }
+        total_volume += volume;
+        if (0..3).all(|axis| barycenter[axis] >= lower[axis] && barycenter[axis] <= upper[axis]) {
+            selected.push(cell.kidx());
+            selected_volume += volume;
+        }
+    }
+    if selected.is_empty() || !total_volume.is_finite() || total_volume <= 0.0 {
+        return Err(FeecGmrfError::InvalidParameter(
+            "C51 physical-QoI region selects no cells or has invalid total volume".to_string(),
         ));
     }
-    let last = map.output_dimension() - 1;
-    map.select_outputs(&[0, last / 2, last])
+    Ok((selected, selected_volume / total_volume))
 }
 
 fn evenly_spaced_indices(dimension: usize, count: usize) -> Vec<usize> {
@@ -1241,6 +1708,14 @@ fn relative_scalar(value: f64, reference: f64) -> f64 {
     (value - reference).abs() / reference.abs().max(f64::MIN_POSITIVE)
 }
 
+fn minimum_raw(values: &[f64]) -> f64 {
+    values.iter().copied().fold(f64::INFINITY, f64::min)
+}
+
+fn negative_count(values: &[f64]) -> usize {
+    values.iter().filter(|value| **value < 0.0).count()
+}
+
 fn dot(lhs: &[f64], rhs: &[f64]) -> Result<f64> {
     if lhs.len() != rhs.len() {
         return Err(FeecGmrfError::Dimension(
@@ -1263,8 +1738,34 @@ fn method_seed(method: C51MethodId) -> u64 {
         C51MethodId::FullMetricDirect => 0xD1CE_C700,
         C51MethodId::FullMetricAugmented => 0xA090_0000,
         C51MethodId::WhitneyCompact => 0xC0A0_AC70,
-        C51MethodId::Spectral => 0x5EEC_7000,
+        C51MethodId::SpectralFullRank => 0x5EEC_F011,
+        C51MethodId::SpectralLowRank => 0x5EEC_10A0,
     }
+}
+
+fn spectral_error(error: impl Display) -> FeecGmrfError {
+    FeecGmrfError::Inference(format!("C51 spectral reference failed: {error}"))
+}
+
+fn measured_or_infinite(measurement: &C51Measurement<f64>) -> f64 {
+    match measurement {
+        C51Measurement::Measured(value) => *value,
+        C51Measurement::NotRecorded | C51Measurement::Unavailable { .. } => f64::INFINITY,
+    }
+}
+
+fn full_rank_maximum_error(row: &C51BenchmarkRow) -> f64 {
+    [
+        &row.posterior_mean_relative_error,
+        &row.covariance_action_relative_error,
+        &row.physical_covariance_action_relative_error,
+        &row.physical_variance_relative_error,
+        &row.physical_transformed_variance_relative_error,
+        &row.physical_mean_relative_error,
+    ]
+    .into_iter()
+    .map(measured_or_infinite)
+    .fold(0.0, f64::max)
 }
 
 fn duration_measurement(duration: Duration) -> C51Measurement<u128> {
@@ -1307,6 +1808,8 @@ fn csv_header() -> String {
         "kappa",
         "tau",
         "observation_class",
+        "physical_qoi_selected_cell_count",
+        "physical_qoi_selected_volume_fraction",
         "sensor_count",
         "sensor_density",
         "repeated_data_count",
@@ -1334,7 +1837,7 @@ fn csv_header() -> String {
         .join(",")
 }
 
-fn measurement_field_names() -> [&'static str; 31] {
+fn measurement_field_names() -> [&'static str; 42] {
     [
         "prior_precision_nnz",
         "observation_update_nnz",
@@ -1347,8 +1850,17 @@ fn measurement_field_names() -> [&'static str; 31] {
         "fill_ratio",
         "spectral_rank",
         "spectral_basis_storage_values",
+        "spectral_gp_storage_values",
+        "spectral_prepared_storage_values",
+        "spectral_dense_factor_values",
+        "spectral_state_feature_values",
+        "spectral_observation_feature_values",
+        "spectral_sampling_normal_dimension",
         "feec_assembly_ns",
         "prior_build_ns",
+        "spectral_operator_recovery_ns",
+        "spectral_eigensolve_ns",
+        "spectral_gp_build_ns",
         "observation_update_assembly_ns",
         "observation_update_and_factor_ns",
         "symbolic_analysis_ns",
@@ -1367,6 +1879,8 @@ fn measurement_field_names() -> [&'static str; 31] {
         "physical_variance_relative_error",
         "physical_transformed_variance_relative_error",
         "physical_mean_relative_error",
+        "physical_transformed_variance_min_raw",
+        "physical_transformed_variance_negative_count",
     ]
 }
 
@@ -1388,6 +1902,8 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         row.kappa.to_string(),
         row.tau.to_string(),
         row.observation_class.as_str().to_string(),
+        row.physical_qoi_selected_cell_count.to_string(),
+        row.physical_qoi_selected_volume_fraction.to_string(),
         row.sensor_count.to_string(),
         row.sensor_density.to_string(),
         row.repeated_data_count.to_string(),
@@ -1411,8 +1927,17 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
     push_measurement(&mut fields, &row.fill_ratio);
     push_measurement(&mut fields, &row.spectral_rank);
     push_measurement(&mut fields, &row.spectral_basis_storage_values);
+    push_measurement(&mut fields, &row.spectral_gp_storage_values);
+    push_measurement(&mut fields, &row.spectral_prepared_storage_values);
+    push_measurement(&mut fields, &row.spectral_dense_factor_values);
+    push_measurement(&mut fields, &row.spectral_state_feature_values);
+    push_measurement(&mut fields, &row.spectral_observation_feature_values);
+    push_measurement(&mut fields, &row.spectral_sampling_normal_dimension);
     push_measurement(&mut fields, &row.feec_assembly_ns);
     push_measurement(&mut fields, &row.prior_build_ns);
+    push_measurement(&mut fields, &row.spectral_operator_recovery_ns);
+    push_measurement(&mut fields, &row.spectral_eigensolve_ns);
+    push_measurement(&mut fields, &row.spectral_gp_build_ns);
     push_measurement(&mut fields, &row.observation_update_assembly_ns);
     push_measurement(&mut fields, &row.observation_update_and_factor_ns);
     push_measurement(&mut fields, &row.symbolic_analysis_ns);
@@ -1434,6 +1959,11 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         &row.physical_transformed_variance_relative_error,
     );
     push_measurement(&mut fields, &row.physical_mean_relative_error);
+    push_measurement(&mut fields, &row.physical_transformed_variance_min_raw);
+    push_measurement(
+        &mut fields,
+        &row.physical_transformed_variance_negative_count,
+    );
     fields
         .into_iter()
         .map(|field| csv_escape(&field))
@@ -1468,6 +1998,17 @@ fn yaml_usize_list(values: &[usize]) -> String {
         values
             .iter()
             .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn yaml_f64_list(values: &[f64]) -> String {
+    format!(
+        "[{}]",
+        values
+            .iter()
+            .map(f64::to_string)
             .collect::<Vec<_>>()
             .join(", ")
     )
@@ -1530,10 +2071,13 @@ mod tests {
         let config = C51BenchmarkConfig::smoke();
         let archive = run_c51_benchmark(&config, C51RunMetadata::smoke("test"))
             .expect("C51 smoke benchmark should run");
-        let designs = 2 * config.local_sensor_counts.len() + usize::from(config.include_global_row);
+        let dimension = archive.rows[0].ambient_dimension;
+        let designs = 2 * local_sensor_targets(&config, dimension).len()
+            + usize::from(config.include_global_row);
+        let method_count = 4 + spectral_low_ranks(&config, dimension).len();
         assert_eq!(
             archive.rows.len(),
-            designs * config.repeated_data_counts.len() * C51MethodId::ALL.len()
+            designs * config.repeated_data_counts.len() * method_count
         );
         assert!(archive.rows.iter().any(|row| {
             row.observation_class == C51ObservationClass::LocalPhysicalB
@@ -1569,6 +2113,12 @@ mod tests {
                         row.observation_update_nnz,
                         C51Measurement::Measured(_)
                     ));
+                    assert!(
+                        measured_f64(&row.physical_transformed_variance_min_raw) > 1.0e-16,
+                        "central-subdomain magnetic QoI must not collapse under boundary conditions"
+                    );
+                    assert!(row.physical_qoi_selected_cell_count > 0);
+                    assert!(row.physical_qoi_selected_volume_fraction < 1.0);
                 }
                 C51MethodId::FullMetricAugmented => {
                     assert!(row.same_discrete_law_eligible);
@@ -1585,9 +2135,22 @@ mod tests {
                     assert!(row.full_uq_workload_eligible);
                     assert!(measured_f64(&row.physical_variance_relative_error).is_finite());
                 }
-                C51MethodId::Spectral => {
-                    assert!(!row.available);
-                    assert!(!row.unavailable_reason.is_empty());
+                C51MethodId::SpectralFullRank => {
+                    assert!(row.available);
+                    assert!(row.same_discrete_law_eligible);
+                    assert!(row.full_uq_workload_eligible);
+                    assert!(measured_f64(&row.covariance_action_relative_error) <= 1.0e-8);
+                    assert!(measured_f64(&row.physical_variance_relative_error) <= 1.0e-8);
+                    assert!(matches!(
+                        row.spectral_prepared_storage_values,
+                        C51Measurement::Measured(_)
+                    ));
+                }
+                C51MethodId::SpectralLowRank => {
+                    assert!(row.available);
+                    assert!(!row.same_discrete_law_eligible);
+                    assert!(row.full_uq_workload_eligible);
+                    assert!(measured_f64(&row.physical_variance_relative_error).is_finite());
                 }
             }
         }
@@ -1607,11 +2170,24 @@ mod tests {
         let manifest = fs::read_to_string(directory.join("manifest.yaml")).unwrap();
         assert!(csv.starts_with("schema_version,study_id,method,available"));
         assert!(csv.contains("fm_direct"));
-        assert!(csv.contains("spectral_r,false"));
+        assert!(csv.contains("spectral_full_rank,true"));
+        assert!(csv.contains("spectral_low_rank,true"));
         assert!(manifest.contains("same_discrete_law_representation"));
         assert!(manifest.contains("matched_physical_qoi_method"));
         assert!(manifest.contains("cpu_model: null"));
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn reference_ladder_is_bounded_and_adds_full_rank_at_runtime() {
+        let config = C51BenchmarkConfig::reference_ladder();
+        config.validate().unwrap();
+        assert_eq!(config.refinements, vec![2, 3, 4]);
+        assert_eq!(config.repeated_data_counts, vec![1, 10, 100]);
+        assert_eq!(config.local_sensor_counts, vec![32]);
+        assert_eq!(config.local_sensor_density_targets, vec![0.02, 0.10]);
+        assert!(!config.spectral_low_ranks.contains(&0));
+        assert_eq!(spectral_low_ranks(&config, 16), vec![8]);
     }
 
     fn measured_f64(measurement: &C51Measurement<f64>) -> f64 {

@@ -282,22 +282,70 @@ pub fn build_magnetic_flux_density_averages_3d(
     if topology.dim() != 3 || coords.dim() != 3 {
         return Err("magnetic volume averages require a 3D topology and coordinates".to_string());
     }
+    let selected_cells = (0..topology.nsimplices(3)).collect::<Vec<_>>();
+    build_selected_cell_magnetic_flux_density_averages_3d(topology, coords, &selected_cells)
+}
+
+/// Volume-averaged B-component maps over a caller-selected set of 3-cells.
+///
+/// The caller owns the physical-region choice. This routine validates the
+/// selected cell IDs and applies the canonical cell-volume normalization on
+/// the full cellwise `R_B D1` output. Unselected cells receive zero RMS weight.
+pub fn build_selected_cell_magnetic_flux_density_averages_3d(
+    topology: &Complex,
+    coords: &MeshCoords,
+    selected_cells: &[usize],
+) -> Result<MagneticFluxDensityAverages3d, String> {
+    if topology.dim() != 3 || coords.dim() != 3 {
+        return Err("magnetic volume averages require a 3D topology and coordinates".to_string());
+    }
+    if selected_cells.is_empty() {
+        return Err("magnetic volume averages require at least one selected cell".to_string());
+    }
+    let mut selected_cells = selected_cells.to_vec();
+    selected_cells.sort_unstable();
+    if selected_cells.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("magnetic volume-average cell indices must be unique".to_string());
+    }
+    if let Some(index) = selected_cells
+        .iter()
+        .find(|index| **index >= topology.nsimplices(3))
+    {
+        return Err(format!(
+            "magnetic volume-average cell index {index} exceeds cell count {}",
+            topology.nsimplices(3)
+        ));
+    }
     let cell_volumes = topology
         .cells()
         .handle_iter()
         .map(|cell| cell.coord_simplex(coords).vol())
         .collect::<Vec<_>>();
-    let domain_volume = cell_volumes.iter().sum::<f64>();
+    if cell_volumes
+        .iter()
+        .any(|volume| !volume.is_finite() || *volume <= 0.0)
+    {
+        return Err("mesh contains a non-positive or non-finite cell volume".to_string());
+    }
+    let domain_volume = selected_cells
+        .iter()
+        .map(|index| cell_volumes[*index])
+        .sum::<f64>();
     if !domain_volume.is_finite() || domain_volume <= 0.0 {
         return Err("mesh has non-positive or non-finite volume".to_string());
     }
-    let normalized = cell_volumes
-        .iter()
-        .map(|volume| volume / domain_volume)
-        .collect::<Vec<_>>();
+    let mut normalized = vec![0.0; cell_volumes.len()];
+    for index in selected_cells {
+        normalized[index] = cell_volumes[index] / domain_volume;
+    }
     let component_functional = SparseRowOperator::new(
         normalized.len(),
-        vec![normalized.iter().copied().enumerate().collect()],
+        vec![normalized
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, weight)| *weight != 0.0)
+            .collect()],
     )
     .map_err(|error| error.to_string())?;
     let components = build_full_magnetic_flux_density_component_operators_3d(topology, coords)?;
@@ -646,6 +694,60 @@ mod tests {
                 .abs()
                 < 1e-10
         );
+    }
+
+    #[test]
+    fn selected_cell_magnetic_averages_normalize_and_preserve_constant_field() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let field = exterior::field::DiffFormClosure::one_form(
+            |p| common::linalg::nalgebra::Vector::from_column_slice(&[0.0, 0.0, p[1]]),
+            3,
+        );
+        let a = ddf::cochain::cochain_projection(&field, &topology, &coords, None);
+        let selected = topology
+            .cells()
+            .handle_iter()
+            .filter(|cell| cell.coord_simplex(&coords).barycenter()[0] <= 0.5)
+            .map(|cell| cell.kidx())
+            .collect::<Vec<_>>();
+        let averages =
+            build_selected_cell_magnetic_flux_density_averages_3d(&topology, &coords, &selected)
+                .unwrap();
+        assert!(averages.domain_volume > 0.0 && averages.domain_volume < 1.0);
+        assert!((averages.vector_rms_weights.iter().sum::<f64>() - 3.0).abs() < 1.0e-12);
+        assert!(averages
+            .vector_rms_weights
+            .chunks_exact(3)
+            .enumerate()
+            .all(|(cell, weights)| selected.contains(&cell) || weights == [0.0, 0.0, 0.0]));
+        let value = averages
+            .x
+            .apply(&GmrfVector::from_iterator(
+                a.coeffs.len(),
+                a.coeffs.iter().copied(),
+            ))
+            .unwrap()[0];
+        assert!((value - 1.0).abs() < 1.0e-10);
+    }
+
+    #[test]
+    fn selected_cell_magnetic_averages_reject_invalid_selections() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        assert!(
+            build_selected_cell_magnetic_flux_density_averages_3d(&topology, &coords, &[]).is_err()
+        );
+        assert!(
+            build_selected_cell_magnetic_flux_density_averages_3d(&topology, &coords, &[0, 0])
+                .is_err()
+        );
+        assert!(build_selected_cell_magnetic_flux_density_averages_3d(
+            &topology,
+            &coords,
+            &[topology.nsimplices(3)]
+        )
+        .is_err());
     }
 
     #[test]
