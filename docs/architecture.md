@@ -110,7 +110,7 @@ For form degree \(k\), define
 A_k = kappa^2 M_k + L_k,
 ```
 
-where \(L_k\) is a weak, self-adjoint, non-negative Hodge–Laplacian. The
+where \(L_k\) is the Galerkin discretisation of the k-Hodge Laplacian. When k>0, the auxiliary k-1 variable is eliminated, so that \(L_k\) operates on the space \(C^k\).  The
 supported integer orders use
 
 ```text
@@ -119,10 +119,7 @@ Q_2 = tau^2 A_k M_k^-1 A_k
 Q_3 = tau^2 A_k M_k^-1 A_k M_k^-1 A_k.
 ```
 
-The mass-inverse policy is part of the discretization. It may use a lumped
-diagonal, an assembled diagonal, a projected inverse, or an explicitly
-supplied matrix. The choice changes the discrete covariance and must therefore
-remain visible in the model configuration.
+The mass-inverse policy is part of the discretization. The consistent inverses is dense, and the sparse approximate inverses perturb the covariance structure even beyond the perturbation introduced by consistent discretisation. The default and recommended sparse inverse is the projected inverse, described in the thesis report.  
 
 `MaternPriorBuilder::essential_boundary_conditions` reduces \(M_k\), \(L_k\),
 and the selected inverse before applying this recurrence. Constructing a
@@ -202,7 +199,7 @@ their specified values and have exactly zero variance.
 
 ## Physical pushforwards
 
-A physical field is a named `LinearMap`, not a post-processing callback. For a
+A physical field is a named `LinearMap`. For a
 magnetic vector potential, the map is
 
 ```text

@@ -33,10 +33,7 @@ precisions. Sparse factorization and covariance actions then make it possible
 to condition fields, impose exact constraints, draw samples, and quantify
 uncertainty without constructing a dense field covariance.
 
-This pairing is useful when a statistical model must respect more than spatial
-distance: for example, circulation around holes, divergence-free structure,
-essential boundary values, or the distinction between a vector potential and
-the magnetic flux density derived from it.
+This pairing is useful when a statistical model must respect curved and non-trivial geometries, and when the field is best modelled without reference to a pariticular coordinate system. It is therefore very well suited to uncertainty quantification in electromagnetic simulation. 
 
 ## Mathematical model
 
@@ -60,17 +57,20 @@ Q_3 = tau^2 A_k M_k^-1 A_k M_k^-1 A_k.
 `MaternPriorBuilder` assembles these models for 0-, 1-, 2-, and 3-form
 spaces, with explicit policies for the mass inverse and essential boundary
 conditions. The parameter `kappa` controls correlation length, `tau` controls
-precision amplitude, and `alpha` controls spectral decay.
+precision amplitude, and `alpha` controls spectral decay and therefore smoothness of the random field.
 
-For 1-forms, a Hodge-decomposed model can place separate priors on exact,
+For k-forms (where 0 < k < n), a Hodge-decomposed model can place separate priors on exact,
 coexact, and harmonic components. The two non-harmonic constructions differ in
 where the requested spectrum is defined:
 
-- a **potential-spectrum** prior gives the latent scalar or 2-form potential a
+- a **potential-spectrum** prior gives the latent k-1 or k+1-form potential a
   Matérn spectrum; applying \(d\) or \(\delta\) contributes an additional
-  eigenvalue factor to the synthesized 1-form covariance;
+  eigenvalue factor to the synthesized k-form covariance;
 - a **form-spectrum** prior compensates for that factor so the resulting
   exact or coexact 1-form has the requested Matérn spectrum.
+
+A **form-spectrum** Hodge-decomposed model is spectrally equivalent to a non-decomposed model defined on the k-form space, whereas
+a **potential-spectrum** model is not.
 
 ### Observations, constraints, and posterior precision
 
@@ -118,10 +118,6 @@ operator as \(L_k\) in the Matérn recurrence. General affine PDE systems should
 use `pde_induced_prior` or an independently constructed prior plus a weak
 residual term.
 
-Nonlinear residuals supply \(r(x)\) and an explicit sparse Jacobian \(J(x)\).
-The Gauss–Newton/Laplace workflow repeatedly assembles
-\(Q + J^T W J\), solves for the MAP update, and returns the final local
-Gaussian approximation.
 
 ### Physical fields and quantities of interest
 
