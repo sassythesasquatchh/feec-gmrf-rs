@@ -128,6 +128,29 @@ Whitney route uses projected sparse inverses by default and is explicitly
 reported as `WhitneyApproximateEliminated`; it is not labelled as an exact
 full-metric law.
 
+`ExactMaternPriorBuilder::from_feec_homogeneous_full_relative` first assembles
+the active lower, state, and upper Whitney spaces as one relative de Rham
+subcomplex. It then forms the exact weak Hodge term and recurrence using
+materialized mass inverses. This produces the full-metric reference law for
+small systems and records `ExactEliminatedReference`, adjacent layouts, and
+both exact inverse roles in metadata. It is deliberately guarded by a maximum
+materialized dimension and is not the scalable supported representation.
+
+`SupportedMaternPriorBuilder` consumes the same canonical adjacent FEEC blocks
+without materializing either mass inverse. For alpha 1--3 it retains each
+metric relation as a sparse auxiliary constraint and places the local quadratic
+energy on the appropriate terminal variables. The resulting object is a
+Gaussian measure on an explicitly constrained support, not an SPD precision on
+the larger ambient space. `gmrf-core` certifies independent support constraints
+and positive energy on their nullspace before factoring the indefinite KKT
+equations. Conditioning and physical pushforwards act on selected state
+coordinates while covariance actions remain in the supported system.
+
+Metadata distinguishes `ExactSupported` with `ConstrainedSupport` inverse
+roles from `ExactEliminatedReference` with `ExactMaterialized` inverses. Solver
+diagnostics distinguish stored input nonzeros from unavailable LU fill; sparse
+block assembly alone is not presented as a factorization-complexity result.
+
 `MaternPriorBuilder::essential_boundary_conditions` reduces \(M_k\), \(L_k\),
 and the selected inverse before applying this recurrence. Constructing a
 full-space alpha-2 or alpha-3 precision and conditioning it afterwards is, in
@@ -135,8 +158,8 @@ general, a different Gaussian model. The former is retained as a legacy
 principal restriction of an already collapsed approximate operator and is
 reported as such in metadata. `GaussianPrior::condition_on_essential_boundary`
 is the separately named finite-law conditioning operation. Compatible
-adjacent-space boundary assembly is required before an exact boundary-domain
-constructor can be exposed.
+adjacent-space boundary assembly is used only by the exact constructor; it is
+not inferred from principal restriction of a completed inverse.
 
 ### Hodge-decomposed 1-form priors
 

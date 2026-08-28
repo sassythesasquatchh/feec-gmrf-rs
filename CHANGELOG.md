@@ -9,6 +9,18 @@ mathematical or numerical result.
 
 - Added Matérn precision construction for 0-, 1-, 2-, and 3-form FEEC spaces,
   with integer orders alpha 1, 2, and 3 and explicit mass-inverse policies.
+- Added a guarded exact full-metric reference builder that assembles compatible
+  adjacent homogeneous full-relative FEEC spaces before materializing either
+  inverse. Exact, projected-Whitney, and opaque collapsed representations now
+  have distinct provenance and boundary metadata.
+- Added an exact supported Matérn builder for alpha 1--3. It retains both
+  full-metric inverse relations as sparse auxiliary constraints and exposes
+  certified KKT conditioning, covariance actions, hard constraints, and
+  transformed variances without mislabelling the ambient KKT system as an SPD
+  precision.
+- Proper prior and correlated-noise constructors now canonicalize duplicate
+  sparse entries, reject non-finite/asymmetric inputs, and require an unshifted
+  sparse Cholesky certificate of positive definiteness without adding jitter.
 - Added potential-spectrum and form-spectrum Hodge-decomposed 1-form priors
   with exact, coexact, and harmonic branches.
 - Added sparse linear Gaussian observations, heteroscedastic and correlated

@@ -33,7 +33,10 @@ precisions. Sparse factorization and covariance actions then make it possible
 to condition fields, impose exact constraints, draw samples, and quantify
 uncertainty without constructing a dense field covariance.
 
-This pairing is useful when a statistical model must respect curved and non-trivial geometries, and when the field is best modelled without reference to a pariticular coordinate system. It is therefore very well suited to uncertainty quantification in electromagnetic simulation. 
+This pairing is useful when a statistical model must respect curved and
+non-trivial geometries, and when the field is best modelled without reference
+to a particular coordinate system. It is therefore well suited to uncertainty
+quantification in electromagnetic simulation.
 
 ## Mathematical model
 
@@ -63,6 +66,24 @@ labelled approximate: it is the compact sparse method used by the studies, not
 an exact full-metric reference construction. The parameter `kappa` controls
 correlation length, `tau` controls precision amplitude, and `alpha` controls
 spectral decay and therefore smoothness of the random field.
+
+`ExactMaternPriorBuilder::from_feec_homogeneous_full_relative` is the
+small-system reference path. It assembles the lower, state, and upper Whitney
+spaces on one compatible homogeneous full-relative subcomplex before forming
+either inverse, then materializes the full-metric eliminated precision without
+dropping entries. Its default dimension guard prevents accidental use as a
+large-scale solver.
+
+`SupportedMaternPriorBuilder::from_feec_homogeneous_full_relative` represents
+the same finite-dimensional full-metric law through local auxiliary variables
+and sparse linear support constraints. It supports exact state covariance
+actions, linear Gaussian observations, hard state constraints, and transformed
+physical variances through a certified sparse KKT solve. The API reports the
+ambient and support dimensions, block nonzeros, certificate residuals, and KKT
+input nonzeros. It does not report unavailable factor fill, and sampling
+returns a typed unsupported error until a support-aware square root is
+implemented. The exact eliminated, exact supported, and compact projected
+builders are explicitly labelled; none silently falls back to another law.
 
 For k-forms (where 0 < k < n), a Hodge-decomposed model can place separate priors on exact,
 coexact, and harmonic components. The two non-harmonic constructions differ in
