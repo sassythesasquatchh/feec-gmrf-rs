@@ -549,6 +549,7 @@ impl SupportedMaternPosterior {
                 covariance[row][column] = value;
             }
         }
+        validate_transformed_covariance_symmetry(&covariance)?;
         Ok(covariance)
     }
 
@@ -785,4 +786,64 @@ fn append_state_constraints(
         feg_infer::sparse::core_triplet_to_gmrf(&matrix),
         Vector::from_vec(rhs),
     ))
+}
+
+fn validate_transformed_covariance_symmetry(covariance: &[Vec<f64>]) -> Result<()> {
+    let dimension = covariance.len();
+    let scale = covariance
+        .iter()
+        .flatten()
+        .map(|value| value.abs())
+        .fold(0.0, f64::max);
+    let tolerance = 4_096.0 * f64::EPSILON * dimension.max(1) as f64 * scale.max(f64::MIN_POSITIVE);
+    let mut maximum = (0_usize, 0_usize, 0.0_f64);
+    for (row, values) in covariance.iter().enumerate() {
+        if values.len() != dimension {
+            return Err(FeecGmrfError::Dimension(
+                "supported transformed covariance is not square".to_string(),
+            ));
+        }
+        for (column, transpose_values) in covariance.iter().enumerate().skip(row + 1) {
+            let difference = (values[column] - transpose_values[row]).abs();
+            if difference > maximum.2 {
+                maximum = (row, column, difference);
+            }
+        }
+    }
+    if maximum.2 > tolerance {
+        return Err(FeecGmrfError::MatrixNotSymmetric {
+            matrix: "supported transformed covariance",
+            row: maximum.0,
+            column: maximum.1,
+            max_abs_difference: maximum.2,
+            tolerance,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transformed_covariance_symmetry_is_scale_relative_and_never_repaired() {
+        validate_transformed_covariance_symmetry(&[
+            vec![2.0e-20, 3.0e-21],
+            vec![3.0e-21 + 1.0e-34, 4.0e-20],
+        ])
+        .unwrap();
+        let error = validate_transformed_covariance_symmetry(&[
+            vec![2.0e-20, 3.0e-21],
+            vec![3.1e-21, 4.0e-20],
+        ])
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            FeecGmrfError::MatrixNotSymmetric {
+                matrix: "supported transformed covariance",
+                ..
+            }
+        ));
+    }
 }

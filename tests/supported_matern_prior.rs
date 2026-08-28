@@ -317,7 +317,24 @@ fn supported_feec_prior_preserves_full_relative_boundary_layout() {
     let cochain_variances = posterior
         .pushforward_variances(&LinearMap::identity(prior.cochain_dimension()))
         .unwrap();
+    let full_covariance = posterior
+        .pushforward_covariance(&LinearMap::identity(prior.cochain_dimension()))
+        .unwrap();
     for (fixed, _) in layouts.state().fixed_dofs() {
         assert_eq!(cochain_variances[*fixed], 0.0);
+        assert!(full_covariance[*fixed].iter().all(|value| *value == 0.0));
+        assert!(full_covariance.iter().all(|row| row[*fixed] == 0.0));
+    }
+    let active_covariance = posterior
+        .pushforward_covariance(&LinearMap::identity(prior.state_dimension()))
+        .unwrap();
+    for (active_row, &full_row) in layouts.state().active_dofs().iter().enumerate() {
+        for (active_column, &full_column) in layouts.state().active_dofs().iter().enumerate() {
+            assert_scalar_close(
+                full_covariance[full_row][full_column],
+                active_covariance[active_row][active_column],
+                "full-cochain boundary-eliminated covariance",
+            );
+        }
     }
 }

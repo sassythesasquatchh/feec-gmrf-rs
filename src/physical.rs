@@ -630,6 +630,47 @@ mod tests {
     }
 
     #[test]
+    fn fixed_footprint_sensors_converge_for_nonconstant_analytic_curl() {
+        let center = [0.42, 0.55, 0.61];
+        let kernel = WendlandC2Kernel3d::new(center, 0.3).unwrap();
+        let expected = [center[0] * center[2], -center[1] * center[2], 0.0];
+        let error = |resolution| {
+            let mesh = CartesianMeshInfo::new_unit_scaled(3, resolution, 1.0);
+            let (topology, coords) = mesh.compute_coord_complex();
+            let sensors =
+                MagneticVolumeSensorBank3d::from_feec(&topology, &coords, &[kernel]).unwrap();
+            let field = exterior::field::DiffFormClosure::one_form(
+                |point| {
+                    common::linalg::nalgebra::Vector::from_column_slice(&[
+                        0.0,
+                        0.0,
+                        point[0] * point[1] * point[2],
+                    ])
+                },
+                3,
+            );
+            let cochain = ddf::cochain::cochain_projection(&field, &topology, &coords, None);
+            let values = sensors.map().apply(cochain.coeffs.as_slice()).unwrap();
+            values
+                .iter()
+                .zip(expected)
+                .map(|(actual, expected)| (actual - expected).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        };
+        let errors = [error(2), error(4), error(8)];
+        assert!(
+            errors.windows(2).all(|pair| pair[1] < pair[0]),
+            "nonconstant analytic-curl sensor errors did not decrease: {errors:?}"
+        );
+        assert!(
+            errors[2] < 2.0e-3,
+            "fine sensor error is {0:.6e}",
+            errors[2]
+        );
+    }
+
+    #[test]
     fn fixed_footprint_kernels_validate_parameters_and_mesh_support() {
         assert!(WendlandC2Kernel3d::new([f64::NAN, 0.0, 0.0], 1.0).is_err());
         assert!(WendlandC2Kernel3d::new([0.0; 3], 0.0).is_err());

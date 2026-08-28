@@ -1478,13 +1478,13 @@ impl SpectralMaternGp {
         output_matrix: &CsrMatrix,
         input: &[f64],
     ) -> Result<Vec<f64>, GpError> {
-        let output_features = sparse_dense_product(output_matrix, &self.feature_matrix())?;
-        if input.len() != output_features.nrows() {
+        if input.len() != output_matrix.nrows() {
             return Err(GpError::OutputVectorDimensionMismatch {
-                expected: output_features.nrows(),
+                expected: output_matrix.nrows(),
                 got: input.len(),
             });
         }
+        let output_features = sparse_dense_product(output_matrix, &self.feature_matrix())?;
         let latent_input = dense_transpose_times_vector(&output_features, input);
         Ok(dense_matrix_times_vector(&output_features, &latent_input))
     }
@@ -3999,6 +3999,21 @@ mod tests {
         output.push(1, 1, 0.3);
         output.push(1, 3, 1.2);
         let output = CsrMatrix::from(&output);
+        let wrong_output = CsrMatrix::zeros(2, 3);
+        assert!(matches!(
+            gp.prior_output_covariance(&wrong_output),
+            Err(GpError::ObservationMatrixDimensionMismatch {
+                expected: 4,
+                got: 3
+            })
+        ));
+        assert!(matches!(
+            gp.prior_output_covariance_action(&output, &[1.0]),
+            Err(GpError::OutputVectorDimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
         let prior_output_covariance = gp.prior_output_covariance(&output).unwrap();
         let expected_prior_output_covariance = sparse_covariance_pushforward(&output, &covariance);
         assert_matrix_close(
