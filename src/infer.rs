@@ -15,7 +15,9 @@ use gmrf_core::{
     estimate_hutchinson_weighted_covariance_trace, exact_weighted_covariance_trace,
     ConstrainedPrecisionSolver, Gmrf, ProbeBatchConfig, SparseRowOperator, TransformedVarianceMode,
 };
-pub use gmrf_core::{ProbeDistribution, VarianceFloor};
+pub use gmrf_core::{
+    CholeskyOrderingKind, ProbeDistribution, SparseCholeskyDiagnostics, VarianceFloor,
+};
 use rand::Rng;
 use std::collections::BTreeMap;
 
@@ -233,12 +235,16 @@ pub struct WeightedCovarianceTraceEstimate {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct FactorizationDiagnostics {
     pub dimension: usize,
-    /// Nonzeros in the complete symmetric precision representation.
+    /// Nonzeros stored in the precision supplied to the factorization.
     pub precision_nonzeros: usize,
-    /// Nonzeros in the stored sparse Cholesky factor.
+    /// Nonzeros in the one symmetric triangle analyzed by Cholesky.
+    pub analyzed_triangle_nonzeros: usize,
+    /// Numeric storage slots in the sparse Cholesky factor.
     pub factor_nonzeros: usize,
-    /// Factor nonzeros divided by precision nonzeros on or below the diagonal.
+    /// Factor storage divided by analyzed-triangle nonzeros.
     pub fill_ratio: f64,
+    /// Ordering requested from the sparse Cholesky backend.
+    pub ordering: CholeskyOrderingKind,
 }
 
 /// A Gaussian prior with a cached sparse factor for repeated uncertainty queries.
@@ -289,18 +295,14 @@ impl PreparedLinearGaussianModel {
 
     /// Sparse sizes of the reusable posterior precision and factor.
     pub fn factorization_diagnostics(&self) -> FactorizationDiagnostics {
-        let precision_nonzeros = self.public_precision.nnz();
-        let lower_precision_nonzeros = lower_triangle_nonzeros(&self.public_precision);
-        let factor_nonzeros = self.posterior_factor.nnz();
+        let backend = self.posterior_factor.diagnostics();
         FactorizationDiagnostics {
-            dimension: self.prior_mean.len(),
-            precision_nonzeros,
-            factor_nonzeros,
-            fill_ratio: if lower_precision_nonzeros == 0 {
-                0.0
-            } else {
-                factor_nonzeros as f64 / lower_precision_nonzeros as f64
-            },
+            dimension: backend.dimension,
+            precision_nonzeros: backend.input_nnz,
+            analyzed_triangle_nonzeros: backend.input_triangle_nnz,
+            factor_nonzeros: backend.lower_factor_nnz,
+            fill_ratio: backend.fill_ratio.unwrap_or(0.0),
+            ordering: backend.ordering,
         }
     }
 
@@ -549,18 +551,14 @@ impl Posterior {
                 "posterior precision does not carry a reusable sparse factor".to_string(),
             )
         })?;
-        let precision_nonzeros = self.precision.nnz();
-        let lower_precision_nonzeros = lower_triangle_nonzeros(&self.precision);
-        let factor_nonzeros = factor.nnz();
+        let backend = factor.diagnostics();
         Ok(FactorizationDiagnostics {
-            dimension: self.mean.len(),
-            precision_nonzeros,
-            factor_nonzeros,
-            fill_ratio: if lower_precision_nonzeros == 0 {
-                0.0
-            } else {
-                factor_nonzeros as f64 / lower_precision_nonzeros as f64
-            },
+            dimension: backend.dimension,
+            precision_nonzeros: backend.input_nnz,
+            analyzed_triangle_nonzeros: backend.input_triangle_nnz,
+            factor_nonzeros: backend.lower_factor_nnz,
+            fill_ratio: backend.fill_ratio.unwrap_or(0.0),
+            ordering: backend.ordering,
         })
     }
 
@@ -1070,13 +1068,6 @@ fn exact_estimate(values: Vec<f64>) -> VarianceEstimate {
             0.0
         },
     }
-}
-
-fn lower_triangle_nonzeros(matrix: &SparseMat) -> usize {
-    matrix
-        .triplet_iter()
-        .filter(|(row, column, value)| row >= column && *value != 0.0)
-        .count()
 }
 
 fn public_estimate(estimate: gmrf_core::VarianceEstimate) -> VarianceEstimate {

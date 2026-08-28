@@ -139,6 +139,21 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
 
         let mut exact_factor = exact.factor().unwrap();
         let supported_factor = supported.factor().unwrap();
+        let diagnostics = supported_factor.diagnostics();
+        assert_eq!(
+            diagnostics.supported_energy_factor_nnz,
+            diagnostics.supported_energy_factor.lower_factor_nnz
+        );
+        if let Some(constraint_factor) = diagnostics.constraint_gram_factor {
+            assert_eq!(
+                diagnostics.constraint_gram_factor_nnz,
+                constraint_factor.lower_factor_nnz
+            );
+        }
+        assert!(matches!(
+            supported_factor.kkt_factor_nonzeros(),
+            Err(FeecGmrfError::Unsupported(_))
+        ));
         assert_vector_close(
             supported_factor.mean(),
             exact_factor.mean(),

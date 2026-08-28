@@ -247,15 +247,19 @@ impl PosteriorReport {
                 strings(&[
                     "dimension",
                     "precision_nonzeros",
+                    "analyzed_triangle_nonzeros",
                     "factor_nonzeros",
                     "fill_ratio",
+                    "ordering",
                 ]),
             )?;
             table.push_row(vec![
                 integer(factorization.dimension)?,
                 integer(factorization.precision_nonzeros)?,
+                integer(factorization.analyzed_triangle_nonzeros)?,
                 integer(factorization.factor_nonzeros)?,
                 ReportCell::Float(factorization.fill_ratio),
+                ReportCell::Text(format!("{:?}", factorization.ordering)),
             ])?;
             tables.push(table);
         }

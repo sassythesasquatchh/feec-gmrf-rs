@@ -341,8 +341,13 @@ fn heteroscedastic_rows_and_prepared_conditioning_use_the_public_model() {
     let diagnostics = prepared.factorization_diagnostics();
     assert_eq!(diagnostics.dimension, 2);
     assert_eq!(diagnostics.precision_nonzeros, 2);
+    assert_eq!(diagnostics.analyzed_triangle_nonzeros, 2);
     assert_eq!(diagnostics.factor_nonzeros, 2);
     assert!((diagnostics.fill_ratio - 1.0).abs() < 1e-12);
+    assert_eq!(
+        diagnostics.ordering,
+        CholeskyOrderingKind::ApproximateMinimumDegree
+    );
 }
 
 #[test]

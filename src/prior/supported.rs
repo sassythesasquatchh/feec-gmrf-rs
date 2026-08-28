@@ -13,9 +13,9 @@ use crate::operator::{BoundaryLayout, ExactFormOperators, FormDegree, LinearMap,
 use crate::{FeecGmrfError, Result};
 use feg_core::SparseTriplet;
 use gmrf_core::{
-    linear_observation_update, LinearObservationTerm, SelectedCoordinates, SparseRowOperator,
-    SupportedGaussianCertificateResiduals, SupportedGaussianFactor, SupportedGaussianSystem,
-    Vector,
+    linear_observation_update, LinearObservationTerm, SelectedCoordinates,
+    SparseCholeskyDiagnostics, SparseRowOperator, SupportedGaussianCertificateResiduals,
+    SupportedGaussianFactor, SupportedGaussianSystem, Vector,
 };
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 use std::ops::Range;
@@ -66,6 +66,12 @@ pub struct SupportedMaternDiagnostics {
     pub constraint_nnz: usize,
     pub constraint_gram_factor_nnz: usize,
     pub supported_energy_factor_nnz: usize,
+    /// Actual sparse-Cholesky storage for the constraint-rank certificate.
+    pub constraint_gram_factor: Option<SparseCholeskyDiagnostics>,
+    /// Actual sparse-Cholesky storage for the supported-energy certificate.
+    pub supported_energy_factor: SparseCholeskyDiagnostics,
+    /// Stored entries of the assembled indefinite KKT coefficient matrix.
+    /// This is not LU factor fill.
     pub kkt_nnz: usize,
     pub certificate_residuals: SupportedGaussianCertificateResiduals,
 }
@@ -243,6 +249,8 @@ impl SupportedMaternPrior {
         let selection = SelectedCoordinates::prefix(ambient_dimension, self.state_dimension())?;
         let mean = factor.selected_mean(&selection, &information)?;
         let certificate = factor.certificate();
+        let constraint_gram_factor = certificate.constraint_gram_factor_diagnostics();
+        let supported_energy_factor = certificate.supported_energy_factor_diagnostics();
         let diagnostics = SupportedMaternDiagnostics {
             ambient_dimension,
             support_dimension: factor.support_dim(),
@@ -251,6 +259,8 @@ impl SupportedMaternPrior {
             constraint_nnz,
             constraint_gram_factor_nnz: certificate.constraint_gram_factor_nnz(),
             supported_energy_factor_nnz: certificate.supported_energy_factor_nnz(),
+            constraint_gram_factor,
+            supported_energy_factor,
             kkt_nnz: factor.kkt_nnz(),
             certificate_residuals: certificate.residuals(),
         };
@@ -298,6 +308,16 @@ impl SupportedMaternPosterior {
 
     pub fn diagnostics(&self) -> SupportedMaternDiagnostics {
         self.diagnostics
+    }
+
+    /// Actual LU factor nonzeros for the indefinite KKT solve, when supported
+    /// by the configured backend.
+    ///
+    /// The current faer backend returns a typed unsupported-query error. This
+    /// prevents the assembled KKT input count from being mislabeled as factor
+    /// fill.
+    pub fn kkt_factor_nonzeros(&self) -> Result<usize> {
+        Ok(self.factor.factor_nnz()?)
     }
 
     pub fn covariance_action(&self, rhs: &[f64]) -> Result<Vec<f64>> {

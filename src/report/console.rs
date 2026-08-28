@@ -136,12 +136,14 @@ pub fn write_console_report<W: Write>(
     if let Some(factorization) = report.factorization {
         writeln!(
             writer,
-            "factorization: dimension={}, precision_nnz={}, factor_nnz={}, fill_ratio={:.*}",
+            "factorization: dimension={}, precision_nnz={}, analyzed_triangle_nnz={}, factor_nnz={}, fill_ratio={:.*}, ordering={:?}",
             factorization.dimension,
             factorization.precision_nonzeros,
+            factorization.analyzed_triangle_nonzeros,
             factorization.factor_nonzeros,
             precision,
-            factorization.fill_ratio
+            factorization.fill_ratio,
+            factorization.ordering
         )?;
     }
     Ok(())

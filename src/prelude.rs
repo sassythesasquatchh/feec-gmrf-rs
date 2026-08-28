@@ -15,10 +15,10 @@ pub use crate::hodge::{
     HodgeOneFormPriorBuilder, HodgePosterior, HodgeTwoFormMassInverse, HodgeZeroFormMassInverse,
 };
 pub use crate::infer::{
-    FactoredGaussianPrior, FactorizationDiagnostics, HutchinsonVarianceConfig,
-    MonteCarloVarianceConfig, Posterior, PreparedLinearGaussianModel, ProbeDistribution,
-    VarianceEstimate, VarianceEstimator, VarianceFloor, VarianceMethod,
-    WeightedCovarianceTraceEstimate, WeightedVarianceEstimate,
+    CholeskyOrderingKind, FactoredGaussianPrior, FactorizationDiagnostics,
+    HutchinsonVarianceConfig, MonteCarloVarianceConfig, Posterior, PreparedLinearGaussianModel,
+    ProbeDistribution, SparseCholeskyDiagnostics, VarianceEstimate, VarianceEstimator,
+    VarianceFloor, VarianceMethod, WeightedCovarianceTraceEstimate, WeightedVarianceEstimate,
 };
 pub use crate::linear_pde::{
     DeterministicLinearPdeSolution, LinearPdeModelBuilder, LinearPdeSystem, PdeResidualNoise,
