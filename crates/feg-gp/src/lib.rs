@@ -6,7 +6,9 @@ mod hodge;
 use common::linalg::nalgebra::quadratic_form_sparse;
 use common::linalg::nalgebra::{CsrMatrix, Matrix as NaMatrix, Vector as NaVector};
 #[cfg(feature = "external-solvers")]
-use common::linalg::petsc::{GhiepReducedSolve, GhiepWhich};
+use common::linalg::petsc::{
+    try_petsc_ghiep, GhiepReducedSolve, GhiepWhich, PetscError, PetscGeneralizedEigenDiagnostics,
+};
 #[cfg(feature = "external-solvers")]
 use exterior::ExteriorGrade;
 use faer::linalg::matmul::matmul;
@@ -22,6 +24,8 @@ use libm::tgamma;
 #[cfg(feature = "external-solvers")]
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 use std::cmp::Ordering;
+#[cfg(feature = "external-solvers")]
+use std::path::PathBuf;
 use thiserror::Error;
 
 #[cfg(feature = "external-solvers")]
@@ -111,6 +115,35 @@ pub enum GpError {
     },
     #[error("mass-orthogonality tolerance must be finite and non-negative")]
     InvalidMassOrthogonalityTolerance,
+    #[cfg(feature = "external-solvers")]
+    #[error("partial generalized eigensolver rank must be in 1..={dimension}, got {requested}")]
+    InvalidPartialGeneralizedEigenbasisRank { requested: usize, dimension: usize },
+    #[cfg(feature = "external-solvers")]
+    #[error(
+        "partial generalized eigenproblem requires matching square matrices, got mass {mass_rows}x{mass_cols} and Laplacian {laplacian_rows}x{laplacian_cols}"
+    )]
+    PartialGeneralizedEigenbasisOperatorDimensionMismatch {
+        mass_rows: usize,
+        mass_cols: usize,
+        laplacian_rows: usize,
+        laplacian_cols: usize,
+    },
+    #[cfg(feature = "external-solvers")]
+    #[error("eigenvalue negative tolerance must be finite and non-negative")]
+    InvalidEigenvalueNegativeTolerance,
+    #[cfg(feature = "external-solvers")]
+    #[error("generalized eigenvalue {index} is negative beyond tolerance {tolerance}: {value}")]
+    NegativeGeneralizedEigenvalue {
+        index: usize,
+        value: f64,
+        tolerance: f64,
+    },
+    #[cfg(feature = "external-solvers")]
+    #[error("partial eigenbasis resource diagnostic overflow for {quantity}")]
+    PartialEigenbasisResourceOverflow { quantity: &'static str },
+    #[cfg(feature = "external-solvers")]
+    #[error(transparent)]
+    ExternalGeneralizedEigenproblem(#[from] PetscError),
     #[error(
         "generalized eigenvectors {left} and {right} have mass inner product {value}, exceeding tolerance {tolerance}"
     )]
@@ -208,6 +241,72 @@ pub struct EigenBasis {
     eigenvectors: Mat<f64>,
 }
 
+/// Validation policy for a production partial generalized eigensolve.
+///
+/// The adapter solves the boundary-reduced FEEC problem
+/// `L v = lambda M v` on the supplied sparse operators. It never substitutes
+/// a dense eigensolver when the PETSc/SLEPc helper is unavailable.
+#[cfg(feature = "external-solvers")]
+#[derive(Debug, Clone, Copy)]
+pub struct PartialGeneralizedEigensolverOptions {
+    pub requested_rank: usize,
+    pub eigenvalue_negative_tolerance: f64,
+    pub mass_orthogonality_tolerance: f64,
+}
+
+#[cfg(feature = "external-solvers")]
+impl PartialGeneralizedEigensolverOptions {
+    /// Construct options for the requested number of smallest eigenpairs.
+    pub fn new(requested_rank: usize) -> Self {
+        Self {
+            requested_rank,
+            eigenvalue_negative_tolerance: 1.0e-10,
+            mass_orthogonality_tolerance: 1.0e-8,
+        }
+    }
+}
+
+/// Auditable resource and external-helper metadata for a partial basis.
+#[cfg(feature = "external-solvers")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PartialGeneralizedEigenbasisDiagnostics {
+    pub dimension: usize,
+    pub requested_rank: usize,
+    pub converged_rank: usize,
+    pub retained_rank: usize,
+    pub mass_nonzeros: usize,
+    pub weak_hodge_laplacian_nonzeros: usize,
+    pub input_nonzeros: usize,
+    pub basis_storage_entries: usize,
+    pub basis_storage_bytes: usize,
+    pub clamped_negative_eigenvalues: usize,
+    pub workspace: PathBuf,
+    pub binary: PathBuf,
+}
+
+/// A validated mass-orthonormal basis and the diagnostics for its helper run.
+#[cfg(feature = "external-solvers")]
+#[derive(Debug, Clone)]
+pub struct PartialGeneralizedEigenbasis {
+    basis: EigenBasis,
+    diagnostics: PartialGeneralizedEigenbasisDiagnostics,
+}
+
+#[cfg(feature = "external-solvers")]
+impl PartialGeneralizedEigenbasis {
+    pub fn basis(&self) -> &EigenBasis {
+        &self.basis
+    }
+
+    pub fn diagnostics(&self) -> &PartialGeneralizedEigenbasisDiagnostics {
+        &self.diagnostics
+    }
+
+    pub fn into_basis(self) -> EigenBasis {
+        self.basis
+    }
+}
+
 /// Explicit resource and validation limits for the dense reference
 /// generalized Hodge eigensolver.
 ///
@@ -274,6 +373,94 @@ pub fn dense_reference_generalized_hodge_eigenbasis(
         options.mass_orthogonality_tolerance,
     )?
     .truncate_smallest(dimension)
+}
+
+/// Compute the smallest generalized Hodge--Laplacian modes with PETSc/SLEPc.
+///
+/// `mass` and `weak_hodge_laplacian` must be the exact same boundary-reduced
+/// operators used to define the discrete law. The external helper may report
+/// more modes than requested; this adapter records the actual converged count,
+/// mass-normalizes and checks all returned modes through [`EigenBasis`], then
+/// sorts and retains exactly the requested number of smallest modes. Returning
+/// fewer than the requested number is treated as invalid helper output rather
+/// than silently changing the approximation rank.
+#[cfg(feature = "external-solvers")]
+pub fn partial_generalized_hodge_eigenbasis(
+    mass: &CsrMatrix,
+    weak_hodge_laplacian: &CsrMatrix,
+    options: PartialGeneralizedEigensolverOptions,
+) -> Result<PartialGeneralizedEigenbasis, GpError> {
+    validate_partial_generalized_eigenbasis_inputs(mass, weak_hodge_laplacian, options)?;
+
+    let result = try_petsc_ghiep(weak_hodge_laplacian, mass, options.requested_rank)?;
+    let PetscGeneralizedEigenDiagnostics {
+        dimension,
+        requested_rank,
+        converged_rank,
+        lhs_nonzeros,
+        rhs_nonzeros,
+        workspace,
+        binary,
+    } = result.diagnostics;
+    if converged_rank < requested_rank {
+        return Err(GpError::ExternalGeneralizedEigenproblem(
+            PetscError::InvalidHelperOutput {
+                binary,
+                workspace,
+                detail: format!(
+                    "the helper converged {converged_rank} eigenpairs, fewer than the requested {requested_rank}"
+                ),
+            },
+        ));
+    }
+
+    let mut eigenvalues = result.eigenvalues;
+    let clamped_negative_eigenvalues = validate_and_clamp_generalized_eigenvalues(
+        &mut eigenvalues,
+        options.eigenvalue_negative_tolerance,
+    )?;
+    let basis = EigenBasis::from_generalized_hodge_laplace_eigenpairs(
+        eigenvalues,
+        result.eigenvectors,
+        mass,
+        options.mass_orthogonality_tolerance,
+    )?
+    .truncate_smallest(requested_rank)?;
+
+    let input_nonzeros = lhs_nonzeros.checked_add(rhs_nonzeros).ok_or(
+        GpError::PartialEigenbasisResourceOverflow {
+            quantity: "input nonzero count",
+        },
+    )?;
+    let basis_storage_entries =
+        dimension
+            .checked_mul(basis.len())
+            .ok_or(GpError::PartialEigenbasisResourceOverflow {
+                quantity: "basis entry count",
+            })?;
+    let basis_storage_bytes = basis_storage_entries
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or(GpError::PartialEigenbasisResourceOverflow {
+            quantity: "basis byte count",
+        })?;
+
+    Ok(PartialGeneralizedEigenbasis {
+        diagnostics: PartialGeneralizedEigenbasisDiagnostics {
+            dimension,
+            requested_rank,
+            converged_rank,
+            retained_rank: basis.len(),
+            mass_nonzeros: rhs_nonzeros,
+            weak_hodge_laplacian_nonzeros: lhs_nonzeros,
+            input_nonzeros,
+            basis_storage_entries,
+            basis_storage_bytes,
+            clamped_negative_eigenvalues,
+            workspace,
+            binary,
+        },
+        basis,
+    })
 }
 
 impl EigenBasis {
@@ -1939,6 +2126,71 @@ fn validate_mass_orthogonality(
     Ok(())
 }
 
+#[cfg(feature = "external-solvers")]
+fn validate_partial_generalized_eigenbasis_inputs(
+    mass: &CsrMatrix,
+    weak_hodge_laplacian: &CsrMatrix,
+    options: PartialGeneralizedEigensolverOptions,
+) -> Result<(), GpError> {
+    let dimension = mass.nrows();
+    if dimension == 0
+        || mass.ncols() != dimension
+        || weak_hodge_laplacian.nrows() != dimension
+        || weak_hodge_laplacian.ncols() != dimension
+    {
+        return Err(
+            GpError::PartialGeneralizedEigenbasisOperatorDimensionMismatch {
+                mass_rows: mass.nrows(),
+                mass_cols: mass.ncols(),
+                laplacian_rows: weak_hodge_laplacian.nrows(),
+                laplacian_cols: weak_hodge_laplacian.ncols(),
+            },
+        );
+    }
+    if options.requested_rank == 0 || options.requested_rank > dimension {
+        return Err(GpError::InvalidPartialGeneralizedEigenbasisRank {
+            requested: options.requested_rank,
+            dimension,
+        });
+    }
+    if !options.eigenvalue_negative_tolerance.is_finite()
+        || options.eigenvalue_negative_tolerance < 0.0
+    {
+        return Err(GpError::InvalidEigenvalueNegativeTolerance);
+    }
+    if !options.mass_orthogonality_tolerance.is_finite()
+        || options.mass_orthogonality_tolerance < 0.0
+    {
+        return Err(GpError::InvalidMassOrthogonalityTolerance);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "external-solvers")]
+fn validate_and_clamp_generalized_eigenvalues(
+    eigenvalues: &mut NaVector,
+    negative_tolerance: f64,
+) -> Result<usize, GpError> {
+    let mut clamped = 0;
+    for (index, value) in eigenvalues.iter_mut().enumerate() {
+        if !value.is_finite() {
+            return Err(GpError::NonFiniteEigenvalue { value: *value });
+        }
+        if *value < -negative_tolerance {
+            return Err(GpError::NegativeGeneralizedEigenvalue {
+                index,
+                value: *value,
+                tolerance: negative_tolerance,
+            });
+        }
+        if *value < 0.0 {
+            *value = 0.0;
+            clamped += 1;
+        }
+    }
+    Ok(clamped)
+}
+
 fn validate_dense_reference_inputs(
     mass: &CsrMatrix,
     weak_hodge_laplacian: &CsrMatrix,
@@ -2458,6 +2710,141 @@ mod tests {
             error,
             GpError::EigenvectorsNotMassOrthogonal { .. }
         ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn partial_eigensolver_validation_rejects_rank_dimensions_and_tolerances() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let mut identity = CooMatrix::new(2, 2);
+        identity.push(0, 0, 1.0);
+        identity.push(1, 1, 1.0);
+        let identity = CsrMatrix::from(&identity);
+
+        for requested_rank in [0, 3] {
+            let error = validate_partial_generalized_eigenbasis_inputs(
+                &identity,
+                &identity,
+                PartialGeneralizedEigensolverOptions::new(requested_rank),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                GpError::InvalidPartialGeneralizedEigenbasisRank {
+                    requested,
+                    dimension: 2
+                } if requested == requested_rank
+            ));
+        }
+
+        let mut rectangular = CooMatrix::new(2, 3);
+        rectangular.push(0, 0, 1.0);
+        rectangular.push(1, 1, 1.0);
+        let error = validate_partial_generalized_eigenbasis_inputs(
+            &identity,
+            &CsrMatrix::from(&rectangular),
+            PartialGeneralizedEigensolverOptions::new(1),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            GpError::PartialGeneralizedEigenbasisOperatorDimensionMismatch { .. }
+        ));
+
+        let mut invalid = PartialGeneralizedEigensolverOptions::new(1);
+        invalid.eigenvalue_negative_tolerance = f64::NAN;
+        assert!(matches!(
+            validate_partial_generalized_eigenbasis_inputs(&identity, &identity, invalid),
+            Err(GpError::InvalidEigenvalueNegativeTolerance)
+        ));
+        let mut invalid = PartialGeneralizedEigensolverOptions::new(1);
+        invalid.mass_orthogonality_tolerance = -1.0;
+        assert!(matches!(
+            validate_partial_generalized_eigenbasis_inputs(&identity, &identity, invalid),
+            Err(GpError::InvalidMassOrthogonalityTolerance)
+        ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn partial_eigenvalue_validation_clamps_roundoff_but_rejects_invalid_values() {
+        let mut values = NaVector::from_vec(vec![2.0, -5.0e-11, 1.0]);
+        assert_eq!(
+            validate_and_clamp_generalized_eigenvalues(&mut values, 1.0e-10).unwrap(),
+            1
+        );
+        assert_eq!(values.as_slice(), &[2.0, 0.0, 1.0]);
+
+        let mut values = NaVector::from_vec(vec![-1.0e-4]);
+        assert!(matches!(
+            validate_and_clamp_generalized_eigenvalues(&mut values, 1.0e-10),
+            Err(GpError::NegativeGeneralizedEigenvalue { index: 0, .. })
+        ));
+
+        let mut values = NaVector::from_vec(vec![f64::INFINITY]);
+        assert!(matches!(
+            validate_and_clamp_generalized_eigenvalues(&mut values, 1.0e-10),
+            Err(GpError::NonFiniteEigenvalue { .. })
+        ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    #[ignore = "requires built PETSc/SLEPc ghiep helper"]
+    fn partial_eigensolver_solves_and_truncates_bounded_diagonal_problem() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let diagonal = |values: &[f64]| {
+            let mut matrix = CooMatrix::new(values.len(), values.len());
+            for (index, value) in values.iter().copied().enumerate() {
+                matrix.push(index, index, value);
+            }
+            CsrMatrix::from(&matrix)
+        };
+        let mass_diagonal = [2.0, 4.0, 8.0];
+        let mass = diagonal(&mass_diagonal);
+        let laplacian = diagonal(&[8.0, 4.0, 16.0]);
+        let result = partial_generalized_hodge_eigenbasis(
+            &mass,
+            &laplacian,
+            PartialGeneralizedEigensolverOptions::new(2),
+        )
+        .expect("bounded helper solve should succeed");
+
+        assert_close(result.basis().eigenvalues()[0], 1.0, 1.0e-8);
+        assert_close(result.basis().eigenvalues()[1], 2.0, 1.0e-8);
+        assert_eq!(result.diagnostics().dimension, 3);
+        assert_eq!(result.diagnostics().requested_rank, 2);
+        assert!(result.diagnostics().converged_rank >= 2);
+        assert_eq!(result.diagnostics().retained_rank, 2);
+        assert_eq!(result.diagnostics().mass_nonzeros, 3);
+        assert_eq!(result.diagnostics().weak_hodge_laplacian_nonzeros, 3);
+        assert_eq!(result.diagnostics().input_nonzeros, 6);
+        assert_eq!(result.diagnostics().basis_storage_entries, 6);
+        assert_eq!(result.diagnostics().basis_storage_bytes, 48);
+        for left in 0..result.basis().len() {
+            for right in 0..result.basis().len() {
+                let mass_inner_product = mass_diagonal
+                    .iter()
+                    .enumerate()
+                    .map(|(row, mass_value)| {
+                        mass_value
+                            * result.basis().eigenvectors()[(row, left)]
+                            * result.basis().eigenvectors()[(row, right)]
+                    })
+                    .sum::<f64>();
+                assert_close(
+                    mass_inner_product,
+                    if left == right { 1.0 } else { 0.0 },
+                    1.0e-8,
+                );
+            }
+        }
+        eprintln!(
+            "retained PETSc helper workspace for inspection: {:?}",
+            result.diagnostics().workspace
+        );
     }
 
     #[test]
