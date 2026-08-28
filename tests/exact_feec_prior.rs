@@ -70,6 +70,19 @@ fn assert_dense_close(actual: &SparseMat, expected: &[[f64; 2]; 2]) {
     }
 }
 
+fn assert_matrices_close(actual: &SparseMat, expected: &SparseMat) {
+    let actual = dense_entries(actual);
+    let expected = dense_entries(expected);
+    assert_eq!(actual.len(), expected.len());
+    for (actual_row, expected_row) in actual.iter().zip(&expected) {
+        assert_eq!(actual_row.len(), expected_row.len());
+        for (&actual, &expected) in actual_row.iter().zip(expected_row) {
+            let scale = expected.abs().max(1.0);
+            assert!((actual - expected).abs() <= 1.0e-11 * scale);
+        }
+    }
+}
+
 #[test]
 fn exact_adjacent_builder_matches_small_closed_form_for_all_supported_alphas() {
     let expected = [
@@ -112,6 +125,119 @@ fn exact_adjacent_builder_matches_small_closed_form_for_all_supported_alphas() {
         };
         assert_eq!(metadata.recurrence_inverse(), expected_recurrence);
     }
+}
+
+#[test]
+fn adjacent_builder_selects_lower_and_recurrence_inverse_sites_independently() {
+    let parameters = MaternParameters::new(MaternAlpha::Two, 1.0, 2.0).unwrap();
+    let exact = ExactMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+        .parameters(parameters)
+        .build()
+        .unwrap();
+    let exact_lower = SparseMat::diagonal(1, 0.25);
+    let exact_state = SparseMat::from_rows(2, &[vec![(0, 0.5)], vec![(1, 1.0 / 3.0)]]).unwrap();
+
+    let lower_provided = AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+        .parameters(parameters)
+        .lower_adjoint_inverse(EliminatedMassInversePolicy::Provided(exact_lower.clone()))
+        .build()
+        .unwrap();
+    let recurrence_provided =
+        AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+            .parameters(parameters)
+            .recurrence_inverse(EliminatedMassInversePolicy::Provided(exact_state.clone()))
+            .build()
+            .unwrap();
+    let both_provided = AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+        .parameters(parameters)
+        .lower_adjoint_inverse(EliminatedMassInversePolicy::Provided(exact_lower))
+        .recurrence_inverse(EliminatedMassInversePolicy::Provided(exact_state))
+        .build()
+        .unwrap();
+
+    for prior in [&lower_provided, &recurrence_provided, &both_provided] {
+        assert_matrices_close(prior.precision(), exact.precision());
+    }
+    let lower_metadata = lower_provided.matern_metadata().unwrap();
+    assert_eq!(
+        lower_metadata.representation(),
+        MaternRepresentation::MixedAdjacentEliminatedApproximation
+    );
+    assert_eq!(
+        lower_metadata.lower_adjoint_inverse(),
+        InverseUse::Applied(MassInverseKind::Provided)
+    );
+    assert_eq!(
+        lower_metadata.recurrence_inverse(),
+        InverseUse::Applied(MassInverseKind::ExactMaterialized)
+    );
+    let recurrence_metadata = recurrence_provided.matern_metadata().unwrap();
+    assert_eq!(
+        recurrence_metadata.lower_adjoint_inverse(),
+        InverseUse::Applied(MassInverseKind::ExactMaterialized)
+    );
+    assert_eq!(
+        recurrence_metadata.recurrence_inverse(),
+        InverseUse::Applied(MassInverseKind::Provided)
+    );
+    assert_eq!(
+        both_provided.matern_metadata().unwrap().representation(),
+        MaternRepresentation::ProvidedAdjacentEliminatedApproximation
+    );
+}
+
+#[test]
+fn adjacent_builder_validates_each_provided_inverse_against_its_metric_space() {
+    let parameters = MaternParameters::new(MaternAlpha::Two, 1.0, 1.0).unwrap();
+    let lower_error = AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+        .parameters(parameters)
+        .lower_adjoint_inverse(EliminatedMassInversePolicy::Provided(SparseMat::diagonal(
+            2, 1.0,
+        )))
+        .build()
+        .unwrap_err();
+    assert!(matches!(lower_error, FeecGmrfError::Dimension(_)));
+
+    let recurrence_error = AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+        .parameters(parameters)
+        .recurrence_inverse(EliminatedMassInversePolicy::Provided(SparseMat::diagonal(
+            1, 1.0,
+        )))
+        .build()
+        .unwrap_err();
+    assert!(matches!(recurrence_error, FeecGmrfError::Dimension(_)));
+}
+
+#[test]
+fn adjacent_builder_materialization_guard_applies_only_to_exact_sites() {
+    let provided_lower = AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+        .parameters(MaternParameters::new(MaternAlpha::One, 1.0, 1.0).unwrap())
+        .lower_adjoint_inverse(EliminatedMassInversePolicy::Provided(SparseMat::diagonal(
+            1, 0.25,
+        )))
+        .maximum_materialized_dimension(1)
+        .unwrap()
+        .build()
+        .unwrap();
+    assert_eq!(provided_lower.dimension(), 2);
+
+    let guarded_recurrence =
+        AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+            .parameters(MaternParameters::new(MaternAlpha::Two, 1.0, 1.0).unwrap())
+            .lower_adjoint_inverse(EliminatedMassInversePolicy::Provided(SparseMat::diagonal(
+                1, 0.25,
+            )))
+            .maximum_materialized_dimension(1)
+            .unwrap()
+            .build()
+            .unwrap_err();
+    assert!(matches!(
+        guarded_recurrence,
+        FeecGmrfError::ExactReferenceSizeExceeded {
+            dimension: 2,
+            maximum: 1
+        }
+    ));
 }
 
 #[test]

@@ -214,10 +214,40 @@ pub enum MaternRepresentation {
     ExactEliminatedReference,
     /// Exact law represented by a sparse energy on a constrained support.
     ExactSupported,
+    /// Eliminated adjacent-space law with one exact-materialized inverse and
+    /// one caller-supplied inverse. The supplied role is conservatively
+    /// recorded as an approximation; equality to the consistent metric is not
+    /// certified by this package.
+    MixedAdjacentEliminatedApproximation,
+    /// Eliminated adjacent-space law whose applicable inverse roles are all
+    /// caller-supplied. The package validates their algebraic contracts but
+    /// does not certify them as consistent-metric inverses.
+    ProvidedAdjacentEliminatedApproximation,
     /// Existing compact Whitney law with at least one approximate metric role.
     WhitneyApproximateEliminated,
     /// A collapsed Hodge operator supplied by the caller.
     ProvidedCollapsedEliminated,
+}
+
+/// Realization of one inverse metric in an eliminated adjacent-space law.
+///
+/// `ExactMaterialized` is intended only for reference-sized systems and is
+/// subject to the builder's explicit materialization limit. `Provided` keeps
+/// the mathematical site explicit while allowing a caller to supply, for
+/// example, a projected sparse inverse assembled by FEEC.
+#[derive(Debug, Clone, PartialEq)]
+pub enum EliminatedMassInversePolicy {
+    ExactMaterialized,
+    Provided(SparseMat),
+}
+
+impl EliminatedMassInversePolicy {
+    fn kind(&self) -> MassInverseKind {
+        match self {
+            Self::ExactMaterialized => MassInverseKind::ExactMaterialized,
+            Self::Provided(_) => MassInverseKind::Provided,
+        }
+    }
 }
 
 /// Origin of the operators used to construct a Matérn prior.
@@ -687,26 +717,32 @@ impl GaussianPrior {
     }
 }
 
-/// Small-system constructor for the exact full-metric eliminated FEEC law.
+const DEFAULT_MAXIMUM_MATERIALIZED_DIMENSION: usize = 1024;
+
+/// Eliminated Matérn construction from compatible adjacent FEEC operators.
 ///
-/// Every required inverse is materialized without dropping entries. This is a
-/// reference implementation for theorem checks and comparator runs, not the
-/// scalable constrained representation.
-pub struct ExactMaternPriorBuilder {
+/// The lower-adjoint and recurrence inverse metrics are separate mathematical
+/// sites and are therefore configured independently. Exact choices materialize
+/// the consistent inverse subject to an explicit size guard. Supplied choices
+/// are validated as finite symmetric positive-definite matrices but remain
+/// recorded as caller-provided approximations.
+pub struct AdjacentMaternPriorBuilder {
     operators: ExactFormOperators,
     parameters: MaternParameters,
+    lower_adjoint_inverse: EliminatedMassInversePolicy,
+    recurrence_inverse: EliminatedMassInversePolicy,
     maximum_materialized_dimension: usize,
 }
 
-impl ExactMaternPriorBuilder {
-    const DEFAULT_MAXIMUM_MATERIALIZED_DIMENSION: usize = 1024;
-
-    /// Build from caller-supplied adjacent masses, derivatives, and layouts.
+impl AdjacentMaternPriorBuilder {
+    /// Build from caller-supplied compatible adjacent masses, derivatives, and layouts.
     pub fn from_operators(operators: ExactFormOperators) -> Self {
         Self {
             operators,
             parameters: MaternParameters::default(),
-            maximum_materialized_dimension: Self::DEFAULT_MAXIMUM_MATERIALIZED_DIMENSION,
+            lower_adjoint_inverse: EliminatedMassInversePolicy::ExactMaterialized,
+            recurrence_inverse: EliminatedMassInversePolicy::ExactMaterialized,
+            maximum_materialized_dimension: DEFAULT_MAXIMUM_MATERIALIZED_DIMENSION,
         }
     }
 
@@ -728,6 +764,23 @@ impl ExactMaternPriorBuilder {
         self
     }
 
+    /// Select the inverse metric inside the lower-adjoint Hodge branch.
+    ///
+    /// This setting is ignored, and reported as not applicable, for degree
+    /// zero where no incoming branch exists.
+    pub fn lower_adjoint_inverse(mut self, policy: EliminatedMassInversePolicy) -> Self {
+        self.lower_adjoint_inverse = policy;
+        self
+    }
+
+    /// Select the degree-`k` inverse metric between repeated Matérn factors.
+    ///
+    /// This setting is ignored, and reported as unused, when `alpha = 1`.
+    pub fn recurrence_inverse(mut self, policy: EliminatedMassInversePolicy) -> Self {
+        self.recurrence_inverse = policy;
+        self
+    }
+
     /// Change the resource guard for each dense inverse that may be materialized.
     ///
     /// Raising this limit changes resource exposure, not the represented law.
@@ -741,64 +794,188 @@ impl ExactMaternPriorBuilder {
         Ok(self)
     }
 
-    /// Assemble the centered exact eliminated precision.
+    /// Assemble the centered eliminated precision.
     pub fn build(self) -> Result<GaussianPrior> {
         let Self {
             operators,
             parameters,
+            lower_adjoint_inverse,
+            recurrence_inverse,
             maximum_materialized_dimension,
         } = self;
 
-        let blocks = assemble_exact_matern_blocks(&operators, parameters.kappa)?;
-        if let Some(lower) = &blocks.lower {
-            enforce_materialization_limit(lower.mass.nrows(), maximum_materialized_dimension)?;
-        }
-        if parameters.alpha != MaternAlpha::One {
-            enforce_materialization_limit(blocks.mass.nrows(), maximum_materialized_dimension)?;
-        }
-
-        let mut system = blocks.local_system.clone();
-        let lower_use = if let Some(lower) = &blocks.lower {
-            let lower_inverse = materialize_exact_mass_inverse(&lower.mass)?;
-            let solved = multiply_sparse(&lower.coupling, &lower_inverse)?;
-            let lower_term = multiply_sparse(&solved, &lower.coupling.transpose())?;
-            system = add_sparse(&system, &lower_term)?;
-            InverseUse::Applied(MassInverseKind::ExactMaterialized)
-        } else {
-            InverseUse::NotApplicable
-        };
-        let system = crate::operator::validate_proper_precision("exact Matérn system", system)?;
-
-        let (precision, recurrence_use) = if parameters.alpha == MaternAlpha::One {
-            (system.scaled(parameters.tau.powi(2)), InverseUse::NotUsed)
-        } else {
-            let mass_inverse = materialize_exact_mass_inverse(&blocks.mass)?;
-            (
-                matern_recurrence(&system, &mass_inverse, parameters.alpha, parameters.tau)?,
-                InverseUse::Applied(MassInverseKind::ExactMaterialized),
-            )
-        };
-
-        let metadata = exact_matern_metadata(
-            &operators,
+        build_eliminated_adjacent_matern_prior(
+            operators,
             parameters,
-            MaternRepresentation::ExactEliminatedReference,
-            lower_use,
-            recurrence_use,
-        );
+            lower_adjoint_inverse,
+            recurrence_inverse,
+            maximum_materialized_dimension,
+        )
+    }
+}
 
-        let state_layout = operators.state().boundary_layout().clone();
-        let needs_elimination = state_layout.full_dimension() != operators.state().dimension()
-            || !state_layout.fixed_dofs().is_empty();
-        let prior = GaussianPrior::new(vec![0.0; operators.state().dimension()], precision)?
-            .with_form_degree(operators.degree())
-            .with_matern_metadata(metadata);
-        if needs_elimination {
-            prior
-                .with_boundary_elimination(EssentialBoundaryElimination::from_layout(state_layout)?)
-        } else {
-            Ok(prior)
+/// Small-system convenience constructor for the exact full-metric eliminated
+/// FEEC law.
+///
+/// Every required inverse is materialized without dropping entries. This is a
+/// reference implementation for theorem checks and comparator runs, not the
+/// scalable constrained representation.
+pub struct ExactMaternPriorBuilder {
+    inner: AdjacentMaternPriorBuilder,
+}
+
+impl ExactMaternPriorBuilder {
+    /// Build from caller-supplied adjacent masses, derivatives, and layouts.
+    pub fn from_operators(operators: ExactFormOperators) -> Self {
+        Self {
+            inner: AdjacentMaternPriorBuilder::from_operators(operators),
         }
+    }
+
+    /// Assemble compatible lowest-order Whitney spaces on the homogeneous
+    /// full-relative subcomplex before either inverse is formed.
+    pub fn from_feec_homogeneous_full_relative(
+        topology: &Complex,
+        metric: &MeshLengths,
+        degree: usize,
+    ) -> Result<Self> {
+        Ok(Self::from_operators(
+            ExactFormOperators::from_feec_homogeneous_full_relative(topology, metric, degree)?,
+        ))
+    }
+
+    /// Set direct `alpha`, `kappa`, and `tau` parameters.
+    pub fn parameters(mut self, parameters: MaternParameters) -> Self {
+        self.inner = self.inner.parameters(parameters);
+        self
+    }
+
+    /// Change the resource guard for each dense inverse that may be materialized.
+    ///
+    /// Raising this limit changes resource exposure, not the represented law.
+    pub fn maximum_materialized_dimension(mut self, maximum: usize) -> Result<Self> {
+        self.inner = self.inner.maximum_materialized_dimension(maximum)?;
+        Ok(self)
+    }
+
+    /// Assemble the centered exact eliminated precision.
+    pub fn build(self) -> Result<GaussianPrior> {
+        self.inner.build()
+    }
+}
+
+fn build_eliminated_adjacent_matern_prior(
+    operators: ExactFormOperators,
+    parameters: MaternParameters,
+    lower_adjoint_inverse: EliminatedMassInversePolicy,
+    recurrence_inverse: EliminatedMassInversePolicy,
+    maximum_materialized_dimension: usize,
+) -> Result<GaussianPrior> {
+    let blocks = assemble_exact_matern_blocks(&operators, parameters.kappa)?;
+
+    let mut system = blocks.local_system.clone();
+    let lower_use = if let Some(lower) = &blocks.lower {
+        let lower_kind = lower_adjoint_inverse.kind();
+        let lower_inverse = resolve_eliminated_mass_inverse(
+            "lower-adjoint mass inverse",
+            &lower.mass,
+            lower_adjoint_inverse,
+            maximum_materialized_dimension,
+        )?;
+        let solved = multiply_sparse(&lower.coupling, &lower_inverse)?;
+        let lower_term = multiply_sparse(&solved, &lower.coupling.transpose())?;
+        system = add_sparse(&system, &lower_term)?;
+        InverseUse::Applied(lower_kind)
+    } else {
+        InverseUse::NotApplicable
+    };
+    let system = crate::operator::validate_proper_precision("adjacent Matérn system", system)?;
+
+    let (precision, recurrence_use) = if parameters.alpha == MaternAlpha::One {
+        (system.scaled(parameters.tau.powi(2)), InverseUse::NotUsed)
+    } else {
+        let recurrence_kind = recurrence_inverse.kind();
+        let mass_inverse = resolve_eliminated_mass_inverse(
+            "recurrence mass inverse",
+            &blocks.mass,
+            recurrence_inverse,
+            maximum_materialized_dimension,
+        )?;
+        (
+            matern_recurrence(&system, &mass_inverse, parameters.alpha, parameters.tau)?,
+            InverseUse::Applied(recurrence_kind),
+        )
+    };
+
+    let representation = eliminated_adjacent_representation(lower_use, recurrence_use);
+    let metadata = exact_matern_metadata(
+        &operators,
+        parameters,
+        representation,
+        lower_use,
+        recurrence_use,
+    );
+
+    let state_layout = operators.state().boundary_layout().clone();
+    let needs_elimination = state_layout.full_dimension() != operators.state().dimension()
+        || !state_layout.fixed_dofs().is_empty();
+    let prior = GaussianPrior::new(vec![0.0; operators.state().dimension()], precision)?
+        .with_form_degree(operators.degree())
+        .with_matern_metadata(metadata);
+    if needs_elimination {
+        prior.with_boundary_elimination(EssentialBoundaryElimination::from_layout(state_layout)?)
+    } else {
+        Ok(prior)
+    }
+}
+
+fn resolve_eliminated_mass_inverse(
+    name: &'static str,
+    mass: &SparseMat,
+    policy: EliminatedMassInversePolicy,
+    maximum_materialized_dimension: usize,
+) -> Result<SparseMat> {
+    match policy {
+        EliminatedMassInversePolicy::ExactMaterialized => {
+            enforce_materialization_limit(mass.nrows(), maximum_materialized_dimension)?;
+            materialize_exact_mass_inverse(mass)
+        }
+        EliminatedMassInversePolicy::Provided(inverse) => {
+            if inverse.nrows() != mass.nrows() || inverse.ncols() != mass.ncols() {
+                return Err(FeecGmrfError::Dimension(format!(
+                    "provided {name} shape {}x{} does not match mass shape {}x{}",
+                    inverse.nrows(),
+                    inverse.ncols(),
+                    mass.nrows(),
+                    mass.ncols()
+                )));
+            }
+            crate::operator::validate_proper_precision(name, inverse)
+        }
+    }
+}
+
+fn eliminated_adjacent_representation(
+    lower: InverseUse,
+    recurrence: InverseUse,
+) -> MaternRepresentation {
+    let used = [lower, recurrence]
+        .into_iter()
+        .filter_map(|usage| match usage {
+            InverseUse::Applied(kind) => Some(kind),
+            InverseUse::NotApplicable | InverseUse::NotUsed => None,
+        })
+        .collect::<Vec<_>>();
+    let provided = used
+        .iter()
+        .filter(|kind| **kind == MassInverseKind::Provided)
+        .count();
+    match (provided, used.len()) {
+        (0, _) => MaternRepresentation::ExactEliminatedReference,
+        (count, total) if count == total => {
+            MaternRepresentation::ProvidedAdjacentEliminatedApproximation
+        }
+        _ => MaternRepresentation::MixedAdjacentEliminatedApproximation,
     }
 }
 

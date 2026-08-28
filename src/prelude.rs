@@ -47,11 +47,12 @@ pub use crate::prior::supported::{
     SupportedMaternPrior, SupportedMaternPriorBuilder,
 };
 pub use crate::prior::{
-    AdjacentBoundaryLayouts, ExactMaternPriorBuilder, GaussianPrior, InverseUse,
-    LowerAdjointMassInversePolicy, MassInverseKind, MassInversePolicy, MaternAlpha,
-    MaternBoundarySemantics, MaternOperatorSource, MaternParameterConvention, MaternParameters,
-    MaternPriorBuilder, MaternPriorMetadata, MaternRepresentation, PriorMahalanobisCalibration,
-    PriorNormalization, RecurrenceMassInversePolicy,
+    AdjacentBoundaryLayouts, AdjacentMaternPriorBuilder, EliminatedMassInversePolicy,
+    ExactMaternPriorBuilder, GaussianPrior, InverseUse, LowerAdjointMassInversePolicy,
+    MassInverseKind, MassInversePolicy, MaternAlpha, MaternBoundarySemantics, MaternOperatorSource,
+    MaternParameterConvention, MaternParameters, MaternPriorBuilder, MaternPriorMetadata,
+    MaternRepresentation, PriorMahalanobisCalibration, PriorNormalization,
+    RecurrenceMassInversePolicy,
 };
 pub use crate::report::{
     write_console_report, write_csv, write_csv_directory, CochainVtuBuilder, ConsoleReportOptions,
