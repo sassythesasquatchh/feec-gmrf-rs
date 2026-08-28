@@ -9,6 +9,8 @@ pub mod annulus_h_formulation;
 #[cfg(feature = "experimental")]
 pub mod c50_split_inverse_sites;
 #[cfg(feature = "experimental")]
+pub mod c51_benchmark;
+#[cfg(feature = "experimental")]
 pub mod c51_exact_supported_pilot;
 pub mod cube_mass_inverse_variance;
 #[cfg(feature = "experimental")]
@@ -107,6 +109,7 @@ pub mod experimental {
     //! maintained study profiles.
 
     pub use crate::c50_split_inverse_sites;
+    pub use crate::c51_benchmark;
     pub use crate::c51_exact_supported_pilot;
     pub use crate::cube_voids_coexact_transform;
     pub use crate::cube_zero_form_kernel_validation;

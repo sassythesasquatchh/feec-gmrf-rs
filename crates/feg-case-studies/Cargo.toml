@@ -38,6 +38,10 @@ plotters = { version = "0.3", default-features = false, features = ["bitmap_back
 name = "c50_split_inverse_sites"
 required-features = ["experimental"]
 
+[[example]]
+name = "c51_benchmark"
+required-features = ["experimental"]
+
 [[test]]
 name = "heavy_planar_holes"
 path = "tests/heavy_planar_holes.rs"
