@@ -1,5 +1,12 @@
 //! Posterior queries, reusable factorizations, and uncertainty estimates.
 
+pub mod exact_observation;
+
+pub use exact_observation::{
+    ExactObservationCovarianceBlocks, ExactObservationCovarianceProvenance,
+    ExactObservationPosterior, ExactObservationPosteriorDiagnostics,
+};
+
 use crate::boundary::EssentialBoundaryElimination;
 use crate::model::{DerivedQuantity, LinearGaussianModelBuilder};
 use crate::operator::{LinearMap, SparseMat};

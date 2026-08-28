@@ -16,13 +16,14 @@ pub use crate::hodge::{
     HodgeOneFormPriorBuilder, HodgePosterior, HodgeTwoFormMassInverse, HodgeZeroFormMassInverse,
 };
 pub use crate::infer::{
-    CholeskyOrderingKind, DirectPhaseResourceUsage, FactoredGaussianPrior,
-    FactorizationDiagnostics, HutchinsonVarianceConfig, LinearConditioningDiagnostics,
-    LinearObservationUpdateDiagnostics, MonteCarloVarianceConfig, Posterior,
-    PreparedLinearGaussianModel, ProbeDistribution, RepeatedSolveResourceUsage,
-    ResourceMeasurement, SparseCholeskyDiagnostics, SparseDirectResourceReport,
-    SparseDirectSolverKind, VarianceEstimate, VarianceEstimator, VarianceFloor, VarianceMethod,
-    WeightedCovarianceTraceEstimate, WeightedVarianceEstimate,
+    CholeskyOrderingKind, DirectPhaseResourceUsage, ExactObservationCovarianceBlocks,
+    ExactObservationCovarianceProvenance, ExactObservationPosterior,
+    ExactObservationPosteriorDiagnostics, FactoredGaussianPrior, FactorizationDiagnostics,
+    HutchinsonVarianceConfig, LinearConditioningDiagnostics, LinearObservationUpdateDiagnostics,
+    MonteCarloVarianceConfig, Posterior, PreparedLinearGaussianModel, ProbeDistribution,
+    RepeatedSolveResourceUsage, ResourceMeasurement, SparseCholeskyDiagnostics,
+    SparseDirectResourceReport, SparseDirectSolverKind, VarianceEstimate, VarianceEstimator,
+    VarianceFloor, VarianceMethod, WeightedCovarianceTraceEstimate, WeightedVarianceEstimate,
 };
 pub use crate::linear_pde::{
     DeterministicLinearPdeSolution, LinearPdeModelBuilder, LinearPdeSystem, PdeResidualNoise,

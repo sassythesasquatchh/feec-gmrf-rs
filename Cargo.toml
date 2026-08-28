@@ -68,3 +68,6 @@ gmrf-core = { path = "gmrf-rs" }
 thiserror = { workspace = true }
 rand = { workspace = true }
 csv = { workspace = true }
+
+[dev-dependencies]
+nalgebra = { workspace = true }

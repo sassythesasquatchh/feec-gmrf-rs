@@ -233,6 +233,27 @@ fn validate_exact_supported_physical_consumer() -> Result<()> {
     Ok(())
 }
 
+fn validate_exact_observation_space_consumer() -> Result<()> {
+    let blocks = ExactObservationCovarianceBlocks::new(
+        vec![vec![1.5, 0.25], vec![0.25, 1.0]],
+        vec![vec![0.75, -0.10]],
+        vec![vec![1.25]],
+    )?;
+    let posterior = ExactObservationPosterior::from_prior_covariance_blocks(blocks, 0.05)?;
+    let mean = posterior.output_mean(&[0.4, -0.2])?;
+    assert_eq!(mean.len(), 1);
+    assert!(mean[0].is_finite());
+    let covariance = posterior.posterior_output_covariance();
+    assert_eq!(covariance.len(), 1);
+    assert!(covariance[0][0].is_finite() && covariance[0][0] > 0.0);
+    assert_eq!(posterior.diagnostics().dense_factor_dimension, 2);
+    assert_eq!(
+        posterior.covariance_provenance(),
+        &ExactObservationCovarianceProvenance::CallerSuppliedExactlySymmetric
+    );
+    Ok(())
+}
+
 fn run_external_consumer() -> Result<()> {
     let _scalar_prior = operator_prior(0)?;
     let form_prior = operator_prior(1)?;
@@ -288,6 +309,7 @@ fn run_external_consumer() -> Result<()> {
         NonlinearResidualTerm::zero("custom_physics", &residual, GaussianNoise::variance(0.1)?)?;
     let _nonlinear_model =
         NonlinearLaplaceModelBuilder::new(form_prior).residual(nonlinear_term)?;
+    validate_exact_observation_space_consumer()?;
     validate_exact_supported_physical_consumer()?;
     Ok(())
 }
