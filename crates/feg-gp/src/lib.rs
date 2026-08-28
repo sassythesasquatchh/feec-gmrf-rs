@@ -10,8 +10,8 @@ use common::linalg::petsc::{GhiepReducedSolve, GhiepWhich};
 #[cfg(feature = "external-solvers")]
 use exterior::ExteriorGrade;
 use faer::linalg::matmul::matmul;
-use faer::linalg::solvers::Solve;
-use faer::{Accum, Idx, Mat, Par, Side, Unbind};
+use faer::linalg::solvers::{Llt, Solve};
+use faer::{Accum, Idx, Mat, MatRef, Par, Side, Unbind};
 #[cfg(feature = "external-solvers")]
 use formoniq::{
     assemble,
@@ -167,16 +167,28 @@ pub enum GpError {
     ObservationIndexRepeated { index: usize },
     #[error("noise variance must be finite and non-negative")]
     InvalidNoiseVariance,
+    #[error("prepared spectral posterior requires finite positive noise variance")]
+    NonPositivePreparedNoiseVariance,
+    #[error("prepared spectral posterior requires at least one observation row")]
+    EmptyPreparedObservationSystem,
     #[error("covariance is not positive definite (cholesky failed)")]
     CholeskyFailed,
     #[error("standard normal length {got} does not match basis size {expected}")]
     SampleDimensionMismatch { expected: usize, got: usize },
+    #[error("latent vector length {got} does not match latent dimension {expected}")]
+    LatentVectorDimensionMismatch { expected: usize, got: usize },
+    #[error("state vector length {got} does not match ambient dimension {expected}")]
+    StateVectorDimensionMismatch { expected: usize, got: usize },
+    #[error("output vector length {got} does not match output dimension {expected}")]
+    OutputVectorDimensionMismatch { expected: usize, got: usize },
     #[error("observation matrix column count {got} does not match ambient dimension {expected}")]
     ObservationMatrixDimensionMismatch { expected: usize, got: usize },
     #[error(
         "observation matrix row count {rows} does not match observation value length {values}"
     )]
     ObservationValueDimensionMismatch { rows: usize, values: usize },
+    #[error("observation value {index} is non-finite: {value}")]
+    NonFiniteObservationValue { index: usize, value: f64 },
     #[error("invalid strong dof index {index} for dimension {dimension}")]
     InvalidStrongDofIndex { index: usize, dimension: usize },
     #[error("full vector length {got} does not match full dimension {expected}")]
@@ -443,6 +455,399 @@ pub fn low_rank_conditioning_strategy(
     }
 }
 
+/// Persistent dimensions and floating-point storage owned by a prepared
+/// spectral posterior.
+///
+/// These counts exclude the eigensolver, the source `SpectralMaternGp` and its
+/// eigenbasis if the caller retains them, and temporary mean/output workspaces.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreparedSpectralPosteriorDiagnostics {
+    pub ambient_dimension: usize,
+    pub latent_dimension: usize,
+    pub observation_count: usize,
+    pub observation_operator_nonzeros: usize,
+    pub conditioning_strategy: LowRankConditioningStrategy,
+    pub dense_factor_dimension: usize,
+    /// Allocated entries in the factor's dense square backing matrix.
+    pub dense_factor_allocated_entries: usize,
+    /// Mathematically active entries in its lower triangle.
+    pub dense_factor_triangular_entries: usize,
+    pub state_feature_entries: usize,
+    pub observation_feature_entries: usize,
+    pub persistent_f64_entries: usize,
+    pub sampling_standard_normal_dimension: usize,
+    pub noise_variance: f64,
+}
+
+/// A fixed-operator spectral posterior that reuses one adaptive dense factor.
+///
+/// The object stores an `N x r` feature matrix, its `m x r` observation
+/// projection, and one dense Cholesky factor of dimension `min(m, r)` for
+/// positive scalar observation noise.  It never constructs an `N x N`
+/// covariance.  Replacement observation values reuse the same factor.
+#[derive(Debug, Clone)]
+pub struct PreparedSpectralPosterior {
+    state_features: Mat<f64>,
+    observation_features: Mat<f64>,
+    noise_variance: f64,
+    strategy: LowRankConditioningStrategy,
+    factor: Llt<f64>,
+    observation_operator_nonzeros: usize,
+}
+
+impl PreparedSpectralPosterior {
+    fn new(
+        state_features: Mat<f64>,
+        observation_matrix: &CsrMatrix,
+        noise_variance: f64,
+    ) -> Result<Self, GpError> {
+        if !noise_variance.is_finite() || noise_variance <= 0.0 {
+            return Err(GpError::NonPositivePreparedNoiseVariance);
+        }
+        if observation_matrix.ncols() != state_features.nrows() {
+            return Err(GpError::ObservationMatrixDimensionMismatch {
+                expected: state_features.nrows(),
+                got: observation_matrix.ncols(),
+            });
+        }
+        if observation_matrix.nrows() == 0 {
+            return Err(GpError::EmptyPreparedObservationSystem);
+        }
+        let observation_features = sparse_dense_product(observation_matrix, &state_features)?;
+        let strategy = low_rank_conditioning_strategy(
+            observation_features.nrows(),
+            observation_features.ncols(),
+            noise_variance,
+        );
+        let system = conditioning_system(&observation_features, noise_variance, strategy);
+        let factor = system
+            .llt(Side::Lower)
+            .map_err(|_| GpError::CholeskyFailed)?;
+        Ok(Self {
+            state_features,
+            observation_features,
+            noise_variance,
+            strategy,
+            factor,
+            observation_operator_nonzeros: observation_matrix.triplet_iter().count(),
+        })
+    }
+
+    pub fn ambient_dimension(&self) -> usize {
+        self.state_features.nrows()
+    }
+
+    pub fn latent_dimension(&self) -> usize {
+        self.state_features.ncols()
+    }
+
+    pub fn observation_count(&self) -> usize {
+        self.observation_features.nrows()
+    }
+
+    pub fn conditioning_strategy(&self) -> LowRankConditioningStrategy {
+        self.strategy
+    }
+
+    pub fn diagnostics(&self) -> PreparedSpectralPosteriorDiagnostics {
+        let factor_dimension = self.factor.L().nrows();
+        let state_feature_entries = self.ambient_dimension() * self.latent_dimension();
+        let observation_feature_entries = self.observation_count() * self.latent_dimension();
+        let dense_factor_allocated_entries = factor_dimension * factor_dimension;
+        PreparedSpectralPosteriorDiagnostics {
+            ambient_dimension: self.ambient_dimension(),
+            latent_dimension: self.latent_dimension(),
+            observation_count: self.observation_count(),
+            observation_operator_nonzeros: self.observation_operator_nonzeros,
+            conditioning_strategy: self.strategy,
+            dense_factor_dimension: factor_dimension,
+            dense_factor_allocated_entries,
+            dense_factor_triangular_entries: factor_dimension * (factor_dimension + 1) / 2,
+            state_feature_entries,
+            observation_feature_entries,
+            persistent_f64_entries: state_feature_entries
+                + observation_feature_entries
+                + dense_factor_allocated_entries,
+            sampling_standard_normal_dimension: match self.strategy {
+                LowRankConditioningStrategy::ObservationSpace => {
+                    self.latent_dimension() + self.observation_count()
+                }
+                LowRankConditioningStrategy::LatentSpace => self.latent_dimension(),
+            },
+            noise_variance: self.noise_variance,
+        }
+    }
+
+    /// Posterior latent mean for replacement observation values.
+    pub fn latent_mean(&self, observation_values: &[f64]) -> Result<Vec<f64>, GpError> {
+        self.validate_observation_values(observation_values)?;
+        let values = Mat::from_fn(self.observation_count(), 1, |row, _| {
+            observation_values[row.unbound()]
+        });
+        let mean = match self.strategy {
+            LowRankConditioningStrategy::ObservationSpace => {
+                let mut solved = values;
+                self.factor.solve_in_place(solved.as_mut());
+                dense_transpose_times_matrix(&self.observation_features, &solved)
+            }
+            LowRankConditioningStrategy::LatentSpace => {
+                let mut rhs = dense_transpose_times_matrix(&self.observation_features, &values);
+                self.factor.solve_in_place(rhs.as_mut());
+                rhs
+            }
+        };
+        Ok(mat_col_to_vec(&mean))
+    }
+
+    /// Posterior coefficient-space mean for replacement observation values.
+    pub fn state_mean(&self, observation_values: &[f64]) -> Result<Vec<f64>, GpError> {
+        let latent = self.latent_mean(observation_values)?;
+        Ok(dense_matrix_times_vector(&self.state_features, &latent))
+    }
+
+    /// Apply the posterior latent covariance without materializing it.
+    pub fn latent_covariance_action(&self, input: &[f64]) -> Result<Vec<f64>, GpError> {
+        self.validate_latent_vector(input)?;
+        match self.strategy {
+            LowRankConditioningStrategy::ObservationSpace => {
+                let projected = dense_matrix_times_vector(&self.observation_features, input);
+                let mut solved = Mat::from_fn(self.observation_count(), 1, |row, _| {
+                    projected[row.unbound()]
+                });
+                self.factor.solve_in_place(solved.as_mut());
+                let correction = dense_transpose_times_matrix(&self.observation_features, &solved);
+                Ok(input
+                    .iter()
+                    .zip(mat_col_to_vec(&correction))
+                    .map(|(prior, removed)| prior - removed)
+                    .collect())
+            }
+            LowRankConditioningStrategy::LatentSpace => {
+                let mut solved =
+                    Mat::from_fn(self.latent_dimension(), 1, |row, _| input[row.unbound()]);
+                self.factor.solve_in_place(solved.as_mut());
+                Ok(mat_col_to_vec(&solved)
+                    .into_iter()
+                    .map(|value| self.noise_variance * value)
+                    .collect())
+            }
+        }
+    }
+
+    /// Apply the posterior coefficient covariance `F C_z F^T`.
+    pub fn state_covariance_action(&self, input: &[f64]) -> Result<Vec<f64>, GpError> {
+        if input.len() != self.ambient_dimension() {
+            return Err(GpError::StateVectorDimensionMismatch {
+                expected: self.ambient_dimension(),
+                got: input.len(),
+            });
+        }
+        let latent_input = dense_transpose_times_vector(&self.state_features, input);
+        let latent_output = self.latent_covariance_action(&latent_input)?;
+        Ok(dense_matrix_times_vector(
+            &self.state_features,
+            &latent_output,
+        ))
+    }
+
+    /// Posterior moments after a sparse physical/output map.
+    pub fn output_moments(
+        &self,
+        output_matrix: &CsrMatrix,
+        observation_values: &[f64],
+    ) -> Result<ConditionedGp, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
+        let latent_mean = self.latent_mean(observation_values)?;
+        let mean = dense_matrix_times_vector(&output_features, &latent_mean);
+        let variance = self.feature_variances(&output_features)?;
+        Ok(ConditionedGp { mean, variance })
+    }
+
+    /// Posterior moments and full output covariance after a sparse output map.
+    ///
+    /// Only the requested output covariance is materialized; the ambient
+    /// coefficient covariance is not.
+    pub fn output_moments_with_covariance(
+        &self,
+        output_matrix: &CsrMatrix,
+        observation_values: &[f64],
+    ) -> Result<ConditionedFullGp, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
+        let latent_mean = self.latent_mean(observation_values)?;
+        let mean = dense_matrix_times_vector(&output_features, &latent_mean);
+        let covariance = self.feature_covariance(&output_features)?;
+        Ok(ConditionedFullGp { mean, covariance })
+    }
+
+    /// Apply the posterior covariance in a requested sparse output space.
+    pub fn output_covariance_action(
+        &self,
+        output_matrix: &CsrMatrix,
+        input: &[f64],
+    ) -> Result<Vec<f64>, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
+        if input.len() != output_features.nrows() {
+            return Err(GpError::OutputVectorDimensionMismatch {
+                expected: output_features.nrows(),
+                got: input.len(),
+            });
+        }
+        let latent_input = dense_transpose_times_vector(&output_features, input);
+        let latent_output = self.latent_covariance_action(&latent_input)?;
+        Ok(dense_matrix_times_vector(&output_features, &latent_output))
+    }
+
+    /// Draw a latent posterior sample from independent standard normals.
+    pub fn latent_sample_from_standard_normal(
+        &self,
+        observation_values: &[f64],
+        standard_normal: &[f64],
+    ) -> Result<Vec<f64>, GpError> {
+        self.validate_observation_values(observation_values)?;
+        let expected = self.diagnostics().sampling_standard_normal_dimension;
+        if standard_normal.len() != expected {
+            return Err(GpError::SampleDimensionMismatch {
+                expected,
+                got: standard_normal.len(),
+            });
+        }
+        match self.strategy {
+            LowRankConditioningStrategy::ObservationSpace => {
+                let latent_dimension = self.latent_dimension();
+                let prior_latent = &standard_normal[..latent_dimension];
+                let noise_standard = &standard_normal[latent_dimension..];
+                let synthetic = dense_matrix_times_vector(&self.observation_features, prior_latent);
+                let residual = observation_values
+                    .iter()
+                    .zip(synthetic)
+                    .zip(noise_standard)
+                    .map(|((observed, predicted), noise)| {
+                        observed - predicted - self.noise_variance.sqrt() * noise
+                    })
+                    .collect::<Vec<_>>();
+                let mut solved = Mat::from_fn(self.observation_count(), 1, |row, _| {
+                    residual[row.unbound()]
+                });
+                self.factor.solve_in_place(solved.as_mut());
+                let correction = mat_col_to_vec(&dense_transpose_times_matrix(
+                    &self.observation_features,
+                    &solved,
+                ));
+                Ok(prior_latent
+                    .iter()
+                    .zip(correction)
+                    .map(|(prior, update)| prior + update)
+                    .collect())
+            }
+            LowRankConditioningStrategy::LatentSpace => {
+                let mean = self.latent_mean(observation_values)?;
+                let innovation = solve_lower_transpose(self.factor.L(), standard_normal);
+                Ok(mean
+                    .into_iter()
+                    .zip(innovation)
+                    .map(|(mean, innovation)| mean + self.noise_variance.sqrt() * innovation)
+                    .collect())
+            }
+        }
+    }
+
+    /// Draw an ambient coefficient posterior sample without an ambient
+    /// covariance matrix.
+    pub fn state_sample_from_standard_normal(
+        &self,
+        observation_values: &[f64],
+        standard_normal: &[f64],
+    ) -> Result<Vec<f64>, GpError> {
+        let latent =
+            self.latent_sample_from_standard_normal(observation_values, standard_normal)?;
+        Ok(dense_matrix_times_vector(&self.state_features, &latent))
+    }
+
+    /// Draw a posterior sample directly in a sparse physical/output space.
+    pub fn output_sample_from_standard_normal(
+        &self,
+        output_matrix: &CsrMatrix,
+        observation_values: &[f64],
+        standard_normal: &[f64],
+    ) -> Result<Vec<f64>, GpError> {
+        let latent =
+            self.latent_sample_from_standard_normal(observation_values, standard_normal)?;
+        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
+        Ok(dense_matrix_times_vector(&output_features, &latent))
+    }
+
+    fn validate_observation_values(&self, values: &[f64]) -> Result<(), GpError> {
+        if values.len() != self.observation_count() {
+            return Err(GpError::ObservationValueDimensionMismatch {
+                rows: self.observation_count(),
+                values: values.len(),
+            });
+        }
+        if let Some((index, &value)) = values
+            .iter()
+            .enumerate()
+            .find(|(_, value)| !value.is_finite())
+        {
+            return Err(GpError::NonFiniteObservationValue { index, value });
+        }
+        Ok(())
+    }
+
+    fn validate_latent_vector(&self, input: &[f64]) -> Result<(), GpError> {
+        if input.len() != self.latent_dimension() {
+            return Err(GpError::LatentVectorDimensionMismatch {
+                expected: self.latent_dimension(),
+                got: input.len(),
+            });
+        }
+        Ok(())
+    }
+
+    fn feature_variances(&self, features: &Mat<f64>) -> Result<Vec<f64>, GpError> {
+        let mut variances = Vec::with_capacity(features.nrows());
+        for row in 0..features.nrows() {
+            let feature = (0..features.ncols())
+                .map(|col| features[(row, col)])
+                .collect::<Vec<_>>();
+            let covariance_feature = self.latent_covariance_action(&feature)?;
+            // Preserve the computed quadratic form, including a possible tiny
+            // negative roundoff residual, so callers can archive and apply
+            // their explicit uncertainty-stabilization policy.  This prepared
+            // comparator must not silently hide material instability.
+            variances.push(
+                feature
+                    .iter()
+                    .zip(covariance_feature)
+                    .map(|(left, right)| left * right)
+                    .sum::<f64>(),
+            );
+        }
+        Ok(variances)
+    }
+
+    fn feature_covariance(&self, features: &Mat<f64>) -> Result<Mat<f64>, GpError> {
+        let covariance_actions = (0..features.nrows())
+            .map(|row| {
+                let feature = (0..features.ncols())
+                    .map(|col| features[(row, col)])
+                    .collect::<Vec<_>>();
+                self.latent_covariance_action(&feature)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Mat::from_fn(
+            features.nrows(),
+            features.nrows(),
+            |row, col| {
+                let right = row.unbound();
+                let left = col.unbound();
+                (0..features.ncols())
+                    .map(|latent| features[(left, latent)] * covariance_actions[right][latent])
+                    .sum()
+            },
+        ))
+    }
+}
+
 impl SpectralMaternGp {
     pub fn from_eigenbasis(
         basis: EigenBasis,
@@ -607,6 +1012,17 @@ impl SpectralMaternGp {
             observation_values,
             noise_variance,
         )
+    }
+
+    /// Prepare a reusable posterior for fixed sparse observations and finite
+    /// positive scalar noise.  Observation values are supplied later and may
+    /// be replaced without refactorization.
+    pub fn prepare_linear_observations(
+        &self,
+        observation_matrix: &CsrMatrix,
+        noise_variance: f64,
+    ) -> Result<PreparedSpectralPosterior, GpError> {
+        PreparedSpectralPosterior::new(self.feature_matrix(), observation_matrix, noise_variance)
     }
 
     /// Condition the spectral model and report moments after a sparse linear
@@ -912,6 +1328,94 @@ pub(crate) fn weighted_feature_matrix(eigenvectors: &Mat<f64>, weights: &[f64]) 
         }
     }
     features
+}
+
+fn conditioning_system(
+    observation_features: &Mat<f64>,
+    noise_variance: f64,
+    strategy: LowRankConditioningStrategy,
+) -> Mat<f64> {
+    let dimension = match strategy {
+        LowRankConditioningStrategy::ObservationSpace => observation_features.nrows(),
+        LowRankConditioningStrategy::LatentSpace => observation_features.ncols(),
+    };
+    let mut system = Mat::zeros(dimension, dimension);
+    match strategy {
+        LowRankConditioningStrategy::ObservationSpace => matmul(
+            &mut system,
+            Accum::Replace,
+            observation_features.as_ref(),
+            observation_features.as_ref().transpose(),
+            1.0,
+            Par::Seq,
+        ),
+        LowRankConditioningStrategy::LatentSpace => matmul(
+            &mut system,
+            Accum::Replace,
+            observation_features.as_ref().transpose(),
+            observation_features.as_ref(),
+            1.0,
+            Par::Seq,
+        ),
+    }
+    for index in 0..dimension {
+        system[(idx(index), idx(index))] += noise_variance;
+    }
+    system
+}
+
+fn dense_matrix_times_vector(matrix: &Mat<f64>, vector: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(matrix.ncols(), vector.len());
+    (0..matrix.nrows())
+        .map(|row| {
+            vector
+                .iter()
+                .enumerate()
+                .map(|(col, value)| matrix[(row, col)] * value)
+                .sum()
+        })
+        .collect()
+}
+
+fn dense_transpose_times_vector(matrix: &Mat<f64>, vector: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(matrix.nrows(), vector.len());
+    (0..matrix.ncols())
+        .map(|col| {
+            vector
+                .iter()
+                .enumerate()
+                .map(|(row, value)| matrix[(row, col)] * value)
+                .sum()
+        })
+        .collect()
+}
+
+fn dense_transpose_times_matrix(left: &Mat<f64>, right: &Mat<f64>) -> Mat<f64> {
+    debug_assert_eq!(left.nrows(), right.nrows());
+    let mut product = Mat::zeros(left.ncols(), right.ncols());
+    matmul(
+        &mut product,
+        Accum::Replace,
+        left.as_ref().transpose(),
+        right.as_ref(),
+        1.0,
+        Par::Seq,
+    );
+    product
+}
+
+fn solve_lower_transpose(lower: MatRef<'_, f64>, rhs: &[f64]) -> Vec<f64> {
+    debug_assert_eq!(lower.nrows(), lower.ncols());
+    debug_assert_eq!(lower.nrows(), rhs.len());
+    let mut solution = rhs.to_vec();
+    for row in (0..lower.nrows()).rev() {
+        let mut value = solution[row];
+        for col in (row + 1)..lower.ncols() {
+            value -= lower[(col, row)] * solution[col];
+        }
+        solution[row] = value / lower[(row, row)];
+    }
+    solution
 }
 
 pub(crate) fn diagonal_from_feature_matrix(features: &Mat<f64>) -> Vec<f64> {
@@ -2179,5 +2683,271 @@ mod tests {
             }
             assert_close(transformed.variance[output_row], expected_variance, 2.0e-13);
         }
+    }
+
+    fn check_prepared_posterior_against_dense_reference(
+        observation_indices: &[usize],
+        expected_strategy: LowRankConditioningStrategy,
+    ) {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let basis = EigenBasis::new(
+            vec![0.4, 1.7, 4.2],
+            Mat::from_fn(4, 3, |row, col| {
+                const VALUES: [[f64; 3]; 4] = [
+                    [1.0, 0.0, 0.2],
+                    [0.1, 0.8, -0.3],
+                    [0.0, 0.4, 1.1],
+                    [0.7, -0.2, 0.5],
+                ];
+                VALUES[row][col]
+            }),
+        )
+        .unwrap();
+        let gp = SpectralMaternGp::from_eigenbasis(
+            basis,
+            SpectralMaternConfig {
+                kappa: 1.1,
+                alpha: 2.0,
+                tau: 0.8,
+                k: 3,
+            },
+        )
+        .unwrap();
+        let mut observation = CooMatrix::new(observation_indices.len(), 4);
+        for (row, &col) in observation_indices.iter().enumerate() {
+            observation.push(row, col, 1.0);
+        }
+        let observation = CsrMatrix::from(&observation);
+        let noise_variance = 0.17;
+        let prepared = gp
+            .prepare_linear_observations(&observation, noise_variance)
+            .unwrap();
+        assert_eq!(prepared.conditioning_strategy(), expected_strategy);
+
+        let values = (0..observation_indices.len())
+            .map(|index| 0.25 - 0.3 * index as f64)
+            .collect::<Vec<_>>();
+        let covariance = gp.covariance_matrix();
+        let dense = condition_full_covariance_with_covariance(
+            &covariance,
+            observation_indices,
+            &values,
+            noise_variance,
+        )
+        .unwrap();
+        let prepared_mean = prepared.state_mean(&values).unwrap();
+        for (actual, expected) in prepared_mean.iter().zip(&dense.mean) {
+            assert_close(*actual, *expected, 3.0e-13);
+        }
+
+        let state_input = [0.3, -0.6, 0.2, 1.1];
+        let action = prepared.state_covariance_action(&state_input).unwrap();
+        let expected_action = (0..4)
+            .map(|row| {
+                state_input
+                    .iter()
+                    .enumerate()
+                    .map(|(col, value)| dense.covariance[(idx(row), idx(col))] * value)
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+        for (actual, expected) in action.iter().zip(expected_action) {
+            assert_close(*actual, expected, 4.0e-13);
+        }
+
+        let mut output = CooMatrix::new(2, 4);
+        output.push(0, 0, 1.0);
+        output.push(0, 2, -0.4);
+        output.push(1, 1, 0.3);
+        output.push(1, 3, 1.2);
+        let output = CsrMatrix::from(&output);
+        let output_moments = prepared
+            .output_moments_with_covariance(&output, &values)
+            .unwrap();
+        let expected_output_mean = sparse_vector_product(&output, &dense.mean);
+        for (actual, expected) in output_moments.mean.iter().zip(expected_output_mean) {
+            assert_close(*actual, expected, 4.0e-13);
+        }
+        let expected_output_covariance = sparse_covariance_pushforward(&output, &dense.covariance);
+        assert_matrix_close(
+            &output_moments.covariance,
+            &expected_output_covariance,
+            5.0e-13,
+        );
+        let diagonal_only = prepared.output_moments(&output, &values).unwrap();
+        for index in 0..2 {
+            assert_close(
+                diagonal_only.variance[index],
+                expected_output_covariance[(idx(index), idx(index))],
+                5.0e-13,
+            );
+        }
+        let output_input = [0.4, -0.9];
+        let output_action = prepared
+            .output_covariance_action(&output, &output_input)
+            .unwrap();
+        for row in 0..2 {
+            let expected = (0..2)
+                .map(|col| expected_output_covariance[(idx(row), idx(col))] * output_input[col])
+                .sum::<f64>();
+            assert_close(output_action[row], expected, 5.0e-13);
+        }
+
+        let replacement_values = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| value + 0.1 * (index + 1) as f64)
+            .collect::<Vec<_>>();
+        let replacement_dense = condition_full_covariance_with_covariance(
+            &covariance,
+            observation_indices,
+            &replacement_values,
+            noise_variance,
+        )
+        .unwrap();
+        let replacement_mean = prepared.state_mean(&replacement_values).unwrap();
+        for (actual, expected) in replacement_mean.iter().zip(replacement_dense.mean) {
+            assert_close(*actual, expected, 4.0e-13);
+        }
+
+        let diagnostics = prepared.diagnostics();
+        assert_eq!(diagnostics.ambient_dimension, 4);
+        assert_eq!(diagnostics.latent_dimension, 3);
+        assert_eq!(diagnostics.observation_count, observation_indices.len());
+        assert_eq!(
+            diagnostics.dense_factor_dimension,
+            observation_indices.len().min(3)
+        );
+        assert_eq!(
+            diagnostics.persistent_f64_entries,
+            diagnostics.state_feature_entries
+                + diagnostics.observation_feature_entries
+                + diagnostics.dense_factor_allocated_entries
+        );
+        let zero_standard_normal = vec![0.0; diagnostics.sampling_standard_normal_dimension];
+        let zero_sample = prepared
+            .state_sample_from_standard_normal(&values, &zero_standard_normal)
+            .unwrap();
+        for (sample, mean) in zero_sample.iter().zip(prepared_mean) {
+            assert_close(*sample, mean, 4.0e-13);
+        }
+        let zero_output_sample = prepared
+            .output_sample_from_standard_normal(&output, &values, &zero_standard_normal)
+            .unwrap();
+        for (sample, mean) in zero_output_sample.iter().zip(output_moments.mean) {
+            assert_close(*sample, mean, 4.0e-13);
+        }
+
+        // The sample is an affine map of the documented independent standard
+        // normals.  Summing outer products of its responses to the canonical
+        // normal basis therefore reconstructs its covariance exactly.
+        let latent_mean = prepared.latent_mean(&values).unwrap();
+        let mut sample_covariance = Mat::zeros(3, 3);
+        for normal_index in 0..diagnostics.sampling_standard_normal_dimension {
+            let mut standard_normal = vec![0.0; diagnostics.sampling_standard_normal_dimension];
+            standard_normal[normal_index] = 1.0;
+            let sample = prepared
+                .latent_sample_from_standard_normal(&values, &standard_normal)
+                .unwrap();
+            for row in 0..3 {
+                for col in 0..3 {
+                    sample_covariance[(idx(row), idx(col))] +=
+                        (sample[row] - latent_mean[row]) * (sample[col] - latent_mean[col]);
+                }
+            }
+        }
+        for col in 0..3 {
+            let mut unit = vec![0.0; 3];
+            unit[col] = 1.0;
+            let expected_column = prepared.latent_covariance_action(&unit).unwrap();
+            for row in 0..3 {
+                assert_close(
+                    sample_covariance[(idx(row), idx(col))],
+                    expected_column[row],
+                    8.0e-13,
+                );
+            }
+        }
+    }
+
+    fn sparse_vector_product(operator: &CsrMatrix, input: &[f64]) -> Vec<f64> {
+        let mut output = vec![0.0; operator.nrows()];
+        for (row, col, value) in operator.triplet_iter() {
+            output[row] += value * input[col];
+        }
+        output
+    }
+
+    fn sparse_covariance_pushforward(operator: &CsrMatrix, covariance: &Mat<f64>) -> Mat<f64> {
+        Mat::from_fn(operator.nrows(), operator.nrows(), |left, right| {
+            let mut value = 0.0;
+            for (left_row, left_col, left_value) in operator.triplet_iter() {
+                if left_row != left {
+                    continue;
+                }
+                for (right_row, right_col, right_value) in operator.triplet_iter() {
+                    if right_row == right {
+                        value +=
+                            left_value * covariance[(idx(left_col), idx(right_col))] * right_value;
+                    }
+                }
+            }
+            value
+        })
+    }
+
+    #[test]
+    fn prepared_posterior_matches_dense_reference_in_observation_space() {
+        check_prepared_posterior_against_dense_reference(
+            &[0, 2],
+            LowRankConditioningStrategy::ObservationSpace,
+        );
+    }
+
+    #[test]
+    fn prepared_posterior_matches_dense_reference_in_latent_space() {
+        check_prepared_posterior_against_dense_reference(
+            &[0, 1, 2, 3],
+            LowRankConditioningStrategy::LatentSpace,
+        );
+    }
+
+    #[test]
+    fn prepared_posterior_rejects_nonpositive_noise_and_wrong_dimensions() {
+        use common::linalg::nalgebra::CooMatrix;
+
+        let gp = SpectralMaternGp::from_eigenbasis(
+            EigenBasis::new(vec![1.0], Mat::ones(2, 1)).unwrap(),
+            SpectralMaternConfig {
+                k: 1,
+                ..SpectralMaternConfig::default()
+            },
+        )
+        .unwrap();
+        let mut observation = CooMatrix::new(1, 2);
+        observation.push(0, 0, 1.0);
+        let observation = CsrMatrix::from(&observation);
+        let error = gp
+            .prepare_linear_observations(&observation, 0.0)
+            .unwrap_err();
+        assert!(matches!(error, GpError::NonPositivePreparedNoiseVariance));
+
+        let prepared = gp.prepare_linear_observations(&observation, 0.1).unwrap();
+        assert!(matches!(
+            prepared.state_mean(&[]).unwrap_err(),
+            GpError::ObservationValueDimensionMismatch { rows: 1, values: 0 }
+        ));
+        assert!(matches!(
+            prepared.state_mean(&[f64::NAN]).unwrap_err(),
+            GpError::NonFiniteObservationValue { index: 0, value } if value.is_nan()
+        ));
+        assert!(matches!(
+            prepared.latent_covariance_action(&[0.0, 1.0]).unwrap_err(),
+            GpError::LatentVectorDimensionMismatch {
+                expected: 1,
+                got: 2
+            }
+        ));
     }
 }
