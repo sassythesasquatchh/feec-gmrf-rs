@@ -131,6 +131,7 @@ class SpectralRankRunnerTests(unittest.TestCase):
         self.assertEqual(
             resolved["rank_grid"], [2048, 2304, 2560, 2816, 3000, 3032]
         )
+        self.assertEqual(resolved["expected_state_dimension"], 3032)
         self.assertEqual(resolved["evidence_tier"], "rank_extension")
         self.assertTrue(resolved["post_primary"])
         with self.assertRaisesRegex(ValueError, "requires refinement 8"):
@@ -279,6 +280,7 @@ class SpectralRankRunnerTests(unittest.TestCase):
             plan = runner.dry_run_plan(args, args.repository.resolve())
         self.assertEqual(plan["maximum_rank"], 4096)
         self.assertEqual(plan["rank_grid"], [2048, 2560, 3072, 3584, 4096])
+        self.assertEqual(plan["expected_state_dimension"], 6130)
         self.assertEqual(plan["evidence_tier"], "rank_extension")
         self.assertTrue(plan["post_primary"])
         self.assertNotIn("--maximum-rank", plan["scientific_command"])

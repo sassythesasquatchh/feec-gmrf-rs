@@ -148,6 +148,7 @@ impl C51SpectralCovarianceRankConfig {
             .then_some(C51_SPECTRAL_RANK_EXTENSION_RATIONALE)
     }
 
+    /// Expected active Whitney dimension frozen into a mesh-specific extension.
     pub fn expected_state_dimension(&self) -> Option<usize> {
         match self.profile.as_str() {
             C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 => Some(3_032),
@@ -1297,6 +1298,14 @@ fn run_refinement(
     let metric = coordinates.to_edge_lengths(&topology);
     let operators = ExactFormOperators::from_feec_homogeneous_full_relative(&topology, &metric, 1)?;
     let state_dimension = operators.state().dimension();
+    if let Some(expected) = config.expected_state_dimension() {
+        if state_dimension != expected {
+            return Err(FeecGmrfError::Dimension(format!(
+                "C51 {} expected active state dimension {expected}, assembled {state_dimension}",
+                config.profile
+            )));
+        }
+    }
     let elimination =
         EssentialBoundaryElimination::from_layout(operators.state().boundary_layout().clone())?;
 
@@ -2702,6 +2711,7 @@ mod tests {
         assert_eq!(n8.refinements, [8]);
         assert_eq!(n8.ranks, C51_SPECTRAL_RANK_EXTENSION_N8_GRID);
         assert_eq!(n8.alphas, [MaternAlpha::Two]);
+        assert_eq!(n8.expected_state_dimension(), Some(3_032));
         assert_eq!(n8.evidence_tier(), "rank_extension");
         assert!(n8.post_primary_rationale().is_some());
 
@@ -2709,6 +2719,7 @@ mod tests {
         assert_eq!(n10.profile, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10);
         assert_eq!(n10.refinements, [10]);
         assert_eq!(n10.ranks, C51_SPECTRAL_RANK_EXTENSION_N10_GRID);
+        assert_eq!(n10.expected_state_dimension(), Some(6_130));
         assert_eq!(n10.evidence_tier(), "rank_extension");
 
         assert!(C51SpectralCovarianceRankConfig::rank_extension(6).is_err());
@@ -2741,6 +2752,7 @@ mod tests {
         assert!(manifest.contains("post_primary: true"));
         assert!(manifest.contains("post_primary_rationale: \"post-primary extension"));
         assert!(manifest.contains("alpha_values: [2]"));
+        assert!(manifest.contains("expected_state_dimension: 6130"));
         assert!(manifest.contains("method_performance_timing_eligible: false"));
         std::fs::remove_file(path).unwrap();
     }

@@ -35,11 +35,13 @@ PRIMARY_PROFILE = "publication-discovery-v1"
 RANK_EXTENSION_PROFILES = {
     "rank-extension-v1-n8": {
         "refinement": 8,
+        "state_dimension": 3032,
         "ranks": (2048, 2304, 2560, 2816, 3000, 3032),
         "evidence_tier": "rank_extension",
     },
     "rank-extension-v1-n10": {
         "refinement": 10,
+        "state_dimension": 6130,
         "ranks": (2048, 2560, 3072, 3584, 4096),
         "evidence_tier": "rank_extension",
     },
@@ -261,6 +263,7 @@ def resolve_profile(
             "refinement": refinement,
             "maximum_rank": maximum_rank,
             "rank_grid": None,
+            "expected_state_dimension": None,
             "evidence_tier": "rank_discovery",
             "post_primary": False,
             "post_primary_rationale": None,
@@ -278,6 +281,7 @@ def resolve_profile(
             "refinement": refinement,
             "maximum_rank": frozen["ranks"][-1],
             "rank_grid": list(frozen["ranks"]),
+            "expected_state_dimension": frozen["state_dimension"],
             "evidence_tier": frozen["evidence_tier"],
             "post_primary": True,
             "post_primary_rationale": RANK_EXTENSION_RATIONALE,
@@ -667,6 +671,7 @@ def dry_run_plan(
         "refinement": args.refinement,
         "maximum_rank": profile["maximum_rank"],
         "rank_grid": profile["rank_grid"],
+        "expected_state_dimension": profile["expected_state_dimension"],
         "build_command": build_command(args.cargo),
         "anticipated_binary": str(binary),
         "scientific_command": scientific_command(
@@ -716,6 +721,7 @@ def initial_manifest(
         "refinement": args.refinement,
         "maximum_rank": profile["maximum_rank"],
         "rank_grid": profile["rank_grid"],
+        "expected_state_dimension": profile["expected_state_dimension"],
         "requested_maximum_rank": args.maximum_rank,
         "attempt_output": str(output),
         "study_output": str(output / "study"),
@@ -822,6 +828,7 @@ def run_attempt(args: argparse.Namespace) -> int:
             "refinement": args.refinement,
             "maximum_rank": profile["maximum_rank"],
             "rank_grid": profile["rank_grid"],
+            "expected_state_dimension": profile["expected_state_dimension"],
             "requested_maximum_rank": args.maximum_rank,
             "attempt_output": str(output),
             "study_output": str(output / "study"),
