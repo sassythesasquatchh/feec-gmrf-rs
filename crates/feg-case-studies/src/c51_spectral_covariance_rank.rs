@@ -24,7 +24,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::Command;
 
-pub const C51_SPECTRAL_COVARIANCE_SCHEMA_VERSION: &str = "c51-spectral-covariance-rank-v1";
+pub const C51_SPECTRAL_COVARIANCE_SCHEMA_VERSION: &str = "c51-spectral-covariance-rank-v2";
 pub const C51_SPECTRAL_COVARIANCE_STUDY_ID: &str = "c51/spectral-covariance-rank";
 pub const C51_SPECTRAL_RANK_GRID: [usize; 12] = [
     32, 64, 128, 256, 512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048,
@@ -494,6 +494,7 @@ impl C51SpectralCovarianceRankArchive {
         self.write_covariances(&directory.join("covariances.csv"))?;
         self.write_basis_attempts(&directory.join("basis_attempts.csv"))?;
         self.write_sensor_banks(&directory.join("sensor_banks.csv"))?;
+        self.write_sensor_overlaps(&directory.join("sensor_overlaps.csv"))?;
         self.write_manifest(&directory.join("manifest.yaml"))?;
         Ok(())
     }
@@ -699,18 +700,11 @@ impl C51SpectralCovarianceRankArchive {
                 "cochain_column",
                 "cochain_weight",
                 "component_row_nonzeros",
-                "overlapping_kernel_pairs",
             ])
             .map_err(csv_error)?;
         for bank in &self.sensor_banks {
             for (index, kernel) in bank.kernels.iter().copied().enumerate() {
                 let center = kernel.center();
-                let overlaps = bank
-                    .overlapping_kernel_pairs
-                    .iter()
-                    .map(|pair| format!("{}:{}", pair[0], pair[1]))
-                    .collect::<Vec<_>>()
-                    .join(";");
                 for component in 0..3 {
                     for &(column, weight) in &bank.component_rows[index][component] {
                         writer
@@ -728,11 +722,31 @@ impl C51SpectralCovarianceRankArchive {
                                 column.to_string(),
                                 format_float(weight),
                                 bank.component_row_nonzeros[index][component].to_string(),
-                                overlaps.clone(),
                             ])
                             .map_err(csv_error)?;
                     }
                 }
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_sensor_overlaps(&self, path: &Path) -> Result<()> {
+        let mut writer = csv::Writer::from_path(path).map_err(csv_error)?;
+        writer
+            .write_record(["refinement", "bank", "left_kernel", "right_kernel"])
+            .map_err(csv_error)?;
+        for bank in &self.sensor_banks {
+            for pair in &bank.overlapping_kernel_pairs {
+                writer
+                    .write_record([
+                        bank.refinement.to_string(),
+                        bank.bank.to_string(),
+                        pair[0].to_string(),
+                        pair[1].to_string(),
+                    ])
+                    .map_err(csv_error)?;
             }
         }
         writer.flush()?;
@@ -840,6 +854,7 @@ impl C51SpectralCovarianceRankArchive {
         writeln!(writer, "covariances_csv: covariances.csv")?;
         writeln!(writer, "basis_attempts_csv: basis_attempts.csv")?;
         writeln!(writer, "sensor_banks_csv: sensor_banks.csv")?;
+        writeln!(writer, "sensor_overlaps_csv: sensor_overlaps.csv")?;
         writer.flush()?;
         Ok(())
     }
@@ -2458,5 +2473,48 @@ mod tests {
                 && !row.method_performance_timing_eligible
                 && row.selection.is_none()
         }));
+    }
+
+    #[test]
+    fn sensor_weights_and_overlaps_are_archived_without_cross_product_duplication() {
+        let directory =
+            std::env::temp_dir().join(format!("c51-sensor-archive-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let archive = C51SpectralCovarianceRankArchive {
+            metadata: C51SpectralCovarianceRankMetadata::discovery("test"),
+            config: C51SpectralCovarianceRankConfig::smoke(),
+            basis_attempts: Vec::new(),
+            rows: Vec::new(),
+            covariances: Vec::new(),
+            sensor_banks: vec![C51SensorBankAudit {
+                refinement: 4,
+                bank: "observation_candidates",
+                kernels: vec![
+                    WendlandC2Kernel3d::new([0.4; 3], 0.2).unwrap(),
+                    WendlandC2Kernel3d::new([0.6; 3], 0.2).unwrap(),
+                ],
+                quadrature_rule: "tetrahedron_cell_barycenter",
+                quadrature_normalizations: vec![1.0, 1.0],
+                component_row_nonzeros: vec![[1; 3], [1; 3]],
+                component_rows: vec![
+                    [vec![(0, 1.0)], vec![(1, 2.0)], vec![(2, 3.0)]],
+                    [vec![(3, 4.0)], vec![(4, 5.0)], vec![(5, 6.0)]],
+                ],
+                overlapping_kernel_pairs: vec![[0, 1]],
+            }],
+            plumbing_gates: Vec::new(),
+        };
+        let weights_path = directory.join("sensor_banks.csv");
+        let overlaps_path = directory.join("sensor_overlaps.csv");
+        archive.write_sensor_banks(&weights_path).unwrap();
+        archive.write_sensor_overlaps(&overlaps_path).unwrap();
+
+        let weights = std::fs::read_to_string(weights_path).unwrap();
+        let overlaps = std::fs::read_to_string(overlaps_path).unwrap();
+        assert_eq!(weights.lines().count(), 7);
+        assert!(!weights.contains("overlapping_kernel_pairs"));
+        assert_eq!(overlaps.lines().count(), 2);
+        assert!(overlaps.contains("4,observation_candidates,0,1"));
+        std::fs::remove_dir_all(directory).unwrap();
     }
 }
