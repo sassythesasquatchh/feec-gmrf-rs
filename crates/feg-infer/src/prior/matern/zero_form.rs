@@ -1,8 +1,7 @@
 use super::build_lindgren_precision_from_system;
 use crate::sparse::{add_sparse, diag_matrix, invert_diag, lumped_diag, scale_matrix};
-use common::linalg::nalgebra::{CooMatrix as FeecCoo, CsrMatrix as FeecCsr};
+use common::linalg::nalgebra::CsrMatrix as FeecCsr;
 use formoniq::problems::laplace_beltrami::LaplaceBeltramiGalmats;
-use gmrf_core::Vector as GmrfVector;
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 
 pub use super::MaternAlpha;
@@ -58,32 +57,7 @@ pub fn build_exact_dense_mass_inverse_0form(
     mass: &FeecCsr,
     drop_tolerance: f64,
 ) -> Result<FeecCsr, String> {
-    if mass.nrows() != mass.ncols() {
-        return Err(format!(
-            "exact 0-form mass inverse requires a square matrix, got {}x{}",
-            mass.nrows(),
-            mass.ncols()
-        ));
-    }
-    let factor = feec_csr_to_gmrf(mass)
-        .cholesky_sqrt_lower()
-        .map_err(|err| format!("failed to factor 0-form mass matrix: {err}"))?;
-    let n = mass.nrows();
-    let tolerance = drop_tolerance.abs();
-    let mut inverse = FeecCoo::new(n, n);
-    for col in 0..n {
-        let mut rhs = GmrfVector::zeros(n);
-        rhs[col] = 1.0;
-        let solution = factor.solve(&rhs).map_err(|err| {
-            format!("failed to solve exact 0-form mass inverse column {col}: {err}")
-        })?;
-        for (row, value) in solution.iter().copied().enumerate() {
-            if value.abs() > tolerance {
-                inverse.push(row, col, value);
-            }
-        }
-    }
-    Ok(FeecCsr::from(&inverse))
+    super::generic::build_dense_mass_inverse_with_drop_tolerance(mass, drop_tolerance)
 }
 
 pub fn build_matern_precision_0form(

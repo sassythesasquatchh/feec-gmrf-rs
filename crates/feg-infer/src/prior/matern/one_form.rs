@@ -280,32 +280,7 @@ pub fn build_exact_dense_mass_inverse_1form(
     mass_u: &FeecCsr,
     drop_tolerance: f64,
 ) -> Result<FeecCsr, String> {
-    if mass_u.nrows() != mass_u.ncols() {
-        return Err(format!(
-            "exact 1-form mass inverse requires a square matrix, got {}x{}",
-            mass_u.nrows(),
-            mass_u.ncols()
-        ));
-    }
-    let factor = feec_csr_to_gmrf(mass_u)
-        .cholesky_sqrt_lower()
-        .map_err(|err| format!("failed to factor 1-form mass matrix: {err}"))?;
-    let n = mass_u.nrows();
-    let tolerance = drop_tolerance.abs();
-    let mut inverse = FeecCoo::new(n, n);
-    for col in 0..n {
-        let mut rhs = GmrfVector::zeros(n);
-        rhs[col] = 1.0;
-        let solution = factor.solve(&rhs).map_err(|err| {
-            format!("failed to solve exact 1-form mass inverse column {col}: {err}")
-        })?;
-        for (row, value) in solution.iter().copied().enumerate() {
-            if value.abs() > tolerance {
-                inverse.push(row, col, value);
-            }
-        }
-    }
-    Ok(FeecCsr::from(&inverse))
+    super::generic::build_dense_mass_inverse_with_drop_tolerance(mass_u, drop_tolerance)
 }
 
 fn build_matern_mass_inverse_1form_with_optional_coords(

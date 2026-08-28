@@ -1,22 +1,77 @@
 use super::{build_lindgren_precision_from_system, MaternAlpha};
-use crate::sparse::{add_sparse, diag_matrix, invert_diag, matrix_diag, scale_matrix};
+use crate::sparse::{add_sparse, diag_matrix, feec_csr_to_gmrf, matrix_diag, scale_matrix};
 use common::linalg::nalgebra::{CooMatrix as FeecCoo, CsrMatrix as FeecCsr};
 use formoniq::{
     assemble::assemble_whitney_projected_sparse_inverse_galmat_for_grade,
     problems::hodge_laplace::MixedGalmats,
 };
+use gmrf_core::Vector as GmrfVector;
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 
+#[derive(Debug)]
 pub struct HodgeLaplacianForm {
     pub grade: usize,
     pub mass_u: FeecCsr,
     pub laplacian: FeecCsr,
 }
 
+enum LowerMassInverse<'a> {
+    Projected,
+    ExactDense,
+    RowSumLumped,
+    Diagonal,
+    Provided(&'a FeecCsr),
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MaternConfig {
     pub kappa: f64,
     pub tau: f64,
+}
+
+/// Assemble the numerically exact dense inverse of a square SPD mass matrix.
+///
+/// This is a reference construction: every nonzero returned by the sparse
+/// factor solve is retained, so the result is generally dense. It is intended
+/// for small-mesh verification and explicit full-metric models, not as a
+/// scalable sparse inverse policy.
+pub fn build_exact_dense_mass_inverse(mass: &FeecCsr) -> Result<FeecCsr, String> {
+    build_dense_mass_inverse_with_drop_tolerance(mass, 0.0)
+}
+
+pub(crate) fn build_dense_mass_inverse_with_drop_tolerance(
+    mass: &FeecCsr,
+    drop_tolerance: f64,
+) -> Result<FeecCsr, String> {
+    if mass.nrows() != mass.ncols() {
+        return Err(format!(
+            "exact mass inverse requires a square matrix, got {}x{}",
+            mass.nrows(),
+            mass.ncols()
+        ));
+    }
+    if !drop_tolerance.is_finite() || drop_tolerance < 0.0 {
+        return Err("mass-inverse drop tolerance must be finite and non-negative".to_string());
+    }
+
+    let factor = feec_csr_to_gmrf(mass)
+        .cholesky_sqrt_lower()
+        .map_err(|err| format!("failed to factor mass matrix: {err}"))?;
+    let dimension = mass.nrows();
+    let mut inverse = FeecCoo::new(dimension, dimension);
+    for column in 0..dimension {
+        let mut rhs = GmrfVector::zeros(dimension);
+        rhs[column] = 1.0;
+        let solution = factor
+            .solve(&rhs)
+            .map_err(|err| format!("failed to solve mass-inverse column {column}: {err}"))?;
+        for (row, value) in solution.iter().copied().enumerate() {
+            if value != 0.0 && value.abs() >= drop_tolerance {
+                inverse.push(row, column, value);
+            }
+        }
+    }
+    Ok(FeecCsr::from(&inverse))
 }
 
 impl Default for MaternConfig {
@@ -40,7 +95,119 @@ pub fn build_hodge_laplacian_form(
         ));
     }
     let galmats = MixedGalmats::compute(topology, metric, grade);
-    build_hodge_laplacian_form_from_galmats(topology, metric, grade, &galmats)
+    build_hodge_laplacian_form_from_galmats_with_lower_mass_inverse(
+        topology,
+        metric,
+        grade,
+        &galmats,
+        LowerMassInverse::Projected,
+    )
+}
+
+/// Assemble the Hodge--Laplacian using the exact lower-degree mass inverse.
+///
+/// For degree zero there is no lower-adjoint term, so this agrees with
+/// [`build_hodge_laplacian_form`]. At positive degree the resulting Schur
+/// complement is generally dense and is intended as a full-metric reference.
+pub fn build_hodge_laplacian_form_with_exact_lower_mass_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    grade: usize,
+) -> Result<HodgeLaplacianForm, String> {
+    if grade > topology.dim() {
+        return Err(format!(
+            "form grade {grade} exceeds topology dimension {}",
+            topology.dim()
+        ));
+    }
+    let galmats = MixedGalmats::compute(topology, metric, grade);
+    build_hodge_laplacian_form_from_galmats_with_lower_mass_inverse(
+        topology,
+        metric,
+        grade,
+        &galmats,
+        LowerMassInverse::ExactDense,
+    )
+}
+
+/// Assemble the Hodge--Laplacian using an inverse row-sum lower mass.
+pub fn build_hodge_laplacian_form_with_row_sum_lower_mass_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    grade: usize,
+) -> Result<HodgeLaplacianForm, String> {
+    build_hodge_laplacian_form_with_named_lower_mass_inverse(
+        topology,
+        metric,
+        grade,
+        LowerMassInverse::RowSumLumped,
+    )
+}
+
+/// Assemble the Hodge--Laplacian using the inverse lower-mass diagonal.
+pub fn build_hodge_laplacian_form_with_diagonal_lower_mass_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    grade: usize,
+) -> Result<HodgeLaplacianForm, String> {
+    build_hodge_laplacian_form_with_named_lower_mass_inverse(
+        topology,
+        metric,
+        grade,
+        LowerMassInverse::Diagonal,
+    )
+}
+
+fn build_hodge_laplacian_form_with_named_lower_mass_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    grade: usize,
+    lower_mass_inverse: LowerMassInverse<'_>,
+) -> Result<HodgeLaplacianForm, String> {
+    if grade > topology.dim() {
+        return Err(format!(
+            "form grade {grade} exceeds topology dimension {}",
+            topology.dim()
+        ));
+    }
+    let galmats = MixedGalmats::compute(topology, metric, grade);
+    build_hodge_laplacian_form_from_galmats_with_lower_mass_inverse(
+        topology,
+        metric,
+        grade,
+        &galmats,
+        lower_mass_inverse,
+    )
+}
+
+/// Assemble the Hodge--Laplacian with a caller-supplied lower-degree mass inverse.
+///
+/// The supplied matrix acts on the mixed auxiliary space of degree `grade - 1`.
+/// Supplying one for degree zero is rejected because no lower-adjoint term
+/// exists there.
+pub fn build_hodge_laplacian_form_with_lower_mass_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    grade: usize,
+    lower_mass_inverse: &FeecCsr,
+) -> Result<HodgeLaplacianForm, String> {
+    if grade > topology.dim() {
+        return Err(format!(
+            "form grade {grade} exceeds topology dimension {}",
+            topology.dim()
+        ));
+    }
+    if grade == 0 {
+        return Err("degree-zero forms have no lower-adjoint mass inverse".to_string());
+    }
+    let galmats = MixedGalmats::compute(topology, metric, grade);
+    build_hodge_laplacian_form_from_galmats_with_lower_mass_inverse(
+        topology,
+        metric,
+        grade,
+        &galmats,
+        LowerMassInverse::Provided(lower_mass_inverse),
+    )
 }
 
 pub fn build_hodge_laplacian_form_from_galmats(
@@ -56,6 +223,22 @@ pub fn build_hodge_laplacian_form_from_galmats(
         ));
     }
 
+    build_hodge_laplacian_form_from_galmats_with_lower_mass_inverse(
+        topology,
+        metric,
+        grade,
+        galmats,
+        LowerMassInverse::Projected,
+    )
+}
+
+fn build_hodge_laplacian_form_from_galmats_with_lower_mass_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    grade: usize,
+    galmats: &MixedGalmats,
+    lower_mass_inverse: LowerMassInverse<'_>,
+) -> Result<HodgeLaplacianForm, String> {
     let mass_u = galmats.mass_u_csr();
     let codifdif_u = if galmats.codifdif_u().nrows() == 0 {
         FeecCsr::from(&FeecCoo::new(mass_u.nrows(), mass_u.ncols()))
@@ -67,8 +250,35 @@ pub fn build_hodge_laplacian_form_from_galmats(
         codifdif_u
     } else {
         let mass_sigma = FeecCsr::from(galmats.mass_sigma());
-        let sigma_inverse =
-            build_projected_or_top_degree_mass_inverse(topology, metric, grade - 1, &mass_sigma)?;
+        let sigma_inverse = match lower_mass_inverse {
+            LowerMassInverse::Projected => build_projected_or_top_degree_mass_inverse(
+                topology,
+                metric,
+                grade - 1,
+                &mass_sigma,
+            )?,
+            LowerMassInverse::ExactDense => build_exact_dense_mass_inverse(&mass_sigma)?,
+            LowerMassInverse::RowSumLumped => build_positive_diagonal_inverse(
+                &crate::sparse::lumped_diag(&mass_sigma),
+                "row-sum lower mass",
+            )?,
+            LowerMassInverse::Diagonal => {
+                build_positive_diagonal_inverse(&matrix_diag(&mass_sigma), "lower mass diagonal")?
+            }
+            LowerMassInverse::Provided(inverse) => {
+                if inverse.nrows() != mass_sigma.nrows() || inverse.ncols() != mass_sigma.ncols() {
+                    return Err(format!(
+                        "provided lower mass inverse dimensions {}x{} do not match grade-{} auxiliary mass {}x{}",
+                        inverse.nrows(),
+                        inverse.ncols(),
+                        grade - 1,
+                        mass_sigma.nrows(),
+                        mass_sigma.ncols()
+                    ));
+                }
+                inverse.clone()
+            }
+        };
         let dif_sigma = FeecCsr::from(galmats.dif_sigma());
         let codif_u = FeecCsr::from(galmats.codif_u());
         let schur_mid = &dif_sigma * &sigma_inverse;
@@ -81,6 +291,18 @@ pub fn build_hodge_laplacian_form_from_galmats(
         mass_u,
         laplacian,
     })
+}
+
+fn build_positive_diagonal_inverse(values: &[f64], name: &str) -> Result<FeecCsr, String> {
+    if values
+        .iter()
+        .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err(format!("{name} entries must be finite and positive"));
+    }
+    Ok(diag_matrix(
+        &values.iter().map(|value| value.recip()).collect::<Vec<_>>(),
+    ))
 }
 
 pub fn build_matern_system_matrix_form(hodge: &HodgeLaplacianForm, kappa: f64) -> FeecCsr {
@@ -102,7 +324,7 @@ pub fn build_projected_or_top_degree_mass_inverse(
     }
 
     let inverse = if grade == topology.dim() {
-        diag_matrix(&invert_diag(&matrix_diag(mass)))
+        build_positive_diagonal_inverse(&matrix_diag(mass), "top-degree mass diagonal")?
     } else {
         FeecCsr::from(&assemble_whitney_projected_sparse_inverse_galmat_for_grade(
             topology, metric, grade,
@@ -173,6 +395,86 @@ mod tests {
             }
         }
         diag
+    }
+
+    fn entry(matrix: &FeecCsr, row: usize, col: usize) -> f64 {
+        matrix
+            .triplet_iter()
+            .filter_map(|(entry_row, entry_col, value)| {
+                (entry_row == row && entry_col == col).then_some(*value)
+            })
+            .sum()
+    }
+
+    #[test]
+    fn exact_dense_mass_inverse_is_grade_independent() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 1, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let metric = coords.to_edge_lengths(&topology);
+
+        for grade in 0..=topology.dim() {
+            let hodge = build_hodge_laplacian_form(&topology, &metric, grade)
+                .expect("form operators should assemble");
+            let inverse = build_exact_dense_mass_inverse(&hodge.mass_u)
+                .expect("mass matrix should admit an exact reference inverse");
+            let product = &hodge.mass_u * &inverse;
+            for row in 0..product.nrows() {
+                for col in 0..product.ncols() {
+                    let expected = if row == col { 1.0 } else { 0.0 };
+                    assert!(
+                        (entry(&product, row, col) - expected).abs() <= 1.0e-9,
+                        "grade {grade} mass-inverse mismatch at ({row},{col})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_dense_mass_inverse_rejects_non_square_input() {
+        let mass = FeecCsr::from(&FeecCoo::new(2, 3));
+        let error = build_exact_dense_mass_inverse(&mass).unwrap_err();
+        assert!(error.contains("requires a square matrix"));
+    }
+
+    #[test]
+    fn exact_lower_mass_inverse_is_explicit_and_grade_independent() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 1, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let metric = coords.to_edge_lengths(&topology);
+
+        let zero_default = build_hodge_laplacian_form(&topology, &metric, 0).unwrap();
+        let zero_exact =
+            build_hodge_laplacian_form_with_exact_lower_mass_inverse(&topology, &metric, 0)
+                .unwrap();
+        assert_eq!(zero_default.laplacian, zero_exact.laplacian);
+
+        for grade in 1..=topology.dim() {
+            let galmats = MixedGalmats::compute(&topology, &metric, grade);
+            let lower_mass = FeecCsr::from(galmats.mass_sigma());
+            let inverse = build_exact_dense_mass_inverse(&lower_mass).unwrap();
+            let exact =
+                build_hodge_laplacian_form_with_exact_lower_mass_inverse(&topology, &metric, grade)
+                    .unwrap();
+            let provided = build_hodge_laplacian_form_with_lower_mass_inverse(
+                &topology, &metric, grade, &inverse,
+            )
+            .unwrap();
+            assert_eq!(exact.mass_u, provided.mass_u);
+            assert_eq!(exact.laplacian, provided.laplacian);
+        }
+    }
+
+    #[test]
+    fn provided_lower_mass_inverse_rejects_wrong_space() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 1, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let metric = coords.to_edge_lengths(&topology);
+        let wrong = FeecCsr::from(&FeecCoo::new(1, 1));
+        let error =
+            build_hodge_laplacian_form_with_lower_mass_inverse(&topology, &metric, 1, &wrong)
+                .unwrap_err();
+        assert!(error.contains("provided lower mass inverse dimensions"));
     }
 
     #[test]
