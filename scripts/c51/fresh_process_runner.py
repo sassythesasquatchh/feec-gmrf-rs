@@ -566,8 +566,12 @@ def run_measured_process(
         "time_tool": time_tool.metadata,
         "time_measurements": time_measurements,
         "cgroup_peak_rss_bytes": cgroup_measurement,
-        "peak_rss_for_analysis": select_peak_rss(
+        "peak_rss_archive_process": select_peak_rss(
             cgroup_measurement, time_measurements["peak_rss_bytes"]
+        ),
+        "peak_rss_row_attribution": unavailable(
+            "the current example executes all methods and designs in one process; "
+            "archive-process peak RSS cannot be attached to a method row or used for a crossover"
         ),
         "artifacts": {
             "stdout": file_record(stdout_path),
@@ -684,6 +688,13 @@ def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
             "supported": list(SUPPORTED_PROFILES),
             "note": "the current Rust example constructs C51BenchmarkConfig::smoke()",
         },
+        "resource_scope": {
+            "kind": "archive_process",
+            "publication_crossover_eligible": False,
+            "reason": "the current example executes all methods and designs in one process; "
+            "method/mesh/observation/workload filters and preferably factor/query phase "
+            "separation are required for row-attributable publication RSS",
+        },
         "repository": str(repository),
         "output": str(args.output),
         "build_command": [
@@ -749,6 +760,12 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
             "supported": list(SUPPORTED_PROFILES),
             "note": "the current Rust example constructs C51BenchmarkConfig::smoke(); "
             "replicate identifies the fresh-process operations replicate",
+        },
+        "resource_scope": {
+            "kind": "archive_process",
+            "publication_crossover_eligible": False,
+            "reason": "the current example executes all methods and designs in one process; "
+            "this runner validates discovery instrumentation only until one-row filters exist",
         },
         "runner": {
             "path": str(script_path),
@@ -923,8 +940,10 @@ def run_self_test(script_path: pathlib.Path, cgroup_mode: str) -> int:
                 output.get("thread_environment", {}).get(name) == "1"
                 for name in THREAD_ENV_NAMES
             ),
-            "rss_explicit": success.manifest["peak_rss_for_analysis"].get("status")
+            "rss_explicit": success.manifest["peak_rss_archive_process"].get("status")
             in {"measured", "unavailable"},
+            "rss_not_row_attributed": success.manifest["peak_rss_row_attribution"].get("status")
+            == "unavailable",
             "stderr_captured": "sentinel"
             in (success_dir / "stderr.log").read_text(encoding="utf-8"),
         }

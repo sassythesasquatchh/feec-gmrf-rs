@@ -36,3 +36,10 @@ The current Rust example implements only `C51BenchmarkConfig::smoke()`. The
 runner therefore rejects other profile names instead of silently running smoke
 under another label. `replicate` identifies the fresh-process operations
 replicate; the scientific smoke seeds remain fixed for paired timing.
+
+The example currently executes every smoke method and observation design in
+one process. Its peak RSS is therefore an **archive-process discovery
+measurement**, not method-row memory. The runner marks it ineligible for a
+publication crossover and does not attach it to `rows.csv`. Publication runs
+require method/mesh/observation/workload filters, and preferably separate
+factor/setup and query process modes, so each peak has one unambiguous owner.

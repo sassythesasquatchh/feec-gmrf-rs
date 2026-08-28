@@ -57,6 +57,14 @@ class FreshProcessRunnerTests(unittest.TestCase):
         self.assertIn("cgroup-v2", selected["selection_rule"])
         self.assertEqual(selected["cgroup_unavailable_reason"], "not delegated")
 
+    def test_row_attribution_is_not_implied_by_peak_selection(self):
+        selected = runner.select_peak_rss(
+            runner.unavailable("not delegated"),
+            runner.measured(2048, "bytes", "macos_bsd_time_maximum_rss"),
+        )
+        self.assertEqual(selected["status"], "measured")
+        self.assertNotIn("method", selected)
+
     def test_thread_environment_is_complete(self):
         environment = runner.thread_environment(3)
         self.assertEqual(set(environment), set(runner.THREAD_ENV_NAMES))
