@@ -12,11 +12,11 @@ use crate::c51_magnetic_sensor_design::{
 };
 use crate::c51_spectral_covariance_rank::{covariance_error_metrics, C51CovarianceErrorMetrics};
 use feec_gmrf::prelude::{
-    axis_aligned_flux_patch_cochain_map_3d, pullback_quadratic_form, AxisAlignedFluxPatch3d,
-    EssentialBoundaryConditions, EssentialBoundaryElimination, ExactFormOperators, GaussianNoise,
+    axis_aligned_flux_patch_cochain_map_3d, pullback_quadratic_form, AdjacentMaternPriorBuilder,
+    AxisAlignedFluxPatch3d, EssentialBoundaryElimination, ExactFormOperators, GaussianNoise,
     HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearMap, LinearObservation,
-    MaternAlpha, MaternParameters, MaternPriorBuilder, OutgoingFormOperator, Result,
-    SupportedMaternPriorBuilder, VarianceMethod,
+    MaternAlpha, MaternParameters, OutgoingFormOperator, Result, SupportedMaternPriorBuilder,
+    VarianceMethod,
 };
 use manifold::{
     gen::cartesian::CartesianMeshInfo,
@@ -28,13 +28,13 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str =
-    "c51-thesis-normalized-flux-cochain-v5";
+    "c51-thesis-normalized-flux-cochain-v6";
 pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str =
     "c51/thesis-normalized-flux-cochain-accuracy";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v5-n8";
+    "thesis-magnetic-trace-normalized-flux-cochain-v6-n8";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v5-n10";
+    "thesis-magnetic-trace-normalized-flux-cochain-v6-n10";
 pub const C51_SURFACE_FLUX_QOI_DESIGN_ID: &str = "c51-midplane-quadrant-fluxes-v1";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
 pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
@@ -137,11 +137,11 @@ pub fn run_c51_thesis_normalized_compact(
     let raw_exact = SupportedMaternPriorBuilder::from_operators(operators.clone())
         .parameters(parameters)
         .build()?;
-    let raw_compact = MaternPriorBuilder::from_feec_whitney_projected(&topology, &metric, 1)?
+    let raw_compact =
+        AdjacentMaternPriorBuilder::from_feec_homogeneous_full_relative_with_projected_inverses(
+            &topology, &metric, 1,
+        )?
         .parameters(parameters)
-        .essential_boundary_conditions(EssentialBoundaryConditions::homogeneous_on_boundary(
-            &topology, 1,
-        )?)
         .build()?;
     if raw_exact.state_dimension() != raw_compact.dimension() {
         return Err(feec_gmrf::FeecGmrfError::Dimension(format!(
@@ -400,6 +400,10 @@ impl C51ThesisNormalizedCompactReport {
         )?;
         writeln!(writer, "cochain_row_semantics: exact_integral_flux_dofs")?;
         writeln!(writer, "cell_barycenter_reconstruction_used: false")?;
+        writeln!(
+            writer,
+            "compact_inverse_ordering: boundary_first_full_relative"
+        )?;
         writeln!(writer, "row_order_seed: {C51_FLUX_COCHAIN_DESIGN_SEED}")?;
         writeln!(writer, "state_dimension: {}", self.state_dimension)?;
         writeln!(

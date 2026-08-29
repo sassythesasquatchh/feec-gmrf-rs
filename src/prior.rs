@@ -6,8 +6,8 @@ use crate::boundary::{
     EliminatedLinearMap, EssentialBoundaryConditions, EssentialBoundaryElimination,
 };
 use crate::operator::{
-    add_sparse, multiply_sparse, ExactBoundaryDomain, ExactFormOperators, FormDegree,
-    FormOperatorProvenance, FormOperators, LinearMap, SparseMat,
+    add_sparse, multiply_sparse, BoundaryLayout, ExactBoundaryDomain, ExactFormOperators,
+    FormDegree, FormOperatorProvenance, FormOperators, LinearMap, SparseMat,
 };
 use crate::{FeecGmrfError, Result};
 pub use feg_core::MaternAlpha;
@@ -773,6 +773,50 @@ impl AdjacentMaternPriorBuilder {
         ))
     }
 
+    /// Assemble the homogeneous full-relative Whitney complex first, then
+    /// construct projected sparse inverse metrics on the already-reduced
+    /// adjacent spaces.
+    ///
+    /// This boundary-first ordering is the coefficient-space construction used
+    /// by the projected inverse consistency argument. It generally differs
+    /// from assembling a full-space projected inverse and taking an active
+    /// principal block afterwards. The returned law remains an explicitly
+    /// approximate eliminated Gaussian prior.
+    pub fn from_feec_homogeneous_full_relative_with_projected_inverses(
+        topology: &Complex,
+        metric: &MeshLengths,
+        degree: usize,
+    ) -> Result<Self> {
+        let operators =
+            ExactFormOperators::from_feec_homogeneous_full_relative(topology, metric, degree)?;
+        let state_inverse = boundary_first_projected_inverse(
+            topology,
+            metric,
+            degree,
+            operators.state().boundary_layout(),
+            operators.state().mass(),
+        )?;
+        let lower_inverse = operators
+            .incoming()
+            .map(|incoming| {
+                boundary_first_projected_inverse(
+                    topology,
+                    metric,
+                    degree - 1,
+                    incoming.lower().boundary_layout(),
+                    incoming.lower().mass(),
+                )
+            })
+            .transpose()?;
+        let mut builder = Self::from_operators(operators)
+            .recurrence_inverse(EliminatedMassInversePolicy::Provided(state_inverse));
+        if let Some(lower_inverse) = lower_inverse {
+            builder =
+                builder.lower_adjoint_inverse(EliminatedMassInversePolicy::Provided(lower_inverse));
+        }
+        Ok(builder)
+    }
+
     /// Set direct `alpha`, `kappa`, and `tau` parameters.
     pub fn parameters(mut self, parameters: MaternParameters) -> Self {
         self.parameters = parameters;
@@ -827,6 +871,41 @@ impl AdjacentMaternPriorBuilder {
             maximum_materialized_dimension,
         )
     }
+}
+
+fn boundary_first_projected_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    degree: usize,
+    layout: &BoundaryLayout,
+    active_mass: &SparseMat,
+) -> Result<SparseMat> {
+    if degree == topology.dim() {
+        return diagonal_inverse(active_mass);
+    }
+    let feec_layout = formoniq::reduction::DofLayout::from_parts(
+        layout.full_dimension(),
+        layout.active_dofs().to_vec(),
+        layout
+            .fixed_dofs()
+            .iter()
+            .map(|(index, value)| formoniq::reduction::PrescribedDof {
+                index: *index,
+                value: *value,
+            })
+            .collect(),
+    )
+    .map_err(FeecGmrfError::Assembly)?;
+    let inverse =
+        formoniq::assemble::assemble_reduced_whitney_projected_sparse_inverse_galmat_for_grade(
+            topology,
+            metric,
+            degree,
+            &feec_layout,
+        )
+        .map_err(FeecGmrfError::Assembly)?;
+    let inverse = common::linalg::nalgebra::CsrMatrix::from(&inverse);
+    Ok(feg_infer::sparse::feec_csr_to_core_triplet(&inverse))
 }
 
 /// Small-system convenience constructor for the exact full-metric eliminated

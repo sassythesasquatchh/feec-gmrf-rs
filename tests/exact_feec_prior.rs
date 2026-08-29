@@ -209,6 +209,37 @@ fn adjacent_builder_validates_each_provided_inverse_against_its_metric_space() {
 }
 
 #[test]
+fn boundary_first_projected_constructor_builds_full_relative_one_form_prior() {
+    let mesh = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0);
+    let (topology, coordinates) = mesh.compute_coord_complex();
+    let metric = coordinates.to_edge_lengths(&topology);
+    let prior =
+        AdjacentMaternPriorBuilder::from_feec_homogeneous_full_relative_with_projected_inverses(
+            &topology, &metric, 1,
+        )
+        .unwrap()
+        .parameters(MaternParameters::new(MaternAlpha::Two, 4.0, 1.0).unwrap())
+        .build()
+        .unwrap();
+
+    assert!(prior.cochain_dimension() > prior.dimension());
+    let metadata = prior.matern_metadata().unwrap();
+    assert_eq!(
+        metadata.representation(),
+        MaternRepresentation::ProvidedAdjacentEliminatedApproximation
+    );
+    assert_eq!(
+        metadata.lower_adjoint_inverse(),
+        InverseUse::Applied(MassInverseKind::Provided)
+    );
+    assert_eq!(
+        metadata.recurrence_inverse(),
+        InverseUse::Applied(MassInverseKind::Provided)
+    );
+    prior.factor().unwrap();
+}
+
+#[test]
 fn adjacent_builder_materialization_guard_applies_only_to_exact_sites() {
     let provided_lower = AdjacentMaternPriorBuilder::from_operators(two_by_two_exact_operators())
         .parameters(MaternParameters::new(MaternAlpha::One, 1.0, 1.0).unwrap())
