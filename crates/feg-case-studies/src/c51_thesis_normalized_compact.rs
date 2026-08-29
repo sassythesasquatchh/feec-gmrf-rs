@@ -21,13 +21,13 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str =
-    "c51-thesis-normalized-flux-cochain-v2";
+    "c51-thesis-normalized-flux-cochain-v3";
 pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str =
     "c51/thesis-normalized-flux-cochain-accuracy";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v2-n8";
+    "thesis-magnetic-trace-normalized-flux-cochain-v3-n8";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v2-n10";
+    "thesis-magnetic-trace-normalized-flux-cochain-v3-n10";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
 pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
 pub const C51_THESIS_TRACE_PROBES: usize = 512;
@@ -100,8 +100,10 @@ pub struct C51ThesisNormalizedCompactReport {
     pub domain_volume: f64,
     pub exact: C51ThesisTraceCalibration,
     pub compact: C51ThesisTraceCalibration,
-    pub selection: C51CovarianceErrorMetrics,
-    pub held_out: C51CovarianceErrorMetrics,
+    pub prior_selection: C51CovarianceErrorMetrics,
+    pub prior_held_out: C51CovarianceErrorMetrics,
+    pub posterior_selection: C51CovarianceErrorMetrics,
+    pub posterior_held_out: C51CovarianceErrorMetrics,
 }
 
 pub fn run_c51_thesis_normalized_compact(
@@ -192,6 +194,13 @@ pub fn run_c51_thesis_normalized_compact(
         GaussianNoise::variance(config.observation_noise_variance_weber_squared)?,
     )?;
 
+    let exact_prior = exact.factor()?;
+    let mut compact_prior = compact.factor()?;
+    let exact_prior_selection = exact_prior.pushforward_covariance(flux_split.selection())?;
+    let exact_prior_held_out = exact_prior.pushforward_covariance(flux_split.held_out())?;
+    let compact_prior_selection = compact_prior.pushforward_covariance(flux_split.selection())?;
+    let compact_prior_held_out = compact_prior.pushforward_covariance(flux_split.held_out())?;
+
     let exact_posterior = exact.condition(std::slice::from_ref(&observation), &[])?;
     let mut compact_posterior = LinearGaussianModelBuilder::new(compact)
         .observe(observation)?
@@ -210,8 +219,13 @@ pub fn run_c51_thesis_normalized_compact(
         domain_volume,
         exact: exact_calibration,
         compact: compact_calibration,
-        selection: covariance_error_metrics(&compact_selection, &exact_selection)?,
-        held_out: covariance_error_metrics(&compact_held_out, &exact_held_out)?,
+        prior_selection: covariance_error_metrics(
+            &compact_prior_selection,
+            &exact_prior_selection,
+        )?,
+        prior_held_out: covariance_error_metrics(&compact_prior_held_out, &exact_prior_held_out)?,
+        posterior_selection: covariance_error_metrics(&compact_selection, &exact_selection)?,
+        posterior_held_out: covariance_error_metrics(&compact_held_out, &exact_held_out)?,
     })
 }
 
@@ -224,8 +238,8 @@ impl C51ThesisNormalizedCompactReport {
 
     fn write_csv(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,selection_e_f,selection_e_2,selection_e_diag,selection_e_dir,selection_e_corr,selection_e_primary,heldout_e_f,heldout_e_2,heldout_e_diag,heldout_e_dir,heldout_e_corr,heldout_e_primary")?;
-        writeln!(writer, "{},{},{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,prior_selection_e_f,prior_selection_e_2,prior_selection_e_diag,prior_selection_e_dir,prior_selection_e_corr,prior_selection_e_primary,prior_heldout_e_f,prior_heldout_e_2,prior_heldout_e_diag,prior_heldout_e_dir,prior_heldout_e_corr,prior_heldout_e_primary,posterior_selection_e_f,posterior_selection_e_2,posterior_selection_e_diag,posterior_selection_e_dir,posterior_selection_e_corr,posterior_selection_e_primary,posterior_heldout_e_f,posterior_heldout_e_2,posterior_heldout_e_diag,posterior_heldout_e_dir,posterior_heldout_e_corr,posterior_heldout_e_primary")?;
+        writeln!(writer, "{},{},{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{},{},{},{}",
             C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
             self.config.profile,
             self.config.refinement,
@@ -243,18 +257,10 @@ impl C51ThesisNormalizedCompactReport {
             self.compact.precision_scale,
             self.compact.tau_multiplier,
             option_float(self.compact.weighted_trace_relative_standard_error),
-            self.selection.relative_frobenius,
-            self.selection.relative_spectral,
-            self.selection.maximum_relative_diagonal,
-            self.selection.maximum_relative_directional,
-            self.selection.relative_correlation_frobenius,
-            self.selection.primary_envelope(),
-            self.held_out.relative_frobenius,
-            self.held_out.relative_spectral,
-            self.held_out.maximum_relative_diagonal,
-            self.held_out.maximum_relative_directional,
-            self.held_out.relative_correlation_frobenius,
-            self.held_out.primary_envelope(),
+            metrics_csv(&self.prior_selection),
+            metrics_csv(&self.prior_held_out),
+            metrics_csv(&self.posterior_selection),
+            metrics_csv(&self.posterior_held_out),
         )?;
         writer.flush()?;
         Ok(())
@@ -294,6 +300,17 @@ impl C51ThesisNormalizedCompactReport {
         writeln!(writer, "cochain_row_semantics: exact_integral_flux_dofs")?;
         writeln!(writer, "cell_barycenter_reconstruction_used: false")?;
         writeln!(writer, "row_order_seed: {C51_FLUX_COCHAIN_DESIGN_SEED}")?;
+        writeln!(writer, "state_dimension: {}", self.state_dimension)?;
+        writeln!(
+            writer,
+            "full_cochain_dimension: {}",
+            self.full_cochain_dimension
+        )?;
+        writeln!(
+            writer,
+            "magnetic_output_dimension: {}",
+            self.magnetic_output_dimension
+        )?;
         writeln!(
             writer,
             "observation_count: {}",
@@ -311,6 +328,27 @@ impl C51ThesisNormalizedCompactReport {
             writer,
             "observation_noise_variance_weber_squared: {:.17e}",
             self.config.observation_noise_variance_weber_squared
+        )?;
+        writeln!(writer, "errors:")?;
+        writeln!(
+            writer,
+            "  prior_selection_primary: {:.17e}",
+            self.prior_selection.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  prior_heldout_primary: {:.17e}",
+            self.prior_held_out.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  posterior_selection_primary: {:.17e}",
+            self.posterior_selection.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  posterior_heldout_primary: {:.17e}",
+            self.posterior_held_out.primary_envelope()
         )?;
         writeln!(
             writer,
@@ -379,6 +417,18 @@ fn option_float(value: Option<f64>) -> String {
     value
         .map(|value| format!("{value:.17e}"))
         .unwrap_or_default()
+}
+
+fn metrics_csv(metrics: &C51CovarianceErrorMetrics) -> String {
+    format!(
+        "{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+        metrics.relative_frobenius,
+        metrics.relative_spectral,
+        metrics.maximum_relative_diagonal,
+        metrics.maximum_relative_directional,
+        metrics.relative_correlation_frobenius,
+        metrics.primary_envelope(),
+    )
 }
 
 fn option_yaml(value: Option<&str>) -> String {
