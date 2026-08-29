@@ -49,6 +49,7 @@ use std::fmt::Display;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v6";
@@ -492,6 +493,81 @@ impl C51RunMetadata {
             hardware: C51HardwareMetadata::default(),
         }
     }
+
+    /// Capture root/submodule Git state and the Rust compiler for a real run.
+    pub fn from_repository(command: impl Into<String>, repository: &Path) -> Result<Self> {
+        let mut metadata = Self::smoke(command);
+        metadata.root_sha = Some(c51_command_output(
+            Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["rev-parse", "HEAD"]),
+            "root Git SHA",
+        )?);
+        metadata.root_dirty = Some(
+            !c51_command_output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(repository)
+                    .args(["status", "--porcelain"]),
+                "root Git status",
+            )?
+            .is_empty(),
+        );
+        for (path, sha, dirty, label) in [
+            (
+                repository.join("feec"),
+                &mut metadata.feec_sha,
+                &mut metadata.feec_dirty,
+                "FEEC",
+            ),
+            (
+                repository.join("gmrf-rs"),
+                &mut metadata.gmrf_sha,
+                &mut metadata.gmrf_dirty,
+                "GMRF",
+            ),
+        ] {
+            *sha = Some(c51_command_output(
+                Command::new("git")
+                    .arg("-C")
+                    .arg(&path)
+                    .args(["rev-parse", "HEAD"]),
+                &format!("{label} Git SHA"),
+            )?);
+            *dirty = Some(
+                !c51_command_output(
+                    Command::new("git")
+                        .arg("-C")
+                        .arg(&path)
+                        .args(["status", "--porcelain"]),
+                    &format!("{label} Git status"),
+                )?
+                .is_empty(),
+            );
+        }
+        metadata.rustc_version = Some(c51_command_output(
+            Command::new("rustc").args(["--version", "--verbose"]),
+            "rustc version",
+        )?);
+        Ok(metadata)
+    }
+}
+
+fn c51_command_output(command: &mut Command, label: &str) -> Result<String> {
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(FeecGmrfError::Inference(format!(
+            "could not capture {label}: status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    String::from_utf8(output.stdout)
+        .map(|value| value.trim().to_string())
+        .map_err(|error| {
+            FeecGmrfError::Inference(format!("could not decode {label} as UTF-8: {error}"))
+        })
 }
 
 /// Frozen mathematical and workload axes for one benchmark invocation.

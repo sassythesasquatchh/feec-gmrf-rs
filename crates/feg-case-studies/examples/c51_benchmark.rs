@@ -47,9 +47,10 @@ fn run_accuracy(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     } else {
         "experimental"
     };
-    let mut metadata = C51RunMetadata::smoke(format!(
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut metadata = C51RunMetadata::from_repository(format!(
         "cargo run --release -p feg-case-studies --features {enabled_features} --example c51_benchmark -- {profile}"
-    ));
+    ), &repository_root)?;
     metadata.profile = profile;
     let archive = match metadata.profile.as_str() {
         "spectral_rank_pilot" => run_c51_spectral_rank_pilot(&config, metadata)?,
@@ -128,7 +129,11 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "juq-performance-v1" => C51ResourceConfig::juq_performance(selection),
         _ => unreachable!("validated resource profile"),
     };
-    let mut metadata = C51RunMetadata::smoke(std::env::args().collect::<Vec<_>>().join(" "));
+    let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut metadata = C51RunMetadata::from_repository(
+        std::env::args().collect::<Vec<_>>().join(" "),
+        &repository_root,
+    )?;
     metadata.profile = format!("resource/{profile}");
     let archive = run_c51_resource(&config, metadata)?;
     archive.write_directory(&output)?;
