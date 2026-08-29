@@ -34,6 +34,13 @@ def slepc_root() -> pathlib.Path:
     return matches[0].parents[3]
 
 
+def petsc_root() -> pathlib.Path:
+    matches = sorted(pathlib.Path("/usr/lib").glob("petscdir/**/lib/petsc/conf/rules"))
+    if len(matches) != 1:
+        raise RuntimeError(f"expected one PETSc configuration, found {matches}")
+    return matches[0].parents[3]
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rank-decisions", type=pathlib.Path, required=True)
@@ -55,6 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     environment = os.environ.copy()
     environment["SLEPC_DIR"] = str(slepc_root())
+    environment["PETSC_DIR"] = str(petsc_root())
     environment["PETSC_SOLVER_PATH"] = str(
         REPOSITORY / "feec" / "petsc-solver" / "ghiep.out"
     )

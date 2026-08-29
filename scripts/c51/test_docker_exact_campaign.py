@@ -27,6 +27,9 @@ class DockerExactCampaignTests(unittest.TestCase):
             mock.patch.object(pathlib.Path, "is_file", return_value=True),
             mock.patch.object(os, "access", return_value=True),
             mock.patch.object(campaign, "slepc_root", return_value=pathlib.Path("/slepc")),
+            mock.patch.object(
+                campaign, "petsc_root", return_value=pathlib.Path("/petsc")
+            ),
             mock.patch.object(campaign, "run", side_effect=record),
         ):
             status = campaign.main(
@@ -49,6 +52,7 @@ class DockerExactCampaignTests(unittest.TestCase):
         self.assertIn("scripts/c51/juq-exact-performance-v1.json", delegated[0])
         self.assertEqual(delegated[0][-1], "--dry-run")
         self.assertEqual(delegated[1]["SLEPC_DIR"], "/slepc")
+        self.assertEqual(delegated[1]["PETSC_DIR"], "/petsc")
         self.assertTrue(delegated[1]["PETSC_SOLVER_PATH"].endswith("/feec/petsc-solver/ghiep.out"))
 
     def test_missing_writable_cgroup_is_a_hard_error(self):
