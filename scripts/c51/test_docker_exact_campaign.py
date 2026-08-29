@@ -25,6 +25,7 @@ class DockerExactCampaignTests(unittest.TestCase):
 
         with (
             mock.patch.object(pathlib.Path, "is_file", return_value=True),
+            mock.patch.object(pathlib.Path, "mkdir"),
             mock.patch.object(os, "access", return_value=True),
             mock.patch.object(campaign, "slepc_root", return_value=pathlib.Path("/slepc")),
             mock.patch.object(
@@ -43,17 +44,19 @@ class DockerExactCampaignTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 0)
-        self.assertIn(
-            ["make", "-C", "feec/petsc-solver", "clean", "all"],
-            [command for command, _ in commands],
-        )
+        build = next(command for command, _ in commands if command[0] == "make")
+        self.assertEqual(build[0:3], ["make", "-C", "/target/c51-petsc-solver"])
+        self.assertTrue(build[4].endswith("/scripts/c51/docker/petsc-solver.mk"))
         delegated = commands[-1]
         self.assertEqual(delegated[0][0:2], ["python3", "scripts/c51/run_juq_performance.py"])
         self.assertIn("scripts/c51/juq-exact-performance-v1.json", delegated[0])
         self.assertEqual(delegated[0][-1], "--dry-run")
         self.assertEqual(delegated[1]["SLEPC_DIR"], "/slepc")
         self.assertEqual(delegated[1]["PETSC_DIR"], "/petsc")
-        self.assertTrue(delegated[1]["PETSC_SOLVER_PATH"].endswith("/feec/petsc-solver/ghiep.out"))
+        self.assertEqual(
+            delegated[1]["PETSC_SOLVER_PATH"],
+            "/target/c51-petsc-solver/ghiep.out",
+        )
 
     def test_missing_writable_cgroup_is_a_hard_error(self):
         with (

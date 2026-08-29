@@ -12,6 +12,7 @@ from typing import Sequence
 
 
 REPOSITORY = pathlib.Path("/workspace")
+PETSC_BUILD = pathlib.Path("/target/c51-petsc-solver")
 
 
 def run(command: Sequence[str], *, environment: dict[str, str] | None = None) -> None:
@@ -63,13 +64,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     environment = os.environ.copy()
     environment["SLEPC_DIR"] = str(slepc_root())
     environment["PETSC_DIR"] = str(petsc_root())
-    environment["PETSC_SOLVER_PATH"] = str(
-        REPOSITORY / "feec" / "petsc-solver" / "ghiep.out"
-    )
+    environment["PETSC_SOLVER_PATH"] = str(PETSC_BUILD / "ghiep.out")
     try:
         for directory in (REPOSITORY, REPOSITORY / "feec", REPOSITORY / "gmrf-rs"):
             run(["git", "config", "--global", "--add", "safe.directory", str(directory)])
-        run(["make", "-C", "feec/petsc-solver", "clean", "all"], environment=environment)
+        PETSC_BUILD.mkdir(parents=True, exist_ok=True)
+        run(
+            [
+                "make",
+                "-C",
+                str(PETSC_BUILD),
+                "-f",
+                str(REPOSITORY / "scripts/c51/docker/petsc-solver.mk"),
+                "all",
+            ],
+            environment=environment,
+        )
         run(
             [
                 "cargo",
