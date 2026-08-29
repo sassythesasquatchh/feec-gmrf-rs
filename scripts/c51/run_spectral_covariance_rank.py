@@ -85,6 +85,18 @@ REPLAY_PROFILES = {
         "ranks": (512, 768, 1024, 1280, 1536, 1792, 2000, 2048, 2560, 3072, 3584, 4096),
         "evidence_tier": "high_observation_replay_accuracy_only",
     },
+    "high-observation-m4096-replay-v1-n8-r3032": {
+        "refinement": 8,
+        "state_dimension": 3032,
+        "ranks": (512, 768, 1024, 1280, 1536, 1792, 2000, 2048, 2304, 2560, 2816, 3000, 3032),
+        "evidence_tier": "high_observation_replay_accuracy_only",
+    },
+    "high-observation-m4096-replay-v1-n10-r4096": {
+        "refinement": 10,
+        "state_dimension": 6130,
+        "ranks": (512, 768, 1024, 1280, 1536, 1792, 2000, 2048, 2560, 3072, 3584, 4096),
+        "evidence_tier": "high_observation_replay_accuracy_only",
+    },
 }
 RANK_EXTENSION_RATIONALE = (
     "post-primary extension frozen after publication-discovery-v1 left corrected "

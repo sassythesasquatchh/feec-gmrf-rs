@@ -2,10 +2,12 @@ use feg_case_studies::c51_spectral_covariance_rank::{
     run_c51_spectral_covariance_rank, run_c51_spectral_covariance_rank_replay,
     C51SpectralCovarianceRankConfig, C51SpectralCovarianceRankMetadata,
     C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10, C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8,
-    C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10, C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8,
-    C51_HIGH_OBSERVATION_PROFILE_N10, C51_HIGH_OBSERVATION_PROFILE_N8,
-    C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10, C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8,
-    C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8,
+    C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10,
+    C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8, C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10,
+    C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8, C51_HIGH_OBSERVATION_PROFILE_N10,
+    C51_HIGH_OBSERVATION_PROFILE_N8, C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10,
+    C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10,
+    C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8,
 };
 use std::env;
 use std::path::PathBuf;
@@ -161,8 +163,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
             C51SpectralCovarianceRankConfig::high_observation_primary(expected_refinement)?
         }
-        C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8 | C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10 => {
-            let expected_refinement = if profile == C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8 {
+        C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8
+        | C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10
+        | C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8
+        | C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10 => {
+            let expected_refinement = if matches!(
+                profile.as_str(),
+                C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8
+                    | C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8
+            ) {
                 8
             } else {
                 10
@@ -179,7 +188,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if rank_decision_output.is_some() || perf0_archive.is_some() {
                 return Err("a replay profile cannot emit a performance rank decision".into());
             }
-            C51SpectralCovarianceRankConfig::high_observation_replay(expected_refinement)?
+            if matches!(
+                profile.as_str(),
+                C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8
+                    | C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10
+            ) {
+                C51SpectralCovarianceRankConfig::high_observation_confirmatory_replay(
+                    expected_refinement,
+                )?
+            } else {
+                C51SpectralCovarianceRankConfig::high_observation_replay(expected_refinement)?
+            }
         }
         C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8
         | C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => {

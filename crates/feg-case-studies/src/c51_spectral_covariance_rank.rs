@@ -97,6 +97,10 @@ pub const C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8: &str =
     "high-observation-m2048-replay-v1-n8-r3032";
 pub const C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10: &str =
     "high-observation-m2048-replay-v1-n10-r4096";
+pub const C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8: &str =
+    "high-observation-m4096-replay-v1-n8-r3032";
+pub const C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10: &str =
+    "high-observation-m4096-replay-v1-n10-r4096";
 pub const C51_HIGH_OBSERVATION_PRIMARY_COUNT: usize = 2_048;
 pub const C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8: &str =
     "high-observation-confirmatory-m4096-v1-n8";
@@ -300,6 +304,39 @@ impl C51SpectralCovarianceRankConfig {
         Ok(config)
     }
 
+    /// Accuracy-only `m=4096` replay of a previously generated basis. This
+    /// selects a fresh exact-request confirmatory rank without attributing the
+    /// cached eigensolve time or emitting a performance rank decision.
+    pub fn high_observation_confirmatory_replay(refinement: usize) -> Result<Self> {
+        let (profile, ranks) = match refinement {
+            8 => (
+                C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8,
+                C51_HIGH_OBSERVATION_REPLAY_RANKS_N8.as_slice(),
+            ),
+            10 => (
+                C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10,
+                C51_HIGH_OBSERVATION_REPLAY_RANKS_N10.as_slice(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "C51 confirmatory high-observation replay refinement must be 8 or 10",
+                ))
+            }
+        };
+        let config = Self {
+            profile: profile.to_string(),
+            refinements: vec![refinement],
+            ranks: ranks.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            observation_kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Confirmatory `m=4096` accuracy gate. This remains separate from both
     /// the `m=2048` primary decision and the seven-count contextual ladder.
     pub fn high_observation_confirmatory(refinement: usize) -> Result<Self> {
@@ -374,6 +411,8 @@ impl C51SpectralCovarianceRankConfig {
             C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10 => Some(6_130),
             C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8 => Some(3_032),
             C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10 => Some(6_130),
+            C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8 => Some(3_032),
+            C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10 => Some(6_130),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => Some(3_032),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => Some(6_130),
             _ => None,
@@ -404,7 +443,18 @@ impl C51SpectralCovarianceRankConfig {
     fn is_high_observation_replay(&self) -> bool {
         matches!(
             self.profile.as_str(),
-            C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8 | C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10
+            C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8
+                | C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10
+                | C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8
+                | C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10
+        )
+    }
+
+    fn is_high_observation_confirmatory_replay(&self) -> bool {
+        matches!(
+            self.profile.as_str(),
+            C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8
+                | C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10
         )
     }
 
@@ -424,9 +474,14 @@ impl C51SpectralCovarianceRankConfig {
     }
 
     fn high_observation_counts(&self) -> &'static [usize] {
-        if self.is_high_observation_primary() || self.is_high_observation_replay() {
+        if self.is_high_observation_primary()
+            || (self.is_high_observation_replay()
+                && !self.is_high_observation_confirmatory_replay())
+        {
             &[C51_HIGH_OBSERVATION_PRIMARY_COUNT]
-        } else if self.is_high_observation_confirmatory() {
+        } else if self.is_high_observation_confirmatory()
+            || self.is_high_observation_confirmatory_replay()
+        {
             &[C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT]
         } else if self.is_high_observation_accuracy() {
             &C51_HIGH_OBSERVATION_COUNTS
@@ -436,9 +491,14 @@ impl C51SpectralCovarianceRankConfig {
     }
 
     fn covariance_designs(&self) -> &'static [C51CovarianceDesign] {
-        if self.is_high_observation_primary() || self.is_high_observation_replay() {
+        if self.is_high_observation_primary()
+            || (self.is_high_observation_replay()
+                && !self.is_high_observation_confirmatory_replay())
+        {
             &[C51CovarianceDesign::HighM2048]
-        } else if self.is_high_observation_confirmatory() {
+        } else if self.is_high_observation_confirmatory()
+            || self.is_high_observation_confirmatory_replay()
+        {
             &[C51CovarianceDesign::HighM4096]
         } else if self.is_high_observation_accuracy() {
             &C51CovarianceDesign::HIGH_OBSERVATION
@@ -533,6 +593,12 @@ impl C51SpectralCovarianceRankConfig {
                 Some((8, C51_HIGH_OBSERVATION_REPLAY_RANKS_N8.as_slice()))
             }
             C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10 => {
+                Some((10, C51_HIGH_OBSERVATION_REPLAY_RANKS_N10.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8 => {
+                Some((8, C51_HIGH_OBSERVATION_REPLAY_RANKS_N8.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10 => {
                 Some((10, C51_HIGH_OBSERVATION_REPLAY_RANKS_N10.as_slice()))
             }
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => {
@@ -4268,10 +4334,33 @@ mod tests {
         assert_eq!(n10.high_observation_counts(), [2_048]);
         assert!(!n10.is_high_observation_primary());
 
+        let confirmatory_n8 =
+            C51SpectralCovarianceRankConfig::high_observation_confirmatory_replay(8).unwrap();
+        assert_eq!(
+            confirmatory_n8.profile,
+            C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8
+        );
+        assert_eq!(confirmatory_n8.high_observation_counts(), [4_096]);
+        assert_eq!(
+            confirmatory_n8.covariance_designs(),
+            [C51CovarianceDesign::HighM4096]
+        );
+        assert_eq!(confirmatory_n8.ranks.last(), Some(&3_032));
+
+        let confirmatory_n10 =
+            C51SpectralCovarianceRankConfig::high_observation_confirmatory_replay(10).unwrap();
+        assert_eq!(
+            confirmatory_n10.profile,
+            C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10
+        );
+        assert_eq!(confirmatory_n10.high_observation_counts(), [4_096]);
+        assert_eq!(confirmatory_n10.ranks.last(), Some(&4_096));
+
         let mut mutated = n10;
         mutated.ranks.push(4_608);
         assert!(mutated.validate().is_err());
         assert!(C51SpectralCovarianceRankConfig::high_observation_replay(6).is_err());
+        assert!(C51SpectralCovarianceRankConfig::high_observation_confirmatory_replay(6).is_err());
     }
 
     #[test]
