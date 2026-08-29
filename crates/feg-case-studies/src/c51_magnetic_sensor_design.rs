@@ -32,6 +32,10 @@ pub const C51_JUQ_PERFORMANCE_VECTOR_CENTER_COUNT: usize = C51_JUQ_PERFORMANCE_G
 /// Frozen scalar-component capacity in the first JUQ performance design.
 pub const C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT: usize =
     3 * C51_JUQ_PERFORMANCE_VECTOR_CENTER_COUNT;
+/// Immutable direct flux-cochain design used by the C51 computational study.
+pub const C51_FLUX_COCHAIN_DESIGN_ID: &str = "c51-flux-cochain-hashed-split-v1";
+/// Frozen seed for the direct flux-cochain row ordering.
+pub const C51_FLUX_COCHAIN_DESIGN_SEED: u64 = 0xC51F_1A5C_0A17;
 
 const SELECTION_CENTERS: [[f64; 3]; 3] =
     [[0.25, 0.25, 0.25], [0.75, 0.25, 0.75], [0.25, 0.75, 0.75]];
@@ -58,6 +62,48 @@ pub struct C51MagneticObservationPrefix {
     quadrature_normalizations: Vec<f64>,
     scalar_map: LinearMap,
     metadata: C51ScalarObservationPrefixMetadata,
+}
+
+/// Disjoint direct observations and validation outputs of the magnetic flux
+/// cochain `D1 A`.
+///
+/// Each returned row is an exact integral FEEC degree of freedom. The frozen
+/// hash only chooses and orders rows; it performs no pointwise or barycentre
+/// reconstruction.
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51FluxCochainSplit {
+    observation: LinearMap,
+    selection: LinearMap,
+    held_out: LinearMap,
+    observation_indices: Vec<usize>,
+    selection_indices: Vec<usize>,
+    held_out_indices: Vec<usize>,
+}
+
+impl C51FluxCochainSplit {
+    pub fn observation(&self) -> &LinearMap {
+        &self.observation
+    }
+
+    pub fn selection(&self) -> &LinearMap {
+        &self.selection
+    }
+
+    pub fn held_out(&self) -> &LinearMap {
+        &self.held_out
+    }
+
+    pub fn observation_indices(&self) -> &[usize] {
+        &self.observation_indices
+    }
+
+    pub fn selection_indices(&self) -> &[usize] {
+        &self.selection_indices
+    }
+
+    pub fn held_out_indices(&self) -> &[usize] {
+        &self.held_out_indices
+    }
 }
 
 impl C51MagneticObservationPrefix {
@@ -140,6 +186,57 @@ pub fn assemble_juq_performance_observation_prefix(
         scalar_map,
         metadata,
     })
+}
+
+/// Select disjoint exact magnetic flux-cochain rows from a canonical `D1` map.
+pub fn assemble_c51_flux_cochain_split(
+    flux_cochain: &LinearMap,
+    observation_count: usize,
+    selection_count: usize,
+    held_out_count: usize,
+) -> Result<C51FluxCochainSplit> {
+    if observation_count == 0 || selection_count == 0 || held_out_count == 0 {
+        return Err(invalid(
+            "C51 flux-cochain split counts must all be strictly positive",
+        ));
+    }
+    let required = observation_count
+        .checked_add(selection_count)
+        .and_then(|count| count.checked_add(held_out_count))
+        .ok_or_else(|| invalid("C51 flux-cochain split count overflow"))?;
+    if required > flux_cochain.output_dimension() {
+        return Err(invalid(format!(
+            "C51 flux-cochain split requires {required} rows but D1 supplies only {}",
+            flux_cochain.output_dimension()
+        )));
+    }
+
+    let mut ordered = (0..flux_cochain.output_dimension()).collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|&index| {
+        (
+            splitmix64((index as u64) ^ C51_FLUX_COCHAIN_DESIGN_SEED),
+            index,
+        )
+    });
+    let observation_indices = ordered[..observation_count].to_vec();
+    let selection_end = observation_count + selection_count;
+    let selection_indices = ordered[observation_count..selection_end].to_vec();
+    let held_out_indices = ordered[selection_end..required].to_vec();
+    Ok(C51FluxCochainSplit {
+        observation: flux_cochain.select_outputs(&observation_indices)?,
+        selection: flux_cochain.select_outputs(&selection_indices)?,
+        held_out: flux_cochain.select_outputs(&held_out_indices)?,
+        observation_indices,
+        selection_indices,
+        held_out_indices,
+    })
+}
+
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
 }
 
 fn scalar_prefix_metadata(
@@ -362,6 +459,32 @@ mod tests {
         assert_eq!(observations.quadrature_normalizations().len(), 11);
         assert_eq!(observations.scalar_map().output_dimension(), 32);
         assert_eq!(observations.metadata().component_counts, [11, 11, 10]);
+    }
+
+    #[test]
+    fn flux_cochain_split_is_exact_deterministic_and_disjoint() {
+        let flux = LinearMap::new(feec_gmrf::prelude::SparseMat::diagonal(16, 2.0)).unwrap();
+        let first = assemble_c51_flux_cochain_split(&flux, 8, 4, 3).unwrap();
+        let second = assemble_c51_flux_cochain_split(&flux, 8, 4, 3).unwrap();
+        assert_eq!(first, second);
+
+        let all_indices = first
+            .observation_indices()
+            .iter()
+            .chain(first.selection_indices())
+            .chain(first.held_out_indices())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(all_indices.len(), 15);
+
+        let input = (0..16).map(|index| index as f64).collect::<Vec<_>>();
+        let expected = first
+            .observation_indices()
+            .iter()
+            .map(|&index| 2.0 * input[index])
+            .collect::<Vec<_>>();
+        assert_eq!(first.observation().apply(&input).unwrap(), expected);
+        assert!(assemble_c51_flux_cochain_split(&flux, 14, 2, 1).is_err());
     }
 
     fn legacy_observation_kernels(count: usize, radius: f64) -> Result<Vec<WendlandC2Kernel3d>> {

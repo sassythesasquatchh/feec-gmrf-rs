@@ -7,33 +7,35 @@
 
 use crate::c51_benchmark::C51RunMetadata;
 use crate::c51_magnetic_sensor_design::{
-    assemble_juq_performance_observation_prefix, held_out_kernels, selection_kernels,
-    C51_FIXED_OBSERVATION_RADIUS, C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+    assemble_c51_flux_cochain_split, C51_FLUX_COCHAIN_DESIGN_ID, C51_FLUX_COCHAIN_DESIGN_SEED,
 };
-use crate::c51_spectral_covariance_rank::{
-    covariance_error_metrics, C51CovarianceErrorMetrics, C51_PERFORMANCE_OUTPUT_DESIGN_ID,
-};
+use crate::c51_spectral_covariance_rank::{covariance_error_metrics, C51CovarianceErrorMetrics};
 use feec_gmrf::prelude::{
     pullback_quadratic_form, EssentialBoundaryConditions, ExactFormOperators, GaussianNoise,
-    HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearObservation,
-    MagneticVolumeSensorBank3d, MaternAlpha, MaternParameters, MaternPriorBuilder, Result,
-    SupportedMaternPriorBuilder, VarianceMethod,
+    HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearObservation, MaternAlpha,
+    MaternParameters, MaternPriorBuilder, Result, SupportedMaternPriorBuilder, VarianceMethod,
 };
 use manifold::{gen::cartesian::CartesianMeshInfo, geometry::coord::simplex::SimplexHandleExt};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
-pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str = "c51-thesis-normalized-compact-v1";
-pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str = "c51/thesis-normalized-compact-accuracy";
-pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str = "thesis-magnetic-trace-normalized-v1-n8";
+pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str =
+    "c51-thesis-normalized-flux-cochain-v2";
+pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str =
+    "c51/thesis-normalized-flux-cochain-accuracy";
+pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
+    "thesis-magnetic-trace-normalized-flux-cochain-v2-n8";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
-    "thesis-magnetic-trace-normalized-v1-n10";
+    "thesis-magnetic-trace-normalized-flux-cochain-v2-n10";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
+pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
 pub const C51_THESIS_TRACE_PROBES: usize = 512;
 pub const C51_THESIS_TRACE_BATCHES: usize = 8;
 pub const C51_THESIS_TRACE_SEED: u64 = 0xC51B_7ACE;
 pub const C51_THESIS_OBSERVATION_COUNT: usize = 4_096;
+pub const C51_THESIS_SELECTION_FLUX_COUNT: usize = 64;
+pub const C51_THESIS_HELD_OUT_FLUX_COUNT: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct C51ThesisNormalizedCompactConfig {
@@ -43,7 +45,7 @@ pub struct C51ThesisNormalizedCompactConfig {
     pub kappa: f64,
     pub base_tau: f64,
     pub target_b_rms_tesla: f64,
-    pub observation_noise_variance: f64,
+    pub observation_noise_variance_weber_squared: f64,
     pub observation_count: usize,
     pub trace_probes: usize,
     pub trace_batches: usize,
@@ -68,7 +70,8 @@ impl C51ThesisNormalizedCompactConfig {
             kappa: 4.0,
             base_tau: 1.0,
             target_b_rms_tesla: C51_THESIS_TARGET_B_RMS_TESLA,
-            observation_noise_variance: 0.05,
+            observation_noise_variance_weber_squared: C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER
+                .powi(2),
             observation_count: C51_THESIS_OBSERVATION_COUNT,
             trace_probes: C51_THESIS_TRACE_PROBES,
             trace_batches: C51_THESIS_TRACE_BATCHES,
@@ -133,8 +136,8 @@ pub fn run_c51_thesis_normalized_compact(
                 .to_string(),
         )
     })?;
-    let magnetic_energy =
-        pullback_quadratic_form(outgoing.active_derivative(), outgoing.upper().mass())?;
+    let flux_cochain = outgoing.active_derivative().clone();
+    let magnetic_energy = pullback_quadratic_form(&flux_cochain, outgoing.upper().mass())?;
     let magnetic_output_dimension = outgoing.upper().dimension();
     let domain_volume = topology
         .cells()
@@ -177,35 +180,26 @@ pub fn run_c51_thesis_normalized_compact(
         .build()?;
     let compact = raw_compact.with_precision_scale(compact_calibration.precision_scale)?;
 
-    let observations = assemble_juq_performance_observation_prefix(
-        &topology,
-        &coordinates,
+    let flux_split = assemble_c51_flux_cochain_split(
+        &flux_cochain,
         config.observation_count,
+        C51_THESIS_SELECTION_FLUX_COUNT,
+        C51_THESIS_HELD_OUT_FLUX_COUNT,
     )?;
     let observation = LinearObservation::new(
-        observations.scalar_map().clone(),
+        flux_split.observation().clone(),
         vec![0.0; config.observation_count],
-        GaussianNoise::variance(config.observation_noise_variance)?,
-    )?;
-    let selection = MagneticVolumeSensorBank3d::from_feec(
-        &topology,
-        &coordinates,
-        &selection_kernels(C51_FIXED_OBSERVATION_RADIUS)?,
-    )?;
-    let held_out = MagneticVolumeSensorBank3d::from_feec(
-        &topology,
-        &coordinates,
-        &held_out_kernels(C51_FIXED_OBSERVATION_RADIUS)?,
+        GaussianNoise::variance(config.observation_noise_variance_weber_squared)?,
     )?;
 
     let exact_posterior = exact.condition(std::slice::from_ref(&observation), &[])?;
     let mut compact_posterior = LinearGaussianModelBuilder::new(compact)
         .observe(observation)?
         .condition()?;
-    let exact_selection = exact_posterior.pushforward_covariance(selection.map().map())?;
-    let exact_held_out = exact_posterior.pushforward_covariance(held_out.map().map())?;
-    let compact_selection = compact_posterior.pushforward_covariance(selection.map().map())?;
-    let compact_held_out = compact_posterior.pushforward_covariance(held_out.map().map())?;
+    let exact_selection = exact_posterior.pushforward_covariance(flux_split.selection())?;
+    let exact_held_out = exact_posterior.pushforward_covariance(flux_split.held_out())?;
+    let compact_selection = compact_posterior.pushforward_covariance(flux_split.selection())?;
+    let compact_held_out = compact_posterior.pushforward_covariance(flux_split.held_out())?;
 
     Ok(C51ThesisNormalizedCompactReport {
         metadata,
@@ -230,13 +224,16 @@ impl C51ThesisNormalizedCompactReport {
 
     fn write_csv(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,selection_e_f,selection_e_2,selection_e_diag,selection_e_dir,selection_e_corr,selection_e_primary,heldout_e_f,heldout_e_2,heldout_e_diag,heldout_e_dir,heldout_e_corr,heldout_e_primary")?;
-        writeln!(writer, "{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,selection_e_f,selection_e_2,selection_e_diag,selection_e_dir,selection_e_corr,selection_e_primary,heldout_e_f,heldout_e_2,heldout_e_diag,heldout_e_dir,heldout_e_corr,heldout_e_primary")?;
+        writeln!(writer, "{},{},{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
             C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
             self.config.profile,
             self.config.refinement,
             self.state_dimension,
             self.config.observation_count,
+            C51_THESIS_SELECTION_FLUX_COUNT,
+            C51_THESIS_HELD_OUT_FLUX_COUNT,
+            self.config.observation_noise_variance_weber_squared,
             self.config.target_b_rms_tesla,
             self.exact.raw_b_rms,
             self.exact.precision_scale,
@@ -291,16 +288,29 @@ impl C51ThesisNormalizedCompactReport {
         writeln!(writer, "  seed: {}", self.config.trace_seed)?;
         writeln!(
             writer,
-            "observation_design_id: {C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID}"
+            "observation_design_id: {C51_FLUX_COCHAIN_DESIGN_ID}"
         )?;
-        writeln!(
-            writer,
-            "physical_qoi_design_id: {C51_PERFORMANCE_OUTPUT_DESIGN_ID}"
-        )?;
+        writeln!(writer, "qoi_design_id: {C51_FLUX_COCHAIN_DESIGN_ID}")?;
+        writeln!(writer, "cochain_row_semantics: exact_integral_flux_dofs")?;
+        writeln!(writer, "cell_barycenter_reconstruction_used: false")?;
+        writeln!(writer, "row_order_seed: {C51_FLUX_COCHAIN_DESIGN_SEED}")?;
         writeln!(
             writer,
             "observation_count: {}",
             self.config.observation_count
+        )?;
+        writeln!(
+            writer,
+            "selection_flux_count: {C51_THESIS_SELECTION_FLUX_COUNT}"
+        )?;
+        writeln!(
+            writer,
+            "heldout_flux_count: {C51_THESIS_HELD_OUT_FLUX_COUNT}"
+        )?;
+        writeln!(
+            writer,
+            "observation_noise_variance_weber_squared: {:.17e}",
+            self.config.observation_noise_variance_weber_squared
         )?;
         writeln!(
             writer,
