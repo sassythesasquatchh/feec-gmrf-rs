@@ -2,8 +2,9 @@
 //!
 //! Both the exact supported FEEC law and the compact projected-Whitney law are
 //! independently scaled to the same domain-wide RMS of `B = D1 A` in the
-//! degree-2 FEEC mass norm. Sensor rows are used only for conditioning and
-//! held-out evaluation; they never define the amplitude.
+//! degree-2 FEEC mass norm. Training rows, local diagnostics, and fixed surface
+//! flux QoIs pair directly with the integral 2-cochain; none uses pointwise or
+//! cell-barycentre reconstruction, and none defines the amplitude.
 
 use crate::c51_benchmark::C51RunMetadata;
 use crate::c51_magnetic_sensor_design::{
@@ -11,23 +12,30 @@ use crate::c51_magnetic_sensor_design::{
 };
 use crate::c51_spectral_covariance_rank::{covariance_error_metrics, C51CovarianceErrorMetrics};
 use feec_gmrf::prelude::{
-    pullback_quadratic_form, EssentialBoundaryConditions, ExactFormOperators, GaussianNoise,
-    HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearObservation, MaternAlpha,
-    MaternParameters, MaternPriorBuilder, Result, SupportedMaternPriorBuilder, VarianceMethod,
+    axis_aligned_flux_patch_cochain_map_3d, pullback_quadratic_form, AxisAlignedFluxPatch3d,
+    EssentialBoundaryConditions, EssentialBoundaryElimination, ExactFormOperators, GaussianNoise,
+    HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearMap, LinearObservation,
+    MaternAlpha, MaternParameters, MaternPriorBuilder, OutgoingFormOperator, Result,
+    SupportedMaternPriorBuilder, VarianceMethod,
 };
-use manifold::{gen::cartesian::CartesianMeshInfo, geometry::coord::simplex::SimplexHandleExt};
+use manifold::{
+    gen::cartesian::CartesianMeshInfo,
+    geometry::{coord::mesh::MeshCoords, coord::simplex::SimplexHandleExt},
+    topology::complex::Complex,
+};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str =
-    "c51-thesis-normalized-flux-cochain-v3";
+    "c51-thesis-normalized-flux-cochain-v4";
 pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str =
     "c51/thesis-normalized-flux-cochain-accuracy";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v3-n8";
+    "thesis-magnetic-trace-normalized-flux-cochain-v4-n8";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v3-n10";
+    "thesis-magnetic-trace-normalized-flux-cochain-v4-n10";
+pub const C51_SURFACE_FLUX_QOI_DESIGN_ID: &str = "c51-midplane-quadrant-fluxes-v1";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
 pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
 pub const C51_THESIS_TRACE_PROBES: usize = 512;
@@ -100,10 +108,14 @@ pub struct C51ThesisNormalizedCompactReport {
     pub domain_volume: f64,
     pub exact: C51ThesisTraceCalibration,
     pub compact: C51ThesisTraceCalibration,
-    pub prior_selection: C51CovarianceErrorMetrics,
-    pub prior_held_out: C51CovarianceErrorMetrics,
-    pub posterior_selection: C51CovarianceErrorMetrics,
-    pub posterior_held_out: C51CovarianceErrorMetrics,
+    pub local_prior_selection: C51CovarianceErrorMetrics,
+    pub local_prior_held_out: C51CovarianceErrorMetrics,
+    pub local_posterior_selection: C51CovarianceErrorMetrics,
+    pub local_posterior_held_out: C51CovarianceErrorMetrics,
+    pub surface_prior_selection: C51CovarianceErrorMetrics,
+    pub surface_prior_held_out: C51CovarianceErrorMetrics,
+    pub surface_posterior_selection: C51CovarianceErrorMetrics,
+    pub surface_posterior_held_out: C51CovarianceErrorMetrics,
 }
 
 pub fn run_c51_thesis_normalized_compact(
@@ -140,6 +152,8 @@ pub fn run_c51_thesis_normalized_compact(
     })?;
     let flux_cochain = outgoing.active_derivative().clone();
     let magnetic_energy = pullback_quadratic_form(&flux_cochain, outgoing.upper().mass())?;
+    let (surface_selection, surface_held_out) =
+        c51_surface_flux_qois(&topology, &coordinates, outgoing, &flux_cochain)?;
     let magnetic_output_dimension = outgoing.upper().dimension();
     let domain_volume = topology
         .cells()
@@ -200,6 +214,11 @@ pub fn run_c51_thesis_normalized_compact(
     let exact_prior_held_out = exact_prior.pushforward_covariance(flux_split.held_out())?;
     let compact_prior_selection = compact_prior.pushforward_covariance(flux_split.selection())?;
     let compact_prior_held_out = compact_prior.pushforward_covariance(flux_split.held_out())?;
+    let exact_surface_prior_selection = exact_prior.pushforward_covariance(&surface_selection)?;
+    let exact_surface_prior_held_out = exact_prior.pushforward_covariance(&surface_held_out)?;
+    let compact_surface_prior_selection =
+        compact_prior.pushforward_covariance(&surface_selection)?;
+    let compact_surface_prior_held_out = compact_prior.pushforward_covariance(&surface_held_out)?;
 
     let exact_posterior = exact.condition(std::slice::from_ref(&observation), &[])?;
     let mut compact_posterior = LinearGaussianModelBuilder::new(compact)
@@ -209,6 +228,10 @@ pub fn run_c51_thesis_normalized_compact(
     let exact_held_out = exact_posterior.pushforward_covariance(flux_split.held_out())?;
     let compact_selection = compact_posterior.pushforward_covariance(flux_split.selection())?;
     let compact_held_out = compact_posterior.pushforward_covariance(flux_split.held_out())?;
+    let exact_surface_selection = exact_posterior.pushforward_covariance(&surface_selection)?;
+    let exact_surface_held_out = exact_posterior.pushforward_covariance(&surface_held_out)?;
+    let compact_surface_selection = compact_posterior.pushforward_covariance(&surface_selection)?;
+    let compact_surface_held_out = compact_posterior.pushforward_covariance(&surface_held_out)?;
 
     Ok(C51ThesisNormalizedCompactReport {
         metadata,
@@ -219,27 +242,66 @@ pub fn run_c51_thesis_normalized_compact(
         domain_volume,
         exact: exact_calibration,
         compact: compact_calibration,
-        prior_selection: covariance_error_metrics(
+        local_prior_selection: covariance_error_metrics(
             &compact_prior_selection,
             &exact_prior_selection,
         )?,
-        prior_held_out: covariance_error_metrics(&compact_prior_held_out, &exact_prior_held_out)?,
-        posterior_selection: covariance_error_metrics(&compact_selection, &exact_selection)?,
-        posterior_held_out: covariance_error_metrics(&compact_held_out, &exact_held_out)?,
+        local_prior_held_out: covariance_error_metrics(
+            &compact_prior_held_out,
+            &exact_prior_held_out,
+        )?,
+        local_posterior_selection: covariance_error_metrics(&compact_selection, &exact_selection)?,
+        local_posterior_held_out: covariance_error_metrics(&compact_held_out, &exact_held_out)?,
+        surface_prior_selection: covariance_error_metrics(
+            &compact_surface_prior_selection,
+            &exact_surface_prior_selection,
+        )?,
+        surface_prior_held_out: covariance_error_metrics(
+            &compact_surface_prior_held_out,
+            &exact_surface_prior_held_out,
+        )?,
+        surface_posterior_selection: covariance_error_metrics(
+            &compact_surface_selection,
+            &exact_surface_selection,
+        )?,
+        surface_posterior_held_out: covariance_error_metrics(
+            &compact_surface_held_out,
+            &exact_surface_held_out,
+        )?,
     })
 }
 
 impl C51ThesisNormalizedCompactReport {
     pub fn write_directory(&self, directory: &Path) -> Result<()> {
         fs::create_dir_all(directory)?;
-        self.write_csv(&directory.join("summary.csv"))?;
+        self.write_summary_csv(&directory.join("summary.csv"))?;
+        self.write_error_csv(
+            &directory.join("local_flux_cochain_errors.csv"),
+            "local_face_flux_cochains",
+            [
+                ("prior", "selection", &self.local_prior_selection),
+                ("prior", "heldout", &self.local_prior_held_out),
+                ("posterior", "selection", &self.local_posterior_selection),
+                ("posterior", "heldout", &self.local_posterior_held_out),
+            ],
+        )?;
+        self.write_error_csv(
+            &directory.join("surface_flux_errors.csv"),
+            "midplane_quadrant_surface_fluxes",
+            [
+                ("prior", "selection", &self.surface_prior_selection),
+                ("prior", "heldout", &self.surface_prior_held_out),
+                ("posterior", "selection", &self.surface_posterior_selection),
+                ("posterior", "heldout", &self.surface_posterior_held_out),
+            ],
+        )?;
         self.write_manifest(&directory.join("manifest.yaml"))
     }
 
-    fn write_csv(&self, path: &Path) -> Result<()> {
+    fn write_summary_csv(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,prior_selection_e_f,prior_selection_e_2,prior_selection_e_diag,prior_selection_e_dir,prior_selection_e_corr,prior_selection_e_primary,prior_heldout_e_f,prior_heldout_e_2,prior_heldout_e_diag,prior_heldout_e_dir,prior_heldout_e_corr,prior_heldout_e_primary,posterior_selection_e_f,posterior_selection_e_2,posterior_selection_e_diag,posterior_selection_e_dir,posterior_selection_e_corr,posterior_selection_e_primary,posterior_heldout_e_f,posterior_heldout_e_2,posterior_heldout_e_diag,posterior_heldout_e_dir,posterior_heldout_e_corr,posterior_heldout_e_primary")?;
-        writeln!(writer, "{},{},{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{},{},{},{}",
+        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,local_prior_heldout_primary,local_posterior_heldout_primary,surface_prior_heldout_primary,surface_posterior_heldout_primary")?;
+        writeln!(writer, "{},{},{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e}",
             C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
             self.config.profile,
             self.config.refinement,
@@ -257,11 +319,38 @@ impl C51ThesisNormalizedCompactReport {
             self.compact.precision_scale,
             self.compact.tau_multiplier,
             option_float(self.compact.weighted_trace_relative_standard_error),
-            metrics_csv(&self.prior_selection),
-            metrics_csv(&self.prior_held_out),
-            metrics_csv(&self.posterior_selection),
-            metrics_csv(&self.posterior_held_out),
+            self.local_prior_held_out.primary_envelope(),
+            self.local_posterior_held_out.primary_envelope(),
+            self.surface_prior_held_out.primary_envelope(),
+            self.surface_posterior_held_out.primary_envelope(),
         )?;
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_error_csv(
+        &self,
+        path: &Path,
+        qoi_family: &str,
+        rows: [(&str, &str, &C51CovarianceErrorMetrics); 4],
+    ) -> Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        writeln!(
+            writer,
+            "schema_version,profile,qoi_family,stage,split,e_f,e_2,e_diag,e_dir,e_corr,e_primary"
+        )?;
+        for (stage, split, metrics) in rows {
+            writeln!(
+                writer,
+                "{},{},{},{},{},{}",
+                C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
+                self.config.profile,
+                qoi_family,
+                stage,
+                split,
+                metrics_csv(metrics),
+            )?;
+        }
         writer.flush()?;
         Ok(())
     }
@@ -296,7 +385,11 @@ impl C51ThesisNormalizedCompactReport {
             writer,
             "observation_design_id: {C51_FLUX_COCHAIN_DESIGN_ID}"
         )?;
-        writeln!(writer, "qoi_design_id: {C51_FLUX_COCHAIN_DESIGN_ID}")?;
+        writeln!(writer, "local_qoi_design_id: {C51_FLUX_COCHAIN_DESIGN_ID}")?;
+        writeln!(
+            writer,
+            "surface_qoi_design_id: {C51_SURFACE_FLUX_QOI_DESIGN_ID}"
+        )?;
         writeln!(writer, "cochain_row_semantics: exact_integral_flux_dofs")?;
         writeln!(writer, "cell_barycenter_reconstruction_used: false")?;
         writeln!(writer, "row_order_seed: {C51_FLUX_COCHAIN_DESIGN_SEED}")?;
@@ -332,23 +425,43 @@ impl C51ThesisNormalizedCompactReport {
         writeln!(writer, "errors:")?;
         writeln!(
             writer,
-            "  prior_selection_primary: {:.17e}",
-            self.prior_selection.primary_envelope()
+            "  local_prior_selection_primary: {:.17e}",
+            self.local_prior_selection.primary_envelope()
         )?;
         writeln!(
             writer,
-            "  prior_heldout_primary: {:.17e}",
-            self.prior_held_out.primary_envelope()
+            "  local_prior_heldout_primary: {:.17e}",
+            self.local_prior_held_out.primary_envelope()
         )?;
         writeln!(
             writer,
-            "  posterior_selection_primary: {:.17e}",
-            self.posterior_selection.primary_envelope()
+            "  local_posterior_selection_primary: {:.17e}",
+            self.local_posterior_selection.primary_envelope()
         )?;
         writeln!(
             writer,
-            "  posterior_heldout_primary: {:.17e}",
-            self.posterior_held_out.primary_envelope()
+            "  local_posterior_heldout_primary: {:.17e}",
+            self.local_posterior_held_out.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  surface_prior_selection_primary: {:.17e}",
+            self.surface_prior_selection.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  surface_prior_heldout_primary: {:.17e}",
+            self.surface_prior_held_out.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  surface_posterior_selection_primary: {:.17e}",
+            self.surface_posterior_selection.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  surface_posterior_heldout_primary: {:.17e}",
+            self.surface_posterior_held_out.primary_envelope()
         )?;
         writeln!(
             writer,
@@ -384,6 +497,46 @@ impl C51ThesisNormalizedCompactReport {
         writer.flush()?;
         Ok(())
     }
+}
+
+fn c51_surface_flux_qois(
+    topology: &Complex,
+    coordinates: &MeshCoords,
+    outgoing: &OutgoingFormOperator,
+    flux_cochain: &LinearMap,
+) -> Result<(LinearMap, LinearMap)> {
+    let mut patches = Vec::with_capacity(12);
+    for normal_axis in 0..3 {
+        for first_half in 0..2 {
+            for second_half in 0..2 {
+                patches.push(AxisAlignedFluxPatch3d::new(
+                    normal_axis,
+                    0.5,
+                    [
+                        [0.5 * first_half as f64, 0.5 * (first_half + 1) as f64],
+                        [0.5 * second_half as f64, 0.5 * (second_half + 1) as f64],
+                    ],
+                )?);
+            }
+        }
+    }
+    let full_patch_map = axis_aligned_flux_patch_cochain_map_3d(topology, coordinates, &patches)?;
+    let eliminated =
+        EssentialBoundaryElimination::from_layout(outgoing.upper().boundary_layout().clone())?
+            .eliminate_map(&full_patch_map, &vec![0.0; patches.len()])?;
+    if eliminated
+        .fixed_offset()
+        .iter()
+        .any(|offset| *offset != 0.0)
+    {
+        return Err(feec_gmrf::FeecGmrfError::Assembly(
+            "C51 homogeneous surface-flux QoIs acquired a nonzero boundary offset".to_string(),
+        ));
+    }
+    let state_patch_map = eliminated.reduced().compose(flux_cochain)?;
+    let selection = state_patch_map.select_outputs(&[0, 2, 4, 6, 8, 10])?;
+    let held_out = state_patch_map.select_outputs(&[1, 3, 5, 7, 9, 11])?;
+    Ok((selection, held_out))
 }
 
 fn trace_calibration(
@@ -453,5 +606,23 @@ mod tests {
         assert!((calibration.precision_scale - 36.0).abs() < 1.0e-12);
         assert!((calibration.tau_multiplier - 6.0).abs() < 1.0e-12);
         assert!((calibration.normalized_b_rms - 0.10).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn surface_flux_qois_compose_exact_face_integrals_with_active_d1() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0);
+        let (topology, coordinates) = mesh.compute_coord_complex();
+        let metric = coordinates.to_edge_lengths(&topology);
+        let operators =
+            ExactFormOperators::from_feec_homogeneous_full_relative(&topology, &metric, 1).unwrap();
+        let outgoing = operators.outgoing().unwrap();
+        let flux_cochain = outgoing.active_derivative().clone();
+        let (selection, held_out) =
+            c51_surface_flux_qois(&topology, &coordinates, outgoing, &flux_cochain).unwrap();
+
+        assert_eq!(selection.output_dimension(), 6);
+        assert_eq!(held_out.output_dimension(), 6);
+        assert_eq!(selection.input_dimension(), flux_cochain.input_dimension());
+        assert_eq!(held_out.input_dimension(), flux_cochain.input_dimension());
     }
 }
