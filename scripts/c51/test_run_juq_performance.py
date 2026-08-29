@@ -156,6 +156,18 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
             command[command.index("--profile") + 1], campaign.EXACT_PROFILE_NAME
         )
 
+    def test_exact_profile_stops_after_first_ineligible_cell(self):
+        exact = campaign.read_json(SCRIPT_DIR / "juq-exact-performance-v1.json")
+        self.assertFalse(
+            campaign.should_continue_after_cell(exact, {"status": "failed"})
+        )
+        self.assertTrue(
+            campaign.should_continue_after_cell(exact, {"status": "eligible_phase"})
+        )
+        self.assertTrue(
+            campaign.should_continue_after_cell(self.profile, {"status": "failed"})
+        )
+
     def test_selected_primary_tier_requires_only_its_two_rank_decisions(self):
         decisions = {
             campaign.rank_key(refinement, 2048, self.profile): self.decision(

@@ -889,6 +889,14 @@ def summarize_cell(
     return summary
 
 
+def should_continue_after_cell(
+    profile: Mapping[str, Any], summary: Mapping[str, Any]
+) -> bool:
+    return summary.get("status") == "eligible_phase" or bool(
+        profile["execution"]["continue_after_cell_failure"]
+    )
+
+
 def write_combined_rows(path: pathlib.Path, rows: Sequence[Mapping[str, str]]) -> None:
     if not rows:
         return
@@ -1045,6 +1053,7 @@ def execute(
     manifest_path = output / "campaign-manifest.json"
     atomic_write_json(manifest_path, campaign)
     summaries: dict[str, dict[str, Any]] = {}
+    stopped_after_cell_failure = False
     for cell in cells:
         command = cell_command(cell, repository, output, runner, profile)
         process = subprocess.run(
@@ -1071,6 +1080,10 @@ def execute(
         summaries[cell.cell_id] = summary
         campaign["cell_results"].append(summary)
         atomic_write_json(manifest_path, campaign)
+        if not should_continue_after_cell(profile, summary):
+            campaign["stopped_after_cell_id"] = cell.cell_id
+            stopped_after_cell_failure = True
+            break
     paired, combined = pair_results(cells, summaries, output)
     campaign["pair_results"] = paired
     if combined:
@@ -1087,9 +1100,13 @@ def execute(
         "source_changed_during_campaign"
         if final_identity != frozen_identity
         else (
-            "completed"
-            if len(combined) == expected_measured_pairs
-            else "completed_with_censored_or_rejected_cells"
+            "stopped_after_cell_failure"
+            if stopped_after_cell_failure
+            else (
+                "completed"
+                if len(combined) == expected_measured_pairs
+                else "completed_with_censored_or_rejected_cells"
+            )
         )
     )
     atomic_write_json(manifest_path, campaign)
