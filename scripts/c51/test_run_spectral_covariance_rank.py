@@ -163,6 +163,25 @@ class SpectralRankRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires refinement 10"):
             runner.resolve_profile(profile, 8, None)
 
+    def test_replay_profile_stops_at_cached_rank_and_passes_workspace(self):
+        profile = "high-observation-m2048-replay-v1-n10-r4096"
+        resolved = runner.resolve_profile(profile, 10, None)
+        self.assertEqual(resolved["maximum_rank"], 4096)
+        self.assertEqual(resolved["rank_grid"][-3:], [3072, 3584, 4096])
+        self.assertFalse(resolved["rank_decision_required"])
+        workspace = pathlib.Path("/tmp/cached-basis")
+        command = runner.scientific_command(
+            pathlib.Path("/tmp/bin"),
+            profile,
+            10,
+            None,
+            pathlib.Path("/tmp/out/study"),
+            basis_workspace=workspace,
+        )
+        self.assertEqual(command[-2:], ["--basis-workspace", str(workspace)])
+        with self.assertRaisesRegex(ValueError, "requires refinement 10"):
+            runner.resolve_profile(profile, 8, None)
+
     def test_build_is_locked_release_example(self):
         self.assertEqual(
             runner.build_command("cargo"),

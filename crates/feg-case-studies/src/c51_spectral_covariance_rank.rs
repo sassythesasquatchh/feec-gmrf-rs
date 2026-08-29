@@ -18,6 +18,8 @@ use crate::c51_magnetic_sensor_design::{
 use common::linalg::nalgebra::CsrMatrix;
 use common::linalg::nalgebra::Matrix;
 #[cfg(feature = "external-solvers")]
+use common::linalg::petsc::{petsc_read_eigenvals, petsc_read_eigenvecs};
+#[cfg(feature = "external-solvers")]
 use feec_gmrf::prelude::{
     AuditedSupportedCovariance, EssentialBoundaryConditions, ExactFormOperators,
     ExactMaternPriorBuilder, LinearGaussianModelBuilder, LinearObservation, MagneticFieldMaps3d,
@@ -38,7 +40,10 @@ use feec_gmrf::spectral::{
     PartialMixedGeneralizedEigenbasisDiagnostics, PartialMixedGeneralizedEigensolverOptions,
 };
 #[cfg(feature = "external-solvers")]
-use feg_gp::{EigenBasis, SpectralMaternConfig, SpectralMaternGp};
+use feg_gp::{
+    checked_imported_generalized_hodge_eigenbasis, EigenBasis, SpectralMaternConfig,
+    SpectralMaternGp,
+};
 #[cfg(feature = "external-solvers")]
 use manifold::gen::cartesian::CartesianMeshInfo;
 use sha2::{Digest, Sha256};
@@ -69,6 +74,13 @@ pub const C51_HIGH_OBSERVATION_RANKS_N10: [usize; 17] = [
     512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048, 2_560, 3_072, 3_584, 4_096, 4_608, 5_120,
     5_632, 6_000, 6_130,
 ];
+/// Exploratory replay grids backed by already generated, revalidated modes.
+/// They select the next proof-grade rank solve but cannot emit a performance
+/// rank decision themselves.
+pub const C51_HIGH_OBSERVATION_REPLAY_RANKS_N8: [usize; 13] = C51_HIGH_OBSERVATION_RANKS_N8;
+pub const C51_HIGH_OBSERVATION_REPLAY_RANKS_N10: [usize; 12] = [
+    512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048, 2_560, 3_072, 3_584, 4_096,
+];
 
 /// Immutable CLI/archive profile for the `n=8` post-primary extension.
 pub const C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8: &str = "rank-extension-v1-n8";
@@ -81,6 +93,10 @@ pub const C51_HIGH_OBSERVATION_PROFILE_N10: &str = "high-observation-accuracy-v1
 pub const C51_HIGH_OBSERVATION_RATIONALE: &str = "pre-performance accuracy ladder over fixed dimension-independent observation counts; shared spectral basis and exact references are permanently timing ineligible";
 pub const C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8: &str = "high-observation-primary-m2048-v1-n8";
 pub const C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10: &str = "high-observation-primary-m2048-v1-n10";
+pub const C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8: &str =
+    "high-observation-m2048-replay-v1-n8-r3032";
+pub const C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10: &str =
+    "high-observation-m2048-replay-v1-n10-r4096";
 pub const C51_HIGH_OBSERVATION_PRIMARY_COUNT: usize = 2_048;
 pub const C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8: &str =
     "high-observation-confirmatory-m4096-v1-n8";
@@ -250,6 +266,40 @@ impl C51SpectralCovarianceRankConfig {
         Ok(config)
     }
 
+    /// Accuracy-only replay of a previously generated basis. The caller must
+    /// supply the PETSc workspace, whose eigenpairs are re-normalized and
+    /// checked against the currently assembled mass matrix. Replay results are
+    /// exploratory and cannot qualify a performance rank.
+    pub fn high_observation_replay(refinement: usize) -> Result<Self> {
+        let (profile, ranks) = match refinement {
+            8 => (
+                C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8,
+                C51_HIGH_OBSERVATION_REPLAY_RANKS_N8.as_slice(),
+            ),
+            10 => (
+                C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10,
+                C51_HIGH_OBSERVATION_REPLAY_RANKS_N10.as_slice(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "C51 high-observation replay refinement must be 8 or 10",
+                ))
+            }
+        };
+        let config = Self {
+            profile: profile.to_string(),
+            refinements: vec![refinement],
+            ranks: ranks.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            observation_kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Confirmatory `m=4096` accuracy gate. This remains separate from both
     /// the `m=2048` primary decision and the seven-count contextual ladder.
     pub fn high_observation_confirmatory(refinement: usize) -> Result<Self> {
@@ -285,6 +335,8 @@ impl C51SpectralCovarianceRankConfig {
     pub fn evidence_tier(&self) -> &'static str {
         if self.is_high_observation_primary() {
             "high_observation_primary_accuracy"
+        } else if self.is_high_observation_replay() {
+            "high_observation_replay_accuracy_only"
         } else if self.is_high_observation_confirmatory() {
             "high_observation_confirmatory_accuracy"
         } else if self.is_high_observation_accuracy() {
@@ -299,6 +351,8 @@ impl C51SpectralCovarianceRankConfig {
     pub fn post_primary_rationale(&self) -> Option<&'static str> {
         if self.is_high_observation_primary() {
             Some("claim-bearing pre-performance m=2048 rank gate with 5% primary and 2% sensitivity thresholds")
+        } else if self.is_high_observation_replay() {
+            Some("accuracy-only replay of previously generated modes to select the next proof-grade exact-request rank; timing and rank-decision export are forbidden")
         } else if self.is_high_observation_confirmatory() {
             Some("confirmatory pre-performance m=4096 rank gate with the same frozen 5% primary and 2% sensitivity thresholds")
         } else if self.is_high_observation_accuracy() {
@@ -318,6 +372,8 @@ impl C51SpectralCovarianceRankConfig {
             C51_HIGH_OBSERVATION_PROFILE_N10 => Some(6_130),
             C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8 => Some(3_032),
             C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10 => Some(6_130),
+            C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8 => Some(3_032),
+            C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10 => Some(6_130),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => Some(3_032),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => Some(6_130),
             _ => None,
@@ -345,6 +401,13 @@ impl C51SpectralCovarianceRankConfig {
         )
     }
 
+    fn is_high_observation_replay(&self) -> bool {
+        matches!(
+            self.profile.as_str(),
+            C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8 | C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10
+        )
+    }
+
     fn is_high_observation_confirmatory(&self) -> bool {
         matches!(
             self.profile.as_str(),
@@ -355,12 +418,13 @@ impl C51SpectralCovarianceRankConfig {
 
     fn is_any_high_observation(&self) -> bool {
         self.is_high_observation_primary()
+            || self.is_high_observation_replay()
             || self.is_high_observation_confirmatory()
             || self.is_high_observation_accuracy()
     }
 
     fn high_observation_counts(&self) -> &'static [usize] {
-        if self.is_high_observation_primary() {
+        if self.is_high_observation_primary() || self.is_high_observation_replay() {
             &[C51_HIGH_OBSERVATION_PRIMARY_COUNT]
         } else if self.is_high_observation_confirmatory() {
             &[C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT]
@@ -372,7 +436,7 @@ impl C51SpectralCovarianceRankConfig {
     }
 
     fn covariance_designs(&self) -> &'static [C51CovarianceDesign] {
-        if self.is_high_observation_primary() {
+        if self.is_high_observation_primary() || self.is_high_observation_replay() {
             &[C51CovarianceDesign::HighM2048]
         } else if self.is_high_observation_confirmatory() {
             &[C51CovarianceDesign::HighM4096]
@@ -464,6 +528,12 @@ impl C51SpectralCovarianceRankConfig {
             }
             C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10 => {
                 Some((10, C51_HIGH_OBSERVATION_RANKS_N10.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8 => {
+                Some((8, C51_HIGH_OBSERVATION_REPLAY_RANKS_N8.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10 => {
+                Some((10, C51_HIGH_OBSERVATION_REPLAY_RANKS_N10.as_slice()))
             }
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => {
                 Some((8, C51_HIGH_OBSERVATION_RANKS_N8.as_slice()))
@@ -1645,6 +1715,8 @@ impl C51SpectralCovarianceRankArchive {
             )?;
             let decision_scope = if self.config.is_high_observation_primary() {
                 "primary_m2048_only"
+            } else if self.config.is_high_observation_replay() {
+                "exploratory_m2048_replay_no_rank_decision"
             } else if self.config.is_high_observation_confirmatory() {
                 "confirmatory_m4096_only"
             } else {
@@ -1656,6 +1728,8 @@ impl C51SpectralCovarianceRankArchive {
                 "performance_rank_decision_observation_count",
                 if self.config.is_high_observation_primary() {
                     Some(C51_HIGH_OBSERVATION_PRIMARY_COUNT)
+                } else if self.config.is_high_observation_replay() {
+                    None
                 } else if self.config.is_high_observation_confirmatory() {
                     Some(C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT)
                 } else {
@@ -1816,6 +1890,35 @@ pub fn run_c51_spectral_covariance_rank(
     config: &C51SpectralCovarianceRankConfig,
     metadata: C51SpectralCovarianceRankMetadata,
 ) -> Result<C51SpectralCovarianceRankArchive> {
+    run_c51_spectral_covariance_rank_internal(config, metadata, None)
+}
+
+/// Replay a previously generated PETSc eigenbasis for accuracy exploration.
+///
+/// The imported vectors are checked against the current FEEC mass matrix, but
+/// the mixed generalized eigen-equation is not re-certified from the cached
+/// files. Consequently this route is restricted to replay profiles and cannot
+/// emit the rank decision consumed by performance timing.
+#[cfg(feature = "external-solvers")]
+pub fn run_c51_spectral_covariance_rank_replay(
+    config: &C51SpectralCovarianceRankConfig,
+    metadata: C51SpectralCovarianceRankMetadata,
+    petsc_workspace: &Path,
+) -> Result<C51SpectralCovarianceRankArchive> {
+    if !config.is_high_observation_replay() {
+        return Err(invalid(
+            "a precomputed PETSc workspace is accepted only by a C51 replay profile",
+        ));
+    }
+    run_c51_spectral_covariance_rank_internal(config, metadata, Some(petsc_workspace))
+}
+
+#[cfg(feature = "external-solvers")]
+fn run_c51_spectral_covariance_rank_internal(
+    config: &C51SpectralCovarianceRankConfig,
+    metadata: C51SpectralCovarianceRankMetadata,
+    petsc_workspace: Option<&Path>,
+) -> Result<C51SpectralCovarianceRankArchive> {
     config.validate()?;
     let plumbing_gates = [2, 4]
         .into_iter()
@@ -1834,7 +1937,7 @@ pub fn run_c51_spectral_covariance_rank(
         plumbing_gates,
     };
     for &refinement in &config.refinements {
-        run_refinement(config, refinement, &mut archive)?;
+        run_refinement(config, refinement, petsc_workspace, &mut archive)?;
     }
     archive.validate()?;
     Ok(archive)
@@ -1972,6 +2075,7 @@ fn run_full_rank_plumbing_gate(
 fn run_refinement(
     config: &C51SpectralCovarianceRankConfig,
     refinement: usize,
+    petsc_workspace: Option<&Path>,
     archive: &mut C51SpectralCovarianceRankArchive,
 ) -> Result<()> {
     let mesh = CartesianMeshInfo::new_unit_scaled(3, refinement, 1.0);
@@ -2160,14 +2264,12 @@ fn run_refinement(
         return Ok(());
     }
 
-    let partial =
-        match partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
-            &topology,
-            &metric,
-            1,
-            PartialMixedGeneralizedEigensolverOptions::new(requested_rank),
-        ) {
-            Ok(partial) => partial,
+    let basis = if let Some(workspace) = petsc_workspace {
+        match replay_basis_from_workspace(&operators, workspace, requested_rank, refinement) {
+            Ok((basis, attempt)) => {
+                archive.basis_attempts.push(attempt);
+                basis
+            }
             Err(error) => {
                 let reason = error.to_string();
                 archive.basis_attempts.push(C51SpectralBasisAttempt {
@@ -2178,18 +2280,16 @@ fn run_refinement(
                     reason: reason.clone(),
                     diagnostics_status: "unavailable".to_string(),
                     diagnostics_unavailable_reason:
-                        "the mixed eigensolver failed before checked diagnostics were returned"
-                            .to_string(),
+                        "the cached PETSc basis failed import or mass validation".to_string(),
                     mass_orthogonality_certificate_status: "unavailable".to_string(),
-                    mass_orthogonality_certificate_reason: "no checked eigenbasis was returned"
-                        .to_string(),
+                    mass_orthogonality_certificate_reason: reason.clone(),
                     generalized_residual_certificate_status: "unavailable".to_string(),
                     generalized_residual_certificate_reason:
-                        "mixed helper failure returned no residual certificate".to_string(),
+                        "replay never substitutes for a proof-grade residual-validated solve"
+                            .to_string(),
                     external_tool_versions_status: "unavailable".to_string(),
                     external_tool_versions_reason:
-                        "mixed helper failure returned binary context but no tool versions"
-                            .to_string(),
+                        "cached helper execution metadata is not inferred".to_string(),
                     sigma_dimension: None,
                     converged_rank: None,
                     retained_rank: None,
@@ -2198,13 +2298,13 @@ fn run_refinement(
                     d_nonzeros: None,
                     c_nonzeros: None,
                     lower_mass_nonzeros: None,
-                    state_mass_nonzeros: None,
+                    state_mass_nonzeros: Some(operators.state().mass().nnz()),
                     basis_storage_entries: None,
                     basis_storage_bytes: Some(expected_basis_bytes),
                     clamped_negative_eigenvalues: None,
                     eigenpair_selection: None,
                     lower_mass_solve: None,
-                    workspace: None,
+                    workspace: Some(workspace.display().to_string()),
                     binary: None,
                 });
                 append_censored_rows(
@@ -2212,7 +2312,7 @@ fn run_refinement(
                     config,
                     refinement,
                     state_dimension,
-                    "mixed_eigensolve",
+                    "cached_basis_revalidation",
                     &reason,
                 );
                 append_unavailable_compact_for_config(
@@ -2224,11 +2324,78 @@ fn run_refinement(
                 );
                 return Ok(());
             }
-        };
-    archive
-        .basis_attempts
-        .push(successful_basis_attempt(refinement, partial.diagnostics()));
-    let basis = partial.into_basis();
+        }
+    } else {
+        let partial =
+            match partial_mixed_generalized_hodge_eigenbasis_from_feec_homogeneous_full_relative(
+                &topology,
+                &metric,
+                1,
+                PartialMixedGeneralizedEigensolverOptions::new(requested_rank),
+            ) {
+                Ok(partial) => partial,
+                Err(error) => {
+                    let reason = error.to_string();
+                    archive.basis_attempts.push(C51SpectralBasisAttempt {
+                        refinement,
+                        state_dimension,
+                        requested_rank,
+                        status: "censored".to_string(),
+                        reason: reason.clone(),
+                        diagnostics_status: "unavailable".to_string(),
+                        diagnostics_unavailable_reason:
+                            "the mixed eigensolver failed before checked diagnostics were returned"
+                                .to_string(),
+                        mass_orthogonality_certificate_status: "unavailable".to_string(),
+                        mass_orthogonality_certificate_reason: "no checked eigenbasis was returned"
+                            .to_string(),
+                        generalized_residual_certificate_status: "unavailable".to_string(),
+                        generalized_residual_certificate_reason:
+                            "mixed helper failure returned no residual certificate".to_string(),
+                        external_tool_versions_status: "unavailable".to_string(),
+                        external_tool_versions_reason:
+                            "mixed helper failure returned binary context but no tool versions"
+                                .to_string(),
+                        sigma_dimension: None,
+                        converged_rank: None,
+                        retained_rank: None,
+                        input_nonzeros: None,
+                        l_nonzeros: None,
+                        d_nonzeros: None,
+                        c_nonzeros: None,
+                        lower_mass_nonzeros: None,
+                        state_mass_nonzeros: None,
+                        basis_storage_entries: None,
+                        basis_storage_bytes: Some(expected_basis_bytes),
+                        clamped_negative_eigenvalues: None,
+                        eigenpair_selection: None,
+                        lower_mass_solve: None,
+                        workspace: None,
+                        binary: None,
+                    });
+                    append_censored_rows(
+                        archive,
+                        config,
+                        refinement,
+                        state_dimension,
+                        "mixed_eigensolve",
+                        &reason,
+                    );
+                    append_unavailable_compact_for_config(
+                        archive,
+                        config,
+                        refinement,
+                        state_dimension,
+                        &reason,
+                    );
+                    return Ok(());
+                }
+            };
+        archive
+            .basis_attempts
+            .push(successful_basis_attempt(refinement, partial.diagnostics()));
+        partial.into_basis()
+    };
 
     for &alpha in &config.alphas {
         let row_start = archive.rows.len();
@@ -2277,6 +2444,121 @@ fn run_refinement(
         }
     }
     Ok(())
+}
+
+#[cfg(feature = "external-solvers")]
+fn replay_basis_from_workspace(
+    operators: &ExactFormOperators,
+    workspace: &Path,
+    requested_rank: usize,
+    refinement: usize,
+) -> Result<(EigenBasis, C51SpectralBasisAttempt)> {
+    let eigenvalue_path = workspace.join("out/eigenvals.bin");
+    let eigenvector_path = workspace.join("out/eigenvecs_u.bin");
+    let eigenvalues = petsc_read_eigenvals(path_text(&eigenvalue_path)?)
+        .map_err(|error| replay_io_error(&eigenvalue_path, error))?;
+    let eigenvectors = petsc_read_eigenvecs(path_text(&eigenvector_path)?)
+        .map_err(|error| replay_io_error(&eigenvector_path, error))?;
+    let state_dimension = operators.state().dimension();
+    let converged_rank = eigenvalues.len();
+    if eigenvectors.nrows() != state_dimension
+        || eigenvectors.ncols() != converged_rank
+        || converged_rank < requested_rank
+    {
+        return Err(FeecGmrfError::Dimension(format!(
+            "C51 cached basis has eigenvalues {converged_rank}, vectors {}x{}, expected at least {requested_rank} vectors on state dimension {state_dimension}",
+            eigenvectors.nrows(),
+            eigenvectors.ncols()
+        )));
+    }
+    let mass = feg_infer::sparse::core_triplet_to_feec_csr(operators.state().mass());
+    let (basis, maximum_defect, clamped) = checked_imported_generalized_hodge_eigenbasis(
+        eigenvalues,
+        eigenvectors,
+        &mass,
+        1.0e-10,
+        1.0e-8,
+    )
+    .map_err(spectral_error)?;
+    let basis = basis
+        .truncate_smallest(requested_rank)
+        .map_err(spectral_error)?;
+    let entries = state_dimension
+        .checked_mul(requested_rank)
+        .ok_or_else(|| FeecGmrfError::Dimension("C51 replay basis size overflow".to_string()))?;
+    let bytes = entries
+        .checked_mul(std::mem::size_of::<f64>())
+        .ok_or_else(|| FeecGmrfError::Dimension("C51 replay basis bytes overflow".to_string()))?;
+    let eigenvalue_sha = c51_file_sha256(&eigenvalue_path)?;
+    let eigenvector_sha = c51_file_sha256(&eigenvector_path)?;
+    let attempt = C51SpectralBasisAttempt {
+        refinement,
+        state_dimension,
+        requested_rank,
+        status: "replayed_accuracy_only".to_string(),
+        reason: format!(
+            "cached PETSc outputs mass-revalidated; eigenvals_sha256={eigenvalue_sha}; eigenvecs_u_sha256={eigenvector_sha}; maximum_mass_orthogonality_defect={maximum_defect:.17e}; not eligible for timing or rank-decision export"
+        ),
+        diagnostics_status: "measured".to_string(),
+        diagnostics_unavailable_reason: String::new(),
+        mass_orthogonality_certificate_status: "validated".to_string(),
+        mass_orthogonality_certificate_reason: format!(
+            "maximum defect {maximum_defect:.17e} <= 1e-8"
+        ),
+        generalized_residual_certificate_status: "unavailable".to_string(),
+        generalized_residual_certificate_reason:
+            "cached replay is exploratory; the selected production rank must be regenerated by the exact-request residual-validated route"
+                .to_string(),
+        external_tool_versions_status: "unavailable".to_string(),
+        external_tool_versions_reason:
+            "cached helper tool versions are not inferred from binary outputs".to_string(),
+        sigma_dimension: None,
+        converged_rank: Some(converged_rank),
+        retained_rank: Some(requested_rank),
+        input_nonzeros: None,
+        l_nonzeros: None,
+        d_nonzeros: None,
+        c_nonzeros: None,
+        lower_mass_nonzeros: None,
+        state_mass_nonzeros: Some(operators.state().mass().nnz()),
+        basis_storage_entries: Some(entries),
+        basis_storage_bytes: Some(bytes),
+        clamped_negative_eigenvalues: Some(clamped),
+        eigenpair_selection: Some("smallest_cached_replay".to_string()),
+        lower_mass_solve: Some("recorded_direct_not_reexecuted".to_string()),
+        workspace: Some(workspace.display().to_string()),
+        binary: None,
+    };
+    Ok((basis, attempt))
+}
+
+#[cfg(feature = "external-solvers")]
+fn path_text(path: &Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        FeecGmrfError::InvalidParameter(format!(
+            "C51 cached PETSc path is not valid UTF-8: {}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(feature = "external-solvers")]
+fn replay_io_error(path: &Path, error: std::io::Error) -> FeecGmrfError {
+    FeecGmrfError::Io(std::io::Error::new(
+        error.kind(),
+        format!(
+            "could not read cached PETSc output {}: {error}",
+            path.display()
+        ),
+    ))
+}
+
+#[cfg(feature = "external-solvers")]
+fn c51_file_sha256(path: &Path) -> Result<String> {
+    let bytes = fs::read(path)?;
+    let mut digest = Sha256::new();
+    digest.update(&bytes);
+    Ok(format!("{:x}", digest.finalize()))
 }
 
 #[cfg(feature = "external-solvers")]
@@ -3968,6 +4250,28 @@ mod tests {
         }
         assert!(C51SpectralCovarianceRankConfig::high_observation_primary(6).is_err());
         assert!(C51SpectralCovarianceRankConfig::high_observation_confirmatory(6).is_err());
+    }
+
+    #[test]
+    fn replay_profiles_are_accuracy_only_and_stop_at_cached_rank() {
+        let n8 = C51SpectralCovarianceRankConfig::high_observation_replay(8).unwrap();
+        assert_eq!(n8.profile, C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8);
+        assert_eq!(n8.ranks, C51_HIGH_OBSERVATION_REPLAY_RANKS_N8);
+        assert_eq!(n8.ranks.last(), Some(&3_032));
+        assert_eq!(n8.high_observation_counts(), [2_048]);
+        assert_eq!(n8.evidence_tier(), "high_observation_replay_accuracy_only");
+
+        let n10 = C51SpectralCovarianceRankConfig::high_observation_replay(10).unwrap();
+        assert_eq!(n10.profile, C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10);
+        assert_eq!(n10.ranks, C51_HIGH_OBSERVATION_REPLAY_RANKS_N10);
+        assert_eq!(n10.ranks.last(), Some(&4_096));
+        assert_eq!(n10.high_observation_counts(), [2_048]);
+        assert!(!n10.is_high_observation_primary());
+
+        let mut mutated = n10;
+        mutated.ranks.push(4_608);
+        assert!(mutated.validate().is_err());
+        assert!(C51SpectralCovarianceRankConfig::high_observation_replay(6).is_err());
     }
 
     #[test]

@@ -2627,6 +2627,38 @@ fn generalized_hodge_basis_with_mass_orthogonality_certificate(
     Ok((basis, maximum_defect))
 }
 
+/// Validate imported generalized Hodge--Laplacian eigenpairs against the
+/// supplied mass matrix and return a mass-orthonormal basis.
+///
+/// This is intended for replaying an already generated eigenbasis in
+/// accuracy-only studies. It validates eigenvalues, normalizes every vector,
+/// and checks the complete `V^T M V` Gram matrix. It does not certify the
+/// generalized eigen-equation; callers using imported solver output must keep
+/// that provenance distinct from a freshly residual-validated eigensolve.
+#[cfg(feature = "external-solvers")]
+pub fn checked_imported_generalized_hodge_eigenbasis(
+    mut eigenvalues: NaVector,
+    eigenvectors: NaMatrix,
+    mass: &CsrMatrix,
+    eigenvalue_negative_tolerance: f64,
+    mass_orthogonality_tolerance: f64,
+) -> Result<(EigenBasis, f64, usize), GpError> {
+    if !eigenvalue_negative_tolerance.is_finite() || eigenvalue_negative_tolerance < 0.0 {
+        return Err(GpError::InvalidEigenvalueNegativeTolerance);
+    }
+    let clamped = validate_and_clamp_generalized_eigenvalues(
+        &mut eigenvalues,
+        eigenvalue_negative_tolerance,
+    )?;
+    let (basis, maximum_defect) = generalized_hodge_basis_with_mass_orthogonality_certificate(
+        eigenvalues,
+        eigenvectors,
+        mass,
+        mass_orthogonality_tolerance,
+    )?;
+    Ok((basis, maximum_defect, clamped))
+}
+
 #[cfg(feature = "external-solvers")]
 fn maximum_relative_mixed_residual(
     operators: GhepReducedOperators<'_>,
@@ -3716,6 +3748,30 @@ mod tests {
             validate_and_clamp_generalized_eigenvalues(&mut values, 1.0e-10),
             Err(GpError::NonFiniteEigenvalue { .. })
         ));
+    }
+
+    #[cfg(feature = "external-solvers")]
+    #[test]
+    fn imported_basis_is_mass_normalized_and_reports_defect() {
+        let mut mass_coo = CooMatrix::new(2, 2);
+        mass_coo.push(0, 0, 4.0);
+        mass_coo.push(1, 1, 9.0);
+        let mass = CsrMatrix::from(&mass_coo);
+        let eigenvalues = NaVector::from_vec(vec![0.0, -5.0e-11]);
+        let eigenvectors = NaMatrix::identity(2, 2);
+        let (basis, defect, clamped) = checked_imported_generalized_hodge_eigenbasis(
+            eigenvalues,
+            eigenvectors,
+            &mass,
+            1.0e-10,
+            1.0e-12,
+        )
+        .unwrap();
+        assert_eq!(basis.len(), 2);
+        assert_eq!(clamped, 1);
+        assert!(defect <= 1.0e-12);
+        assert!((basis.eigenvectors()[(0, 0)] - 0.5).abs() <= 1.0e-12);
+        assert!((basis.eigenvectors()[(1, 1)] - 1.0 / 3.0).abs() <= 1.0e-12);
     }
 
     #[cfg(feature = "external-solvers")]
