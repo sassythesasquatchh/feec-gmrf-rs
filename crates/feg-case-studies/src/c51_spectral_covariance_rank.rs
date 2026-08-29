@@ -101,6 +101,9 @@ pub const C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8: &str =
     "high-observation-m4096-replay-v1-n8-r3032";
 pub const C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10: &str =
     "high-observation-m4096-replay-v1-n10-r4096";
+pub const C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10: &str =
+    "high-observation-m4096-rank-extension-v1-n10-r4608";
+pub const C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_N10_GRID: [usize; 2] = [4_096, 4_608];
 pub const C51_HIGH_OBSERVATION_PRIMARY_COUNT: usize = 2_048;
 pub const C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8: &str =
     "high-observation-confirmatory-m4096-v1-n8";
@@ -337,6 +340,25 @@ impl C51SpectralCovarianceRankConfig {
         Ok(config)
     }
 
+    /// Fresh post-replay extension resolving the preregistered 2% `m=4096`
+    /// sensitivity rank at `n=10`. The shared 4,608-mode solve is accuracy
+    /// evidence only; production method timing must request the selected rank
+    /// independently.
+    pub fn high_observation_confirmatory_rank_extension_n10() -> Result<Self> {
+        let config = Self {
+            profile: C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10.to_string(),
+            refinements: vec![10],
+            ranks: C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_N10_GRID.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            observation_kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     /// Confirmatory `m=4096` accuracy gate. This remains separate from both
     /// the `m=2048` primary decision and the seven-count contextual ladder.
     pub fn high_observation_confirmatory(refinement: usize) -> Result<Self> {
@@ -376,6 +398,8 @@ impl C51SpectralCovarianceRankConfig {
             "high_observation_replay_accuracy_only"
         } else if self.is_high_observation_confirmatory() {
             "high_observation_confirmatory_accuracy"
+        } else if self.is_high_observation_confirmatory_rank_extension() {
+            "high_observation_confirmatory_rank_extension"
         } else if self.is_high_observation_accuracy() {
             "high_observation_accuracy"
         } else if self.is_rank_extension() {
@@ -392,6 +416,8 @@ impl C51SpectralCovarianceRankConfig {
             Some("accuracy-only replay of previously generated modes to select the next proof-grade exact-request rank; timing and rank-decision export are forbidden")
         } else if self.is_high_observation_confirmatory() {
             Some("confirmatory pre-performance m=4096 rank gate with the same frozen 5% primary and 2% sensitivity thresholds")
+        } else if self.is_high_observation_confirmatory_rank_extension() {
+            Some("fresh post-replay extension of the unresolved preregistered 2% m=4096 n=10 sensitivity rank; shared-basis timing is forbidden")
         } else if self.is_high_observation_accuracy() {
             Some(C51_HIGH_OBSERVATION_RATIONALE)
         } else {
@@ -413,6 +439,7 @@ impl C51SpectralCovarianceRankConfig {
             C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10 => Some(6_130),
             C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8 => Some(3_032),
             C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10 => Some(6_130),
+            C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10 => Some(6_130),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => Some(3_032),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => Some(6_130),
             _ => None,
@@ -458,6 +485,10 @@ impl C51SpectralCovarianceRankConfig {
         )
     }
 
+    fn is_high_observation_confirmatory_rank_extension(&self) -> bool {
+        self.profile == C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10
+    }
+
     fn is_high_observation_confirmatory(&self) -> bool {
         matches!(
             self.profile.as_str(),
@@ -470,6 +501,7 @@ impl C51SpectralCovarianceRankConfig {
         self.is_high_observation_primary()
             || self.is_high_observation_replay()
             || self.is_high_observation_confirmatory()
+            || self.is_high_observation_confirmatory_rank_extension()
             || self.is_high_observation_accuracy()
     }
 
@@ -481,6 +513,7 @@ impl C51SpectralCovarianceRankConfig {
             &[C51_HIGH_OBSERVATION_PRIMARY_COUNT]
         } else if self.is_high_observation_confirmatory()
             || self.is_high_observation_confirmatory_replay()
+            || self.is_high_observation_confirmatory_rank_extension()
         {
             &[C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT]
         } else if self.is_high_observation_accuracy() {
@@ -498,6 +531,7 @@ impl C51SpectralCovarianceRankConfig {
             &[C51CovarianceDesign::HighM2048]
         } else if self.is_high_observation_confirmatory()
             || self.is_high_observation_confirmatory_replay()
+            || self.is_high_observation_confirmatory_rank_extension()
         {
             &[C51CovarianceDesign::HighM4096]
         } else if self.is_high_observation_accuracy() {
@@ -601,6 +635,10 @@ impl C51SpectralCovarianceRankConfig {
             C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10 => {
                 Some((10, C51_HIGH_OBSERVATION_REPLAY_RANKS_N10.as_slice()))
             }
+            C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10 => Some((
+                10,
+                C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_N10_GRID.as_slice(),
+            )),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => {
                 Some((8, C51_HIGH_OBSERVATION_RANKS_N8.as_slice()))
             }
@@ -4316,6 +4354,27 @@ mod tests {
         }
         assert!(C51SpectralCovarianceRankConfig::high_observation_primary(6).is_err());
         assert!(C51SpectralCovarianceRankConfig::high_observation_confirmatory(6).is_err());
+
+        let extension =
+            C51SpectralCovarianceRankConfig::high_observation_confirmatory_rank_extension_n10()
+                .unwrap();
+        assert_eq!(
+            extension.profile,
+            C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10
+        );
+        assert_eq!(
+            extension.ranks,
+            C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_N10_GRID
+        );
+        assert_eq!(extension.high_observation_counts(), [4_096]);
+        assert_eq!(
+            extension.covariance_designs(),
+            [C51CovarianceDesign::HighM4096]
+        );
+        assert_eq!(
+            extension.evidence_tier(),
+            "high_observation_confirmatory_rank_extension"
+        );
     }
 
     #[test]

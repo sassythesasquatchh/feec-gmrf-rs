@@ -111,11 +111,14 @@ def derive_one(attempt: pathlib.Path, perf0_hash: str) -> dict[str, Any]:
     manifest = read_json(manifest_path)
     if manifest.get("outcome") != "completed" or manifest.get("raw_return_code") != 0:
         raise ValueError(f"{attempt} is not a completed replay attempt")
-    if manifest.get("evidence_tier") != "high_observation_replay_accuracy_only":
-        raise ValueError(f"{attempt} is not accuracy-only replay evidence")
+    if manifest.get("evidence_tier") not in {
+        "high_observation_replay_accuracy_only",
+        "high_observation_confirmatory_rank_extension",
+    }:
+        raise ValueError(f"{attempt} is not an admissible m=4096 accuracy attempt")
     profile = str(manifest.get("profile", ""))
-    if "m4096-replay" not in profile:
-        raise ValueError(f"{attempt} is not an m=4096 replay profile")
+    if "m4096" not in profile:
+        raise ValueError(f"{attempt} is not an m=4096 accuracy profile")
     if manifest.get("method_performance_timing_eligible") is not False:
         raise ValueError(f"{attempt} incorrectly marks replay timing eligible")
     study = attempt / "study"

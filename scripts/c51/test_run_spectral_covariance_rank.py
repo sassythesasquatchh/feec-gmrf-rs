@@ -139,6 +139,30 @@ class SpectralRankRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rejects --maximum-rank"):
             runner.resolve_profile("rank-extension-v1-n8", 8, 3032)
 
+    def test_m4096_n10_rank_extension_is_immutable_and_accuracy_only(self):
+        profile = "high-observation-m4096-rank-extension-v1-n10-r4608"
+        resolved = runner.resolve_profile(profile, 10, None)
+        self.assertEqual(resolved["maximum_rank"], 4608)
+        self.assertEqual(resolved["rank_grid"], [4096, 4608])
+        self.assertEqual(resolved["expected_state_dimension"], 6130)
+        self.assertEqual(
+            resolved["evidence_tier"],
+            "high_observation_confirmatory_rank_extension",
+        )
+        self.assertFalse(resolved["rank_decision_required"])
+        command = runner.scientific_command(
+            pathlib.Path("/tmp/bin"),
+            profile,
+            10,
+            None,
+            pathlib.Path("/tmp/out/study"),
+        )
+        self.assertNotIn("--maximum-rank", command)
+        with self.assertRaisesRegex(ValueError, "requires refinement 10"):
+            runner.resolve_profile(profile, 8, None)
+        with self.assertRaisesRegex(ValueError, "rejects --maximum-rank"):
+            runner.resolve_profile(profile, 10, 4608)
+
     def test_high_observation_profile_reaches_n10_full_rank_and_exports_decision(self):
         profile = "high-observation-primary-m2048-v1-n10"
         resolved = runner.resolve_profile(profile, 10, None)

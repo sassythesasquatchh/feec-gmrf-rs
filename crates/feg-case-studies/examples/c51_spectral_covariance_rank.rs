@@ -2,6 +2,7 @@ use feg_case_studies::c51_spectral_covariance_rank::{
     run_c51_spectral_covariance_rank, run_c51_spectral_covariance_rank_replay,
     C51SpectralCovarianceRankConfig, C51SpectralCovarianceRankMetadata,
     C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10, C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8,
+    C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10,
     C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N10,
     C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8, C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10,
     C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8, C51_HIGH_OBSERVATION_PROFILE_N10,
@@ -214,6 +215,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 maximum_rank,
             )?;
             C51SpectralCovarianceRankConfig::high_observation_confirmatory(expected_refinement)?
+        }
+        C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10 => {
+            validate_focused_profile_arguments(&profile, refinement, 10, maximum_rank)?;
+            if basis_workspace.is_some()
+                || rank_decision_output.is_some()
+                || perf0_archive.is_some()
+            {
+                return Err(
+                    "the m=4096 n=10 rank extension accepts no replay or rank-decision artifacts"
+                        .into(),
+                );
+            }
+            C51SpectralCovarianceRankConfig::high_observation_confirmatory_rank_extension_n10()?
         }
         _ => return Err(format!("unknown C51 spectral covariance profile {profile}").into()),
     };

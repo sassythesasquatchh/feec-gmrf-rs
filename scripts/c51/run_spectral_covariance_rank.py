@@ -45,6 +45,12 @@ RANK_EXTENSION_PROFILES = {
         "ranks": (2048, 2560, 3072, 3584, 4096),
         "evidence_tier": "rank_extension",
     },
+    "high-observation-m4096-rank-extension-v1-n10-r4608": {
+        "refinement": 10,
+        "state_dimension": 6130,
+        "ranks": (4096, 4608),
+        "evidence_tier": "high_observation_confirmatory_rank_extension",
+    },
 }
 HIGH_OBSERVATION_PROFILES = {
     "high-observation-primary-m2048-v1-n8": {
