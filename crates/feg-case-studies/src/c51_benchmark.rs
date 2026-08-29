@@ -2968,8 +2968,7 @@ fn base_resource_row(
         ) && config.physical_observation_design
             == C51PhysicalObservationDesign::JuqFixedFootprintPrefix
             && config.physical_output_design
-                == C51PhysicalOutputDesign::RankStudySelectionAndHeldOut
-            && !matches!(method, C51MethodId::FullMetricAugmented),
+                == C51PhysicalOutputDesign::RankStudySelectionAndHeldOut,
         full_uq_workload_eligible: selection.phase == C51ResourcePhase::QueryFullUq
             && !matches!(
                 method,
@@ -5708,6 +5707,34 @@ mod tests {
             assert_eq!(archive.row.method, method);
             assert_eq!(archive.config.selection.phase, C51ResourcePhase::ColdSetup);
         }
+    }
+
+    #[test]
+    fn juq_augmented_cold_setup_is_common_physical_uq_eligible() {
+        let selection = C51ResourceSelection {
+            refinement: 8,
+            observation_class: C51ObservationClass::LocalPhysicalB,
+            sensor_target: C51ResourceSensorTarget::Count(4),
+            repeated_data_count: 1,
+            method: C51MethodId::FullMetricAugmented,
+            spectral_rank: None,
+            phase: C51ResourcePhase::ColdSetup,
+        };
+        let archive = run_c51_resource(
+            &C51ResourceConfig::juq_performance(selection),
+            C51RunMetadata::smoke("juq-augmented-cold-eligibility-test"),
+        )
+        .unwrap();
+        assert!(archive.row.common_physical_uq_workload_eligible);
+        assert!(archive.row.method_performance_timing_eligible);
+        assert_eq!(
+            archive.row.observation_design_id,
+            C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID
+        );
+        assert_eq!(
+            archive.row.physical_qoi_design_id,
+            C51PhysicalOutputDesign::RankStudySelectionAndHeldOut.as_str()
+        );
     }
 
     #[cfg(not(feature = "external-solvers"))]

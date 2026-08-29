@@ -98,6 +98,8 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
         profile_path = SCRIPT_DIR / "juq-exact-performance-v1.json"
         profile = campaign.read_json(profile_path)
         campaign.validate_profile(profile)
+        self.assertEqual(profile["execution"]["cgroup_mode"], "auto")
+        self.assertFalse(profile["execution"]["continue_after_cell_failure"])
         decisions = []
         for refinement in (8, 10):
             decision = self.decision(refinement, 4096)

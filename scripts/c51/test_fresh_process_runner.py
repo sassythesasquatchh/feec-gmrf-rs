@@ -131,6 +131,19 @@ class FreshProcessRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "cgroup-mode required"):
             runner.validate_publication_peak_rss_mode("juq-performance-v1", "auto")
 
+        macos_peak = runner.measured(
+            4096, "bytes", "macos_bsd_time_maximum_rss"
+        )
+        runner.validate_publication_peak_source(
+            "juq-exact-performance-v1", macos_peak
+        )
+        with self.assertRaisesRegex(ValueError, "not one of"):
+            runner.validate_publication_peak_source("juq-performance-v1", macos_peak)
+        runner.validate_publication_peak_source(
+            "juq-performance-v1",
+            runner.measured(4096, "bytes", "cgroup_v2_memory_peak"),
+        )
+
     def test_low_rank_resource_build_requires_external_solver_feature(self):
         spectral = self.resource_selection(method="spectral_low_rank")
         spectral["spectral_rank"] = 2048

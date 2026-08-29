@@ -120,7 +120,10 @@ EXPECTED_EXECUTION = {
     "require_clean_recursive_source": True,
     "fresh_process_per_method_phase_cell": True,
 }
-EXACT_EXPECTED_EXECUTION = EXPECTED_EXECUTION | {"cgroup_mode": "auto"}
+EXACT_EXPECTED_EXECUTION = EXPECTED_EXECUTION | {
+    "cgroup_mode": "auto",
+    "continue_after_cell_failure": False,
+}
 PAIR_QUERY_MEASUREMENTS = {
     "repeated_data_ns",
     "physical_qoi_ns",

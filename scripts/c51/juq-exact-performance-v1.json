@@ -46,7 +46,7 @@
     "deterministic_randomization_seed": 849348622,
     "threads": 1,
     "cgroup_mode": "auto",
-    "continue_after_cell_failure": true,
+    "continue_after_cell_failure": false,
     "require_clean_recursive_source": true,
     "fresh_process_per_method_phase_cell": true
   },

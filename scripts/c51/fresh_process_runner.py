@@ -872,6 +872,7 @@ def attach_peak_rss_to_resource_row(
     peak_rss: Mapping[str, Any],
     *,
     require_performance_eligible: bool = False,
+    publication_profile: str | None = None,
 ) -> dict[str, Any]:
     try:
         with rows_path.open("r", encoding="utf-8", newline="") as stream:
@@ -927,12 +928,7 @@ def attach_peak_rss_to_resource_row(
             raise ValueError(
                 "resource row is performance-ineligible: " + "; ".join(reasons)
             )
-        if peak_rss.get("status") != "measured":
-            raise ValueError("publication resource row has no measured process-tree peak RSS")
-        if peak_rss.get("source") != "cgroup_v2_memory_peak":
-            raise ValueError(
-                "publication resource row requires cgroup-v2 process-tree memory.peak"
-            )
+        validate_publication_peak_source(publication_profile, peak_rss)
     if peak_rss.get("status") != "measured":
         return unavailable(
             "method-phase RSS was not attached because no measured peak was available"
@@ -975,6 +971,24 @@ def attach_peak_rss_to_resource_row(
         "rows_csv": str(rows_path),
         "measurement_field": measurement_name,
     }
+
+
+def validate_publication_peak_source(
+    profile: str | None, peak_rss: Mapping[str, Any]
+) -> None:
+    if peak_rss.get("status") != "measured":
+        raise ValueError("publication resource row has no measured process-tree peak RSS")
+    source = peak_rss.get("source")
+    if profile == "juq-performance-v1":
+        allowed = {"cgroup_v2_memory_peak"}
+    elif profile == "juq-exact-performance-v1":
+        allowed = {"cgroup_v2_memory_peak", "macos_bsd_time_maximum_rss"}
+    else:
+        raise ValueError(f"unknown publication profile for peak-RSS policy: {profile!r}")
+    if source not in allowed:
+        raise ValueError(
+            f"{profile} peak-RSS source {source!r} is not one of {sorted(allowed)}"
+        )
 
 
 def performance_ineligibility_reasons(
@@ -1226,6 +1240,9 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
                 selection,
                 result.manifest["peak_rss_archive_process"],
                 require_performance_eligible=args.profile in PUBLICATION_PROFILES,
+                publication_profile=(
+                    args.profile if args.profile in PUBLICATION_PROFILES else None
+                ),
             )
         elif selection is not None:
             result.manifest["peak_rss_row_attribution"] = unavailable(
