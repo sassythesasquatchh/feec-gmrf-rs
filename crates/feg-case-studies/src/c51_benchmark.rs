@@ -15,18 +15,21 @@
 //! only and are not evidence of a performance advantage.
 
 use crate::c51_magnetic_sensor_design::{
-    assemble_juq_performance_observation_prefix, held_out_kernels, selection_kernels,
-    C51_FIXED_OBSERVATION_RADIUS, C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT,
-    C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+    assemble_c51_active_flux_cochain_map, assemble_c51_flux_cochain_split,
+    assemble_c51_surface_flux_split, assemble_juq_performance_observation_prefix, held_out_kernels,
+    selection_kernels, C51_FIXED_OBSERVATION_RADIUS, C51_FLUX_COCHAIN_DESIGN_ID,
+    C51_FLUX_COCHAIN_HELD_OUT_COUNT, C51_FLUX_COCHAIN_SELECTION_COUNT,
+    C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT, C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+    C51_SURFACE_FLUX_QOI_DESIGN_ID,
 };
 use common::linalg::nalgebra::CsrMatrix as FeecCsrMatrix;
 use feec_gmrf::prelude::{
-    calibrate_prior_to_physical_rms, CholeskyOrderingKind, EssentialBoundaryConditions,
-    EssentialBoundaryElimination, ExactFormOperators, ExactMaternPriorBuilder,
-    ExactObservationCovarianceBlocks, ExactObservationCovarianceProvenance,
-    ExactObservationPosterior, FeecGmrfError, GaussianNoise, GaussianPrior,
-    LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d, MaternAlpha,
-    MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
+    calibrate_prior_to_physical_rms, AdjacentMaternPriorBuilder, CholeskyOrderingKind,
+    EssentialBoundaryConditions, EssentialBoundaryElimination, ExactFormOperators,
+    ExactMaternPriorBuilder, ExactObservationCovarianceBlocks,
+    ExactObservationCovarianceProvenance, ExactObservationPosterior, FeecGmrfError, GaussianNoise,
+    GaussianPrior, LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d,
+    MaternAlpha, MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
     SupportedMaternPrior, SupportedMaternPriorBuilder, VarianceMethod,
 };
 #[cfg(feature = "external-solvers")]
@@ -56,7 +59,7 @@ use std::time::{Duration, Instant};
 const C51_CALIBRATION_SELECTION_OUTPUT_COUNT: usize = 9;
 
 pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v7";
-pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v4";
+pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v5";
 pub const C51_STUDY_ID: &str = "c51/accuracy-resource";
 
 const EXACT_REFERENCE_MAXIMUM_DIMENSION: usize = 1_024;
@@ -77,6 +80,16 @@ const EXACT_REQUESTED_MIXED_EIGENVALUE_NEGATIVE_TOLERANCE: f64 = 1.0e-10;
 pub const C51_CLAIM_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT: f64 = 0.05;
 pub const C51_SENSITIVITY_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT: f64 = 0.02;
 pub const C51_CONTEXT_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT: f64 = 0.10;
+
+// Frozen from clean direct-cochain accuracy archives at parent `5eef534`.
+const C51_INTEGRAL_FLUX_EXACT_TAU_N8: f64 = 17.652_314_257_032_09;
+const C51_INTEGRAL_FLUX_EXACT_TAU_N10: f64 = 20.453_086_423_392_97;
+const C51_INTEGRAL_FLUX_COMPACT_TRACE_TAU_N8: f64 = 22.641_722_540_142_85;
+const C51_INTEGRAL_FLUX_COMPACT_TRACE_TAU_N10: f64 = 26.051_269_480_098_004;
+const C51_INTEGRAL_FLUX_POSTERIOR_SCALE_N8: f64 = 0.911_588_783_318_580_1;
+const C51_INTEGRAL_FLUX_POSTERIOR_SCALE_N10: f64 = 0.808_522_246_426_985_3;
+const C51_INTEGRAL_FLUX_TARGET_POSTERIOR_RMS_N8: f64 = 9.619_759_447_761_718e-4;
+const C51_INTEGRAL_FLUX_TARGET_POSTERIOR_RMS_N10: f64 = 1.008_755_891_127_561_6e-3;
 
 /// A resource or accuracy quantity with explicit availability semantics.
 #[derive(Debug, Clone, PartialEq)]
@@ -144,6 +157,7 @@ pub enum C51MethodId {
     FullMetricAugmented,
     WhitneyCompact,
     WhitneyCompactCalibrated,
+    WhitneyCompactIntegralFluxCalibrated,
     ExactObservationSpaceGp,
     SpectralFullRank,
     SpectralLowRank,
@@ -156,6 +170,9 @@ impl C51MethodId {
             Self::FullMetricAugmented => "fm_aug",
             Self::WhitneyCompact => "whitney_compact",
             Self::WhitneyCompactCalibrated => "whitney_compact_calibrated",
+            Self::WhitneyCompactIntegralFluxCalibrated => {
+                "whitney_compact_integral_flux_calibrated"
+            }
             Self::ExactObservationSpaceGp => "exact_observation_gp",
             Self::SpectralFullRank => "spectral_full_rank",
             Self::SpectralLowRank => "spectral_low_rank",
@@ -172,6 +189,9 @@ pub enum C51PhysicalObservationDesign {
     /// Frozen, nested Wendland-C2 volume sensors with fixed physical radius.
     /// The scalar count is independent of the latent dimension.
     JuqFixedFootprintPrefix,
+    /// Deterministic prefix of exact face-integral rows of the active `D1`
+    /// magnetic flux cochain.
+    FluxCochainHashedPrefix,
 }
 
 impl C51PhysicalObservationDesign {
@@ -179,6 +199,7 @@ impl C51PhysicalObservationDesign {
         match self {
             Self::LegacyCellRows => "legacy_cellwise_b_rows",
             Self::JuqFixedFootprintPrefix => C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+            Self::FluxCochainHashedPrefix => C51_FLUX_COCHAIN_DESIGN_ID,
         }
     }
 }
@@ -191,6 +212,8 @@ pub enum C51PhysicalOutputDesign {
     /// The independent selection and held-out fixed-footprint banks used by
     /// the spectral-rank study (nine scalar outputs per bank).
     RankStudySelectionAndHeldOut,
+    /// Six calibration and six held-out mid-plane quadrant flux integrals.
+    MidplaneQuadrantSurfaceFluxSplit,
 }
 
 impl C51PhysicalOutputDesign {
@@ -200,6 +223,7 @@ impl C51PhysicalOutputDesign {
             Self::RankStudySelectionAndHeldOut => {
                 "rank_study_selection_and_held_out_wendland_c2_18"
             }
+            Self::MidplaneQuadrantSurfaceFluxSplit => C51_SURFACE_FLUX_QOI_DESIGN_ID,
         }
     }
 }
@@ -208,6 +232,7 @@ impl C51PhysicalOutputDesign {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C51ObservationClass {
     LocalPhysicalB,
+    LocalFluxCochain,
     LocalSelectors,
     GlobalRow,
 }
@@ -216,6 +241,7 @@ impl C51ObservationClass {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::LocalPhysicalB => "local_physical_b",
+            Self::LocalFluxCochain => "local_flux_cochain",
             Self::LocalSelectors => "local_selectors",
             Self::GlobalRow => "global_row",
         }
@@ -354,6 +380,11 @@ pub struct C51ResourceConfig {
     /// Frozen exact-FEEC prior RMS on the nine-output selection bank. Required
     /// only by the physically calibrated projected-Whitney resource method.
     pub projected_calibration_target_prior_rms: Option<f64>,
+    /// Frozen coherent posterior-QoI precision scale for the direct integral
+    /// flux study. It is applied after the submitted trace normalization.
+    pub projected_integral_flux_posterior_precision_scale: Option<f64>,
+    /// Selection-bank posterior RMS that produced the frozen precision scale.
+    pub projected_integral_flux_target_posterior_rms: Option<f64>,
 }
 
 impl C51ResourceConfig {
@@ -378,6 +409,8 @@ impl C51ResourceConfig {
             posterior_sample_count: smoke.posterior_sample_count,
             seed: smoke.seed,
             projected_calibration_target_prior_rms: None,
+            projected_integral_flux_posterior_precision_scale: None,
+            projected_integral_flux_target_posterior_rms: None,
         }
     }
 
@@ -406,7 +439,70 @@ impl C51ResourceConfig {
             posterior_sample_count: performance.posterior_sample_count,
             seed: performance.seed,
             projected_calibration_target_prior_rms: None,
+            projected_integral_flux_posterior_precision_scale: None,
+            projected_integral_flux_target_posterior_rms: None,
         }
+    }
+
+    /// Claim-bearing exact-cochain resource configuration.
+    ///
+    /// This freezes the observation density, submitted magnetic trace
+    /// normalization, and any method-specific amplitude selected in the clean
+    /// direct-cochain accuracy archive. The offline calibration search is not
+    /// repeated inside timed method processes.
+    pub fn juq_integral_flux_performance(selection: C51ResourceSelection) -> Result<Self> {
+        let (expected_observations, exact_tau, compact_tau, posterior_scale, target_rms) =
+            match selection.refinement {
+                8 => (
+                    4_096,
+                    C51_INTEGRAL_FLUX_EXACT_TAU_N8,
+                    C51_INTEGRAL_FLUX_COMPACT_TRACE_TAU_N8,
+                    C51_INTEGRAL_FLUX_POSTERIOR_SCALE_N8,
+                    C51_INTEGRAL_FLUX_TARGET_POSTERIOR_RMS_N8,
+                ),
+                10 => (
+                    8_192,
+                    C51_INTEGRAL_FLUX_EXACT_TAU_N10,
+                    C51_INTEGRAL_FLUX_COMPACT_TRACE_TAU_N10,
+                    C51_INTEGRAL_FLUX_POSTERIOR_SCALE_N10,
+                    C51_INTEGRAL_FLUX_TARGET_POSTERIOR_RMS_N10,
+                ),
+                refinement => {
+                    return Err(FeecGmrfError::InvalidParameter(format!(
+                        "the frozen integral-flux resource profile has no refinement {refinement}"
+                    )))
+                }
+            };
+        if selection.observation_class != C51ObservationClass::LocalFluxCochain
+            || selection.sensor_target != C51ResourceSensorTarget::Count(expected_observations)
+        {
+            return Err(FeecGmrfError::InvalidParameter(format!(
+                "the refinement-{} integral-flux profile requires exactly {} local flux-cochain observations",
+                selection.refinement, expected_observations
+            )));
+        }
+        let (tau, frozen_scale, frozen_target) = match selection.method {
+            C51MethodId::WhitneyCompact => (compact_tau, None, None),
+            C51MethodId::WhitneyCompactIntegralFluxCalibrated => {
+                (compact_tau, Some(posterior_scale), Some(target_rms))
+            }
+            C51MethodId::WhitneyCompactCalibrated => {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "the legacy prior-RMS calibrated compact method is not part of the direct integral-flux profile"
+                        .to_string(),
+                ))
+            }
+            _ => (exact_tau, None, None),
+        };
+        let mut config = Self::juq_performance(selection);
+        config.physical_observation_design = C51PhysicalObservationDesign::FluxCochainHashedPrefix;
+        config.physical_output_design = C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit;
+        config.tau = tau;
+        config.observation_noise_variance = 2.5e-7;
+        config.projected_integral_flux_posterior_precision_scale = frozen_scale;
+        config.projected_integral_flux_target_posterior_rms = frozen_target;
+        config.validate()?;
+        Ok(config)
     }
 
     fn benchmark_config(&self) -> C51BenchmarkConfig {
@@ -448,28 +544,45 @@ impl C51ResourceConfig {
         match (
             self.selection.method,
             self.projected_calibration_target_prior_rms,
+            self.projected_integral_flux_posterior_precision_scale,
+            self.projected_integral_flux_target_posterior_rms,
         ) {
-            (C51MethodId::WhitneyCompactCalibrated, Some(value))
+            (C51MethodId::WhitneyCompactCalibrated, Some(value), None, None)
                 if value.is_finite() && value > 0.0 => {}
-            (C51MethodId::WhitneyCompactCalibrated, _) => {
+            (
+                C51MethodId::WhitneyCompactIntegralFluxCalibrated,
+                None,
+                Some(scale),
+                Some(target),
+            ) if scale.is_finite() && scale > 0.0 && target.is_finite() && target > 0.0 => {}
+            (C51MethodId::WhitneyCompactCalibrated, _, _, _) => {
                 return Err(FeecGmrfError::InvalidParameter(
                     "the calibrated projected-Whitney method requires a positive finite frozen target prior RMS"
                         .to_string(),
                 ));
             }
-            (_, None) => {}
-            (_, Some(_)) => {
+            (C51MethodId::WhitneyCompactIntegralFluxCalibrated, _, _, _) => {
                 return Err(FeecGmrfError::InvalidParameter(
-                    "a projected calibration target is valid only for the calibrated projected-Whitney method"
+                    "the calibrated integral-flux method requires a positive frozen posterior precision scale and target RMS"
+                        .to_string(),
+                ));
+            }
+            (_, None, None, None) => {}
+            _ => {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "projected calibration metadata is valid only for its matching calibrated method"
                         .to_string(),
                 ));
             }
         }
         if self.selection.method == C51MethodId::ExactObservationSpaceGp
-            && self.selection.observation_class != C51ObservationClass::LocalPhysicalB
+            && !matches!(
+                self.selection.observation_class,
+                C51ObservationClass::LocalPhysicalB | C51ObservationClass::LocalFluxCochain
+            )
         {
             return Err(FeecGmrfError::InvalidParameter(
-                "the exact observation-space GP resource method requires the common local physical-B design"
+                "the exact observation-space GP resource method requires a common local physical design"
                     .to_string(),
             ));
         }
@@ -790,6 +903,27 @@ impl C51BenchmarkConfig {
         {
             return Err(FeecGmrfError::InvalidParameter(
                 "legacy smoke observations require the legacy central-region physical output"
+                    .to_string(),
+            ));
+        }
+        if self.physical_observation_design == C51PhysicalObservationDesign::FluxCochainHashedPrefix
+        {
+            if self.physical_output_design
+                != C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit
+                || self.include_global_row
+                || self.include_local_selectors
+                || !self.local_sensor_density_targets.is_empty()
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "the direct flux-cochain profile requires exact surface-flux outputs and absolute local flux counts only"
+                        .to_string(),
+                ));
+            }
+        } else if self.physical_output_design
+            == C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "the integral surface-flux output design requires direct flux-cochain observations"
                     .to_string(),
             ));
         }
@@ -1328,6 +1462,24 @@ impl C51BenchmarkArchive {
             "  physical_output_design: {}",
             yaml_scalar(self.config.physical_output_design.as_str())
         )?;
+        if self.config.physical_observation_design
+            == C51PhysicalObservationDesign::FluxCochainHashedPrefix
+        {
+            writeln!(writer, "  cochain_row_semantics: exact_integral_flux_dofs")?;
+            writeln!(writer, "  physical_chain: A_active_to_D1_to_B_flux_cochain")?;
+            writeln!(writer, "  cell_barycenter_reconstruction_used: false")?;
+            writeln!(
+                writer,
+                "  prior_normalization: frozen_thesis_domain_averaged_M2_D1_Qinv_D1T"
+            )?;
+            writeln!(writer, "  normalization_source_parent_commit: 5eef534")?;
+        } else {
+            writeln!(writer, "  cochain_row_semantics: null")?;
+            writeln!(writer, "  physical_chain: reconstructed_physical_outputs")?;
+            writeln!(writer, "  cell_barycenter_reconstruction_used: true")?;
+            writeln!(writer, "  prior_normalization: profile_defined")?;
+            writeln!(writer, "  normalization_source_parent_commit: null")?;
+        }
         writeln!(
             writer,
             "  refinements: {}",
@@ -1538,6 +1690,17 @@ impl C51ResourceArchive {
                     .to_string(),
             ));
         }
+        if self.config.physical_observation_design
+            == C51PhysicalObservationDesign::FluxCochainHashedPrefix
+            && (self.row.observation_design_id != C51_FLUX_COCHAIN_DESIGN_ID
+                || self.row.physical_qoi_design_id != C51_SURFACE_FLUX_QOI_DESIGN_ID
+                || self.row.physical_qoi_output_count != 12)
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 integral-flux resource row did not retain the frozen cochain observation/output designs"
+                    .to_string(),
+            ));
+        }
         if selection.method == C51MethodId::WhitneyCompactCalibrated {
             let measured = |measurement: &C51Measurement<f64>| matches!(measurement, C51Measurement::Measured(value) if value.is_finite() && *value > 0.0);
             if self.row.amplitude_calibration_policy
@@ -1560,6 +1723,46 @@ impl C51ResourceArchive {
                 if (tau_multiplier.powi(2) - *scale).abs() > 1.0e-12 * *scale {
                     return Err(FeecGmrfError::InvalidParameter(
                         "C51 calibrated projected precision and tau scales disagree".to_string(),
+                    ));
+                }
+            }
+        } else if selection.method == C51MethodId::WhitneyCompactIntegralFluxCalibrated {
+            let measured = |measurement: &C51Measurement<f64>| matches!(measurement, C51Measurement::Measured(value) if value.is_finite() && *value > 0.0);
+            if self.row.amplitude_calibration_policy
+                != "frozen_exact_reference_posterior_surface_flux_rms_by_prior_precision"
+                || self.row.amplitude_calibration_target_prior_rms != C51Measurement::NotRecorded
+                || self.row.amplitude_calibration_uncalibrated_prior_rms
+                    != C51Measurement::NotRecorded
+                || !measured(&self.row.amplitude_calibration_precision_scale)
+                || !measured(&self.row.amplitude_calibration_tau_multiplier)
+                || !matches!(
+                    &self.row.amplitude_calibration_ns,
+                    C51Measurement::Unavailable { .. }
+                )
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "C51 integral-flux calibrated resource row is missing frozen calibration provenance"
+                        .to_string(),
+                ));
+            }
+            if let (C51Measurement::Measured(scale), C51Measurement::Measured(tau_multiplier)) = (
+                &self.row.amplitude_calibration_precision_scale,
+                &self.row.amplitude_calibration_tau_multiplier,
+            ) {
+                if (tau_multiplier.powi(2) - *scale).abs() > 1.0e-12 * *scale {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "C51 integral-flux calibrated precision and tau scales disagree"
+                            .to_string(),
+                    ));
+                }
+                let expected = self
+                    .config
+                    .projected_integral_flux_posterior_precision_scale
+                    .expect("validated calibrated integral-flux scale");
+                if (*scale - expected).abs() > 1.0e-15 * expected {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "C51 integral-flux resource row did not apply its frozen precision scale"
+                            .to_string(),
                     ));
                 }
             }
@@ -1739,10 +1942,34 @@ impl C51ResourceArchive {
             Some(value) => writeln!(writer, "  frozen_target_prior_rms: {value:.17e}")?,
             None => writeln!(writer, "  frozen_target_prior_rms: null")?,
         }
-        writeln!(writer, "  stage: prior_before_conditioning")?;
+        match self.config.projected_integral_flux_target_posterior_rms {
+            Some(value) => writeln!(writer, "  frozen_target_posterior_rms: {value:.17e}")?,
+            None => writeln!(writer, "  frozen_target_posterior_rms: null")?,
+        }
+        match self
+            .config
+            .projected_integral_flux_posterior_precision_scale
+        {
+            Some(value) => writeln!(writer, "  frozen_posterior_precision_scale: {value:.17e}")?,
+            None => writeln!(writer, "  frozen_posterior_precision_scale: null")?,
+        }
+        if selection.method == C51MethodId::WhitneyCompactIntegralFluxCalibrated {
+            writeln!(
+                writer,
+                "  stage: prior_precision_scaled_before_conditioning_from_frozen_posterior_target"
+            )?;
+            writeln!(writer, "  source_parent_commit: 5eef534")?;
+        } else {
+            writeln!(writer, "  stage: prior_before_conditioning")?;
+            writeln!(writer, "  source_parent_commit: null")?;
+        }
         writeln!(writer, "  calibration_bank: selection")?;
         writeln!(writer, "  held_out_used_for_calibration: false")?;
-        writeln!(writer, "  cost_included_in_prior_build_ns: true")?;
+        writeln!(
+            writer,
+            "  cost_included_in_prior_build_ns: {}",
+            selection.method != C51MethodId::WhitneyCompactIntegralFluxCalibrated
+        )?;
         writeln!(
             writer,
             "accuracy_status: {}",
@@ -1926,12 +2153,16 @@ pub fn run_c51_resource(
     let selection = &config.selection;
     if matches!(
         selection.method,
-        C51MethodId::WhitneyCompact | C51MethodId::WhitneyCompactCalibrated
+        C51MethodId::WhitneyCompact
+            | C51MethodId::WhitneyCompactCalibrated
+            | C51MethodId::WhitneyCompactIntegralFluxCalibrated
     ) {
         let mut row = run_isolated_compact_resource(
             &benchmark,
             selection,
             config.projected_calibration_target_prior_rms,
+            config.projected_integral_flux_posterior_precision_scale,
+            config.projected_integral_flux_target_posterior_rms,
         )?;
         mark_resource_accuracy_unavailable(&mut row);
         let archive = C51ResourceArchive {
@@ -1969,7 +2200,9 @@ pub fn run_c51_resource(
                 selection,
             )?
         }
-        C51MethodId::WhitneyCompact | C51MethodId::WhitneyCompactCalibrated => {
+        C51MethodId::WhitneyCompact
+        | C51MethodId::WhitneyCompactCalibrated
+        | C51MethodId::WhitneyCompactIntegralFluxCalibrated => {
             unreachable!("handled by isolated compact route")
         }
         C51MethodId::FullMetricAugmented => {
@@ -2432,6 +2665,19 @@ fn assemble_problem_maps(
     elimination: &EssentialBoundaryElimination,
     state_dimension: usize,
 ) -> Result<(ProblemMaps, Vec<ObservationDesign>)> {
+    let direct_flux = if config.physical_observation_design
+        == C51PhysicalObservationDesign::FluxCochainHashedPrefix
+        || config.physical_output_design
+            == C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit
+    {
+        let flux_elimination = EssentialBoundaryConditions::homogeneous_on_boundary(topology, 2)?
+            .eliminate(topology.nsimplices(2))?;
+        let active_flux =
+            assemble_c51_active_flux_cochain_map(topology, elimination, &flux_elimination)?;
+        Some((active_flux, flux_elimination))
+    } else {
+        None
+    };
     let (physical_qoi, legacy_observation, selected_cell_count, selected_volume_fraction) =
         match config.physical_output_design {
             C51PhysicalOutputDesign::LegacyCentralRegionAverage => {
@@ -2479,6 +2725,21 @@ fn assemble_problem_maps(
                     .clone();
                 (map, None, 0, 0.0)
             }
+            C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit => {
+                let (active_flux, flux_elimination) = direct_flux.as_ref().ok_or_else(|| {
+                    FeecGmrfError::Inference(
+                        "C51 integral surface QoIs are missing the active flux-cochain map"
+                            .to_string(),
+                    )
+                })?;
+                let split = assemble_c51_surface_flux_split(
+                    topology,
+                    coordinates,
+                    flux_elimination,
+                    active_flux,
+                )?;
+                (split.stacked()?, None, 0, 0.0)
+            }
         };
     let physical_qoi_probe = physical_qoi_probe(physical_qoi.output_dimension(), config.seed);
     let problem = ProblemMaps {
@@ -2496,6 +2757,7 @@ fn assemble_problem_maps(
         elimination,
         state_dimension,
         legacy_observation.as_ref(),
+        direct_flux.as_ref().map(|(map, _)| map),
     )?;
     Ok((problem, designs))
 }
@@ -2587,14 +2849,25 @@ fn build_compact_prior(
     parameters: MaternParameters,
 ) -> Result<(GaussianPrior, Duration)> {
     let start = Instant::now();
-    let prior =
+    let prior = if config.physical_observation_design
+        == C51PhysicalObservationDesign::FluxCochainHashedPrefix
+    {
+        AdjacentMaternPriorBuilder::from_feec_homogeneous_full_relative_with_projected_inverses(
+            topology,
+            metric,
+            config.form_degree,
+        )?
+        .parameters(parameters)
+        .build()?
+    } else {
         MaternPriorBuilder::from_feec_whitney_projected(topology, metric, config.form_degree)?
             .parameters(parameters)
             .essential_boundary_conditions(EssentialBoundaryConditions::homogeneous_on_boundary(
                 topology,
                 config.form_degree,
             )?)
-            .build()?;
+            .build()?
+    };
     Ok((prior, start.elapsed()))
 }
 
@@ -2982,6 +3255,8 @@ fn run_isolated_compact_resource(
     config: &C51BenchmarkConfig,
     selection: &C51ResourceSelection,
     calibration_target_prior_rms: Option<f64>,
+    integral_flux_posterior_precision_scale: Option<f64>,
+    integral_flux_target_posterior_rms: Option<f64>,
 ) -> Result<C51BenchmarkRow> {
     let mesh_start = Instant::now();
     let mesh = CartesianMeshInfo::new_unit_scaled(3, selection.refinement, 1.0);
@@ -3014,8 +3289,9 @@ fn run_isolated_compact_resource(
             matching.len()
         )));
     };
-    let (prior, prior_build, calibration) = match selection.method {
-        C51MethodId::WhitneyCompact => (raw_prior, raw_prior_build, None),
+    let (prior, prior_build, calibration, frozen_integral_flux_calibration) = match selection.method
+    {
+        C51MethodId::WhitneyCompact => (raw_prior, raw_prior_build, None, None),
         C51MethodId::WhitneyCompactCalibrated => {
             let target_rms = calibration_target_prior_rms.ok_or_else(|| {
                 FeecGmrfError::InvalidParameter(
@@ -3037,7 +3313,35 @@ fn run_isolated_compact_resource(
             let (prior, report) =
                 calibrate_prior_to_physical_rms(&raw_prior, &calibration_map, target_rms)?;
             let elapsed = start.elapsed();
-            (prior, raw_prior_build + elapsed, Some((report, elapsed)))
+            (
+                prior,
+                raw_prior_build + elapsed,
+                Some((report, elapsed)),
+                None,
+            )
+        }
+        C51MethodId::WhitneyCompactIntegralFluxCalibrated => {
+            let scale = integral_flux_posterior_precision_scale.ok_or_else(|| {
+                FeecGmrfError::InvalidParameter(
+                    "C51 calibrated integral-flux prior is missing its frozen precision scale"
+                        .to_string(),
+                )
+            })?;
+            let target = integral_flux_target_posterior_rms.ok_or_else(|| {
+                FeecGmrfError::InvalidParameter(
+                    "C51 calibrated integral-flux prior is missing its frozen posterior RMS target"
+                        .to_string(),
+                )
+            })?;
+            let start = Instant::now();
+            let prior = raw_prior.with_precision_scale(scale)?;
+            let elapsed = start.elapsed();
+            (
+                prior,
+                raw_prior_build + elapsed,
+                None,
+                Some((scale, target)),
+            )
         }
         _ => unreachable!("isolated compact route accepts only projected methods"),
     };
@@ -3062,6 +3366,15 @@ fn run_isolated_compact_resource(
         row.amplitude_calibration_tau_multiplier =
             C51Measurement::Measured(report.tau_multiplier());
         row.amplitude_calibration_ns = duration_measurement(elapsed);
+    }
+    if let Some((scale, _target)) = frozen_integral_flux_calibration {
+        row.amplitude_calibration_policy =
+            "frozen_exact_reference_posterior_surface_flux_rms_by_prior_precision".to_string();
+        row.amplitude_calibration_precision_scale = C51Measurement::Measured(scale);
+        row.amplitude_calibration_tau_multiplier = C51Measurement::Measured(scale.sqrt());
+        row.amplitude_calibration_ns = C51Measurement::unavailable(
+            "offline selection-bank calibration search is reported by the accuracy archive and excluded from timed posterior construction",
+        );
     }
     Ok(row)
 }
@@ -3091,6 +3404,9 @@ fn base_resource_row(
             C51MethodId::WhitneyCompactCalibrated => {
                 "projected_inverse_whitney_physical_rms_calibrated"
             }
+            C51MethodId::WhitneyCompactIntegralFluxCalibrated => {
+                "projected_inverse_whitney_integral_flux_posterior_rms_calibrated"
+            }
             C51MethodId::SpectralLowRank => "truncated_exact_full_metric_whitney_spectral",
         }
         .to_string(),
@@ -3101,14 +3417,27 @@ fn base_resource_row(
                 | C51MethodId::ExactObservationSpaceGp
                 | C51MethodId::SpectralFullRank
         ),
-        matched_physical_qoi_eligible: method == C51MethodId::WhitneyCompactCalibrated,
+        matched_physical_qoi_eligible: matches!(
+            method,
+            C51MethodId::WhitneyCompactCalibrated
+                | C51MethodId::WhitneyCompactIntegralFluxCalibrated
+        ),
         common_physical_uq_workload_eligible: matches!(
             selection.phase,
             C51ResourcePhase::ColdSetup | C51ResourcePhase::QueryPhysicalUq
-        ) && config.physical_observation_design
-            == C51PhysicalObservationDesign::JuqFixedFootprintPrefix
-            && config.physical_output_design
-                == C51PhysicalOutputDesign::RankStudySelectionAndHeldOut,
+        ) && matches!(
+            (
+                config.physical_observation_design,
+                config.physical_output_design,
+            ),
+            (
+                C51PhysicalObservationDesign::JuqFixedFootprintPrefix,
+                C51PhysicalOutputDesign::RankStudySelectionAndHeldOut,
+            ) | (
+                C51PhysicalObservationDesign::FluxCochainHashedPrefix,
+                C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit,
+            )
+        ),
         full_uq_workload_eligible: selection.phase == C51ResourcePhase::QueryFullUq
             && !matches!(
                 method,
@@ -4125,9 +4454,12 @@ fn run_exact_observation_gp_method(
     phase: C51ResourcePhase,
     reference: Option<&ReferenceAnswers>,
 ) -> Result<C51BenchmarkRow> {
-    if design.class != C51ObservationClass::LocalPhysicalB {
+    if !matches!(
+        design.class,
+        C51ObservationClass::LocalPhysicalB | C51ObservationClass::LocalFluxCochain
+    ) {
         return Err(FeecGmrfError::InvalidParameter(
-            "the exact observation-space GP comparator requires local physical-B observations"
+            "the exact observation-space GP comparator requires local physical observations"
                 .to_string(),
         ));
     }
@@ -4627,6 +4959,7 @@ fn observation_designs(
     elimination: &EssentialBoundaryElimination,
     dimension: usize,
     legacy_full_physical_observation: Option<&LinearMap>,
+    direct_flux_observation: Option<&LinearMap>,
 ) -> Result<Vec<ObservationDesign>> {
     let mut designs = Vec::new();
     for requested in local_sensor_targets(config, dimension) {
@@ -4684,6 +5017,31 @@ fn observation_designs(
                     component_counts: metadata.component_counts.map(C51Measurement::Measured),
                 });
             }
+            C51PhysicalObservationDesign::FluxCochainHashedPrefix => {
+                let flux = direct_flux_observation.ok_or_else(|| {
+                    FeecGmrfError::Inference(
+                        "C51 direct observation design is missing its active flux-cochain map"
+                            .to_string(),
+                    )
+                })?;
+                let split = assemble_c51_flux_cochain_split(
+                    flux,
+                    requested,
+                    C51_FLUX_COCHAIN_SELECTION_COUNT,
+                    C51_FLUX_COCHAIN_HELD_OUT_COUNT,
+                )?;
+                designs.push(ObservationDesign {
+                    class: C51ObservationClass::LocalFluxCochain,
+                    operator: split.observation().clone(),
+                    sensor_count: requested,
+                    design_id: C51_FLUX_COCHAIN_DESIGN_ID.to_string(),
+                    fixed_radius: C51Measurement::unavailable(
+                        "integral face-flux cochains have mesh-face support rather than a reconstruction kernel radius",
+                    ),
+                    vector_center_count: C51Measurement::NotRecorded,
+                    component_counts: std::array::from_fn(|_| C51Measurement::NotRecorded),
+                });
+            }
         }
         if config.include_local_selectors {
             let indices = evenly_spaced_indices(dimension, sensor_count);
@@ -4729,7 +5087,8 @@ fn local_sensor_targets(config: &C51BenchmarkConfig, dimension: usize) -> Vec<us
         .iter()
         .map(|count| match config.physical_observation_design {
             C51PhysicalObservationDesign::LegacyCellRows => (*count).min(dimension),
-            C51PhysicalObservationDesign::JuqFixedFootprintPrefix => *count,
+            C51PhysicalObservationDesign::JuqFixedFootprintPrefix
+            | C51PhysicalObservationDesign::FluxCochainHashedPrefix => *count,
         })
         .collect::<BTreeSet<_>>();
     for density in &config.local_sensor_density_targets {
@@ -4965,6 +5324,7 @@ fn method_seed(method: C51MethodId) -> u64 {
         C51MethodId::FullMetricAugmented => 0xA090_0000,
         C51MethodId::WhitneyCompact => 0xC0A0_AC70,
         C51MethodId::WhitneyCompactCalibrated => 0xCA1B_AA7E,
+        C51MethodId::WhitneyCompactIntegralFluxCalibrated => 0xF10C_CA1B,
         C51MethodId::ExactObservationSpaceGp => 0xEAC7_600D,
         C51MethodId::SpectralFullRank => 0x5EEC_F011,
         C51MethodId::SpectralLowRank => 0x5EEC_10A0,
@@ -5534,7 +5894,9 @@ mod tests {
                     assert!(measured_f64(&row.covariance_action_relative_error) <= 1.0e-9);
                     assert!(measured_f64(&row.physical_variance_relative_error) <= 1.0e-9);
                 }
-                C51MethodId::WhitneyCompact | C51MethodId::WhitneyCompactCalibrated => {
+                C51MethodId::WhitneyCompact
+                | C51MethodId::WhitneyCompactCalibrated
+                | C51MethodId::WhitneyCompactIntegralFluxCalibrated => {
                     assert!(!row.same_discrete_law_eligible);
                     assert!(row.full_uq_workload_eligible);
                     assert!(measured_f64(&row.physical_variance_relative_error).is_finite());
@@ -5813,6 +6175,86 @@ mod tests {
         assert!(matches!(
             archive.row.amplitude_calibration_ns,
             C51Measurement::Measured(value) if value > 0
+        ));
+    }
+
+    #[test]
+    fn integral_flux_resource_profile_freezes_method_specific_amplitudes() {
+        let selection = |refinement, count, method| C51ResourceSelection {
+            refinement,
+            observation_class: C51ObservationClass::LocalFluxCochain,
+            sensor_target: C51ResourceSensorTarget::Count(count),
+            repeated_data_count: 1,
+            method,
+            spectral_rank: None,
+            phase: C51ResourcePhase::ColdSetup,
+        };
+        let exact = C51ResourceConfig::juq_integral_flux_performance(selection(
+            8,
+            4_096,
+            C51MethodId::FullMetricAugmented,
+        ))
+        .unwrap();
+        assert_eq!(exact.tau, C51_INTEGRAL_FLUX_EXACT_TAU_N8);
+        assert_eq!(
+            exact.physical_output_design,
+            C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit
+        );
+
+        let compact = C51ResourceConfig::juq_integral_flux_performance(selection(
+            10,
+            8_192,
+            C51MethodId::WhitneyCompactIntegralFluxCalibrated,
+        ))
+        .unwrap();
+        assert_eq!(compact.tau, C51_INTEGRAL_FLUX_COMPACT_TRACE_TAU_N10);
+        assert_eq!(
+            compact.projected_integral_flux_posterior_precision_scale,
+            Some(C51_INTEGRAL_FLUX_POSTERIOR_SCALE_N10)
+        );
+        assert!(C51ResourceConfig::juq_integral_flux_performance(selection(
+            8,
+            4_095,
+            C51MethodId::WhitneyCompact,
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn bounded_integral_flux_resource_uses_no_reconstruction() {
+        let selection = C51ResourceSelection {
+            refinement: 4,
+            observation_class: C51ObservationClass::LocalFluxCochain,
+            sensor_target: C51ResourceSensorTarget::Count(32),
+            repeated_data_count: 1,
+            method: C51MethodId::WhitneyCompactIntegralFluxCalibrated,
+            spectral_rank: None,
+            phase: C51ResourcePhase::ColdSetup,
+        };
+        let mut config = C51ResourceConfig::juq_performance(selection);
+        config.physical_observation_design = C51PhysicalObservationDesign::FluxCochainHashedPrefix;
+        config.physical_output_design = C51PhysicalOutputDesign::MidplaneQuadrantSurfaceFluxSplit;
+        config.observation_noise_variance = 2.5e-7;
+        config.projected_integral_flux_posterior_precision_scale = Some(0.9);
+        config.projected_integral_flux_target_posterior_rms = Some(1.0e-3);
+        let archive = run_c51_resource(&config, C51RunMetadata::smoke("integral-flux-resource"))
+            .expect("bounded direct-cochain resource row should run");
+        assert_eq!(
+            archive.row.observation_design_id,
+            C51_FLUX_COCHAIN_DESIGN_ID
+        );
+        assert_eq!(
+            archive.row.physical_qoi_design_id,
+            C51_SURFACE_FLUX_QOI_DESIGN_ID
+        );
+        assert_eq!(archive.row.physical_qoi_output_count, 12);
+        assert_eq!(
+            archive.row.amplitude_calibration_precision_scale,
+            C51Measurement::Measured(0.9)
+        );
+        assert!(matches!(
+            archive.row.observation_fixed_radius,
+            C51Measurement::Unavailable { .. }
         ));
     }
 

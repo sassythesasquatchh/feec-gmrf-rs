@@ -69,7 +69,7 @@ fn run_accuracy(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if !matches!(arguments.len(), 10 | 11) {
         return Err(
-            "resource usage: c51_benchmark resource <profile> <output> <refinement> <observation-class> <count|density> <target> <D> <method> <rank|none> <cold_setup|query_physical_uq|query_full_uq> [projected-calibration-target-prior-rms]"
+            "resource usage: c51_benchmark resource <profile> <output> <refinement> <observation-class> <count|density> <target> <D> <method> <rank|none> <cold_setup|query_physical_uq|query_full_uq> [legacy-projected-calibration-target-prior-rms]"
                 .into(),
         );
     }
@@ -81,9 +81,10 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             | "juq-exact-performance-v1"
             | "juq-exact-projected-performance-v1"
             | "juq-exact-calibrated-projected-performance-v1"
+            | "juq-integral-flux-performance-v1"
     ) {
         return Err(format!(
-            "resource profile {profile:?} is unavailable; use smoke, juq-performance-v1, juq-exact-performance-v1, juq-exact-projected-performance-v1, or juq-exact-calibrated-projected-performance-v1"
+            "resource profile {profile:?} is unavailable; use smoke, juq-performance-v1, juq-exact-performance-v1, juq-exact-projected-performance-v1, juq-exact-calibrated-projected-performance-v1, or juq-integral-flux-performance-v1"
         )
         .into());
     }
@@ -93,6 +94,7 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "local_physical_b" | "fixed_footprint_magnetic_volume" => {
             C51ObservationClass::LocalPhysicalB
         }
+        "local_flux_cochain" => C51ObservationClass::LocalFluxCochain,
         "local_selectors" => C51ObservationClass::LocalSelectors,
         "global_row" => C51ObservationClass::GlobalRow,
         value => return Err(format!("unknown C51 observation class {value:?}").into()),
@@ -108,6 +110,9 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "fm_aug" => C51MethodId::FullMetricAugmented,
         "whitney_compact" => C51MethodId::WhitneyCompact,
         "whitney_compact_calibrated" => C51MethodId::WhitneyCompactCalibrated,
+        "whitney_compact_integral_flux_calibrated" => {
+            C51MethodId::WhitneyCompactIntegralFluxCalibrated
+        }
         "exact_observation_gp" => C51MethodId::ExactObservationSpaceGp,
         "spectral_full_rank" => C51MethodId::SpectralFullRank,
         "spectral_low_rank" => C51MethodId::SpectralLowRank,
@@ -139,6 +144,9 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         | "juq-exact-projected-performance-v1"
         | "juq-exact-calibrated-projected-performance-v1" => {
             C51ResourceConfig::juq_performance(selection)
+        }
+        "juq-integral-flux-performance-v1" => {
+            C51ResourceConfig::juq_integral_flux_performance(selection)?
         }
         _ => unreachable!("validated resource profile"),
     };

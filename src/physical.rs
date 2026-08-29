@@ -484,6 +484,24 @@ impl MagneticFieldMaps3d {
     }
 }
 
+/// Assemble the full-space magnetic flux-cochain map `A -> D1 A` in three
+/// dimensions without constructing any pointwise field reconstruction.
+///
+/// Both input and output coefficients are integral FEEC cochains: edge
+/// circulations map to oriented face fluxes through the topological exterior
+/// derivative.
+pub fn magnetic_flux_cochain_map_3d(topology: &Complex) -> Result<LinearMap> {
+    if topology.dim() != 3 {
+        return Err(FeecGmrfError::Dimension(
+            "magnetic flux cochain maps require a 3D topology".to_string(),
+        ));
+    }
+    linear_map_from_rows(
+        feg_infer::physical::build_exterior_derivative_1_operator(topology)
+            .map_err(FeecGmrfError::Assembly)?,
+    )
+}
+
 /// Build an outward flux functional over selected boundary faces.
 pub fn outward_boundary_flux_map_3d(
     topology: &Complex,
@@ -1127,6 +1145,17 @@ mod tests {
         let reconstruction = LinearMap::new(SparseMat::diagonal(2, 3.0)).unwrap();
         let magnetic = magnetic_field_map(&derivative, &reconstruction).unwrap();
         assert_eq!(magnetic.apply(&[1.0, -1.0]).unwrap(), vec![6.0, -6.0]);
+    }
+
+    #[test]
+    fn magnetic_flux_cochain_map_is_the_full_d1_without_reconstruction() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 1, 1.0);
+        let (topology, coordinates) = mesh.compute_coord_complex();
+        let direct = magnetic_flux_cochain_map_3d(&topology).unwrap();
+        let bundled = MagneticFieldMaps3d::from_feec(&topology, &coordinates).unwrap();
+        assert_eq!(direct, bundled.flux_cochain);
+        assert_eq!(direct.input_dimension(), topology.nsimplices(1));
+        assert_eq!(direct.output_dimension(), topology.nsimplices(2));
     }
 
     #[test]

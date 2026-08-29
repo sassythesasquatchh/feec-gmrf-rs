@@ -45,10 +45,11 @@ pub use crate::physical::{
     axis_aligned_flux_patch_cochain_map_3d, calibrate_prior_to_physical_rms,
     calibrate_prior_to_physical_rms_with_method, calibrate_prior_to_posterior_physical_rms,
     calibrate_prior_to_weighted_physical_rms, calibrate_prior_to_weighted_physical_rms_with_method,
-    covariance_mean_marginal_rms, magnetic_field_map, outward_boundary_flux_map_3d,
-    reconstructed_barycenter_1form_map, scalar_field_l2_rms_weights, AxisAlignedFluxPatch3d,
-    MagneticFieldMaps3d, MagneticVolumeSensorBank3d, PhysicalMap, PhysicalRmsCalibration,
-    PosteriorPhysicalRmsCalibration, PosteriorPhysicalRmsCalibrationOptions, WendlandC2Kernel3d,
+    covariance_mean_marginal_rms, magnetic_field_map, magnetic_flux_cochain_map_3d,
+    outward_boundary_flux_map_3d, reconstructed_barycenter_1form_map, scalar_field_l2_rms_weights,
+    AxisAlignedFluxPatch3d, MagneticFieldMaps3d, MagneticVolumeSensorBank3d, PhysicalMap,
+    PhysicalRmsCalibration, PosteriorPhysicalRmsCalibration,
+    PosteriorPhysicalRmsCalibrationOptions, WendlandC2Kernel3d,
 };
 pub use crate::prior::supported::{
     AuditedSupportedCovariance, PreparedSupportedMaternModel, SupportedCovarianceSymmetryAudit,

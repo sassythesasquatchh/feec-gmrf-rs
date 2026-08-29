@@ -10,22 +10,19 @@
 
 use crate::c51_benchmark::C51RunMetadata;
 use crate::c51_magnetic_sensor_design::{
-    assemble_c51_flux_cochain_split, C51_FLUX_COCHAIN_DESIGN_ID, C51_FLUX_COCHAIN_DESIGN_SEED,
+    assemble_c51_flux_cochain_split, assemble_c51_surface_flux_split, C51_FLUX_COCHAIN_DESIGN_ID,
+    C51_FLUX_COCHAIN_DESIGN_SEED, C51_FLUX_COCHAIN_HELD_OUT_COUNT,
+    C51_FLUX_COCHAIN_SELECTION_COUNT, C51_SURFACE_FLUX_QOI_DESIGN_ID,
 };
 use crate::c51_spectral_covariance_rank::{covariance_error_metrics, C51CovarianceErrorMetrics};
 use feec_gmrf::prelude::{
-    axis_aligned_flux_patch_cochain_map_3d, calibrate_prior_to_posterior_physical_rms,
-    covariance_mean_marginal_rms, pullback_quadratic_form, AdjacentMaternPriorBuilder,
-    AxisAlignedFluxPatch3d, EssentialBoundaryElimination, ExactFormOperators, GaussianNoise,
-    HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearMap, LinearObservation,
-    MaternAlpha, MaternParameters, OutgoingFormOperator, PosteriorPhysicalRmsCalibration,
+    calibrate_prior_to_posterior_physical_rms, covariance_mean_marginal_rms,
+    pullback_quadratic_form, AdjacentMaternPriorBuilder, EssentialBoundaryElimination,
+    ExactFormOperators, GaussianNoise, HutchinsonVarianceConfig, LinearGaussianModelBuilder,
+    LinearObservation, MaternAlpha, MaternParameters, PosteriorPhysicalRmsCalibration,
     PosteriorPhysicalRmsCalibrationOptions, Result, SupportedMaternPriorBuilder, VarianceMethod,
 };
-use manifold::{
-    gen::cartesian::CartesianMeshInfo,
-    geometry::{coord::mesh::MeshCoords, coord::simplex::SimplexHandleExt},
-    topology::complex::Complex,
-};
+use manifold::{gen::cartesian::CartesianMeshInfo, geometry::coord::simplex::SimplexHandleExt};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -38,7 +35,6 @@ pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
     "thesis-magnetic-trace-normalized-flux-cochain-v7-n8";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
     "thesis-magnetic-trace-normalized-flux-cochain-v7-n10";
-pub const C51_SURFACE_FLUX_QOI_DESIGN_ID: &str = "c51-midplane-quadrant-fluxes-v1";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
 pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
 pub const C51_THESIS_TRACE_PROBES: usize = 512;
@@ -46,8 +42,8 @@ pub const C51_THESIS_TRACE_BATCHES: usize = 8;
 pub const C51_THESIS_TRACE_SEED: u64 = 0xC51B_7ACE;
 pub const C51_THESIS_OBSERVATION_COUNT_N8: usize = 4_096;
 pub const C51_THESIS_OBSERVATION_COUNT_N10: usize = 8_192;
-pub const C51_THESIS_SELECTION_FLUX_COUNT: usize = 64;
-pub const C51_THESIS_HELD_OUT_FLUX_COUNT: usize = 64;
+pub const C51_THESIS_SELECTION_FLUX_COUNT: usize = C51_FLUX_COCHAIN_SELECTION_COUNT;
+pub const C51_THESIS_HELD_OUT_FLUX_COUNT: usize = C51_FLUX_COCHAIN_HELD_OUT_COUNT;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct C51ThesisNormalizedCompactConfig {
@@ -168,8 +164,12 @@ pub fn run_c51_thesis_normalized_compact(
     })?;
     let flux_cochain = outgoing.active_derivative().clone();
     let magnetic_energy = pullback_quadratic_form(&flux_cochain, outgoing.upper().mass())?;
-    let (surface_selection, surface_held_out) =
-        c51_surface_flux_qois(&topology, &coordinates, outgoing, &flux_cochain)?;
+    let flux_elimination =
+        EssentialBoundaryElimination::from_layout(outgoing.upper().boundary_layout().clone())?;
+    let surface_split =
+        assemble_c51_surface_flux_split(&topology, &coordinates, &flux_elimination, &flux_cochain)?;
+    let surface_selection = surface_split.selection().clone();
+    let surface_held_out = surface_split.held_out().clone();
     let magnetic_output_dimension = outgoing.upper().dimension();
     let domain_volume = topology
         .cells()
@@ -674,46 +674,6 @@ impl C51ThesisNormalizedCompactReport {
     }
 }
 
-fn c51_surface_flux_qois(
-    topology: &Complex,
-    coordinates: &MeshCoords,
-    outgoing: &OutgoingFormOperator,
-    flux_cochain: &LinearMap,
-) -> Result<(LinearMap, LinearMap)> {
-    let mut patches = Vec::with_capacity(12);
-    for normal_axis in 0..3 {
-        for first_half in 0..2 {
-            for second_half in 0..2 {
-                patches.push(AxisAlignedFluxPatch3d::new(
-                    normal_axis,
-                    0.5,
-                    [
-                        [0.5 * first_half as f64, 0.5 * (first_half + 1) as f64],
-                        [0.5 * second_half as f64, 0.5 * (second_half + 1) as f64],
-                    ],
-                )?);
-            }
-        }
-    }
-    let full_patch_map = axis_aligned_flux_patch_cochain_map_3d(topology, coordinates, &patches)?;
-    let eliminated =
-        EssentialBoundaryElimination::from_layout(outgoing.upper().boundary_layout().clone())?
-            .eliminate_map(&full_patch_map, &vec![0.0; patches.len()])?;
-    if eliminated
-        .fixed_offset()
-        .iter()
-        .any(|offset| *offset != 0.0)
-    {
-        return Err(feec_gmrf::FeecGmrfError::Assembly(
-            "C51 homogeneous surface-flux QoIs acquired a nonzero boundary offset".to_string(),
-        ));
-    }
-    let state_patch_map = eliminated.reduced().compose(flux_cochain)?;
-    let selection = state_patch_map.select_outputs(&[0, 2, 4, 6, 8, 10])?;
-    let held_out = state_patch_map.select_outputs(&[1, 3, 5, 7, 9, 11])?;
-    Ok((selection, held_out))
-}
-
 fn trace_calibration(
     weighted_trace: f64,
     relative_standard_error: Option<f64>,
@@ -802,8 +762,18 @@ mod tests {
             ExactFormOperators::from_feec_homogeneous_full_relative(&topology, &metric, 1).unwrap();
         let outgoing = operators.outgoing().unwrap();
         let flux_cochain = outgoing.active_derivative().clone();
-        let (selection, held_out) =
-            c51_surface_flux_qois(&topology, &coordinates, outgoing, &flux_cochain).unwrap();
+        let flux_elimination =
+            EssentialBoundaryElimination::from_layout(outgoing.upper().boundary_layout().clone())
+                .unwrap();
+        let split = assemble_c51_surface_flux_split(
+            &topology,
+            &coordinates,
+            &flux_elimination,
+            &flux_cochain,
+        )
+        .unwrap();
+        let selection = split.selection();
+        let held_out = split.held_out();
 
         assert_eq!(selection.output_dimension(), 6);
         assert_eq!(held_out.output_dimension(), 6);

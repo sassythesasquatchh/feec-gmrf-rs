@@ -1,4 +1,4 @@
-//! Fixed-footprint magnetic observation designs for the C51 studies.
+//! Magnetic observation and integral-QoI designs for the C51 studies.
 //!
 //! This module owns only study design: fixed physical centers, nested ordering,
 //! and scalar-component prefixes.  Physical assembly remains in
@@ -6,7 +6,9 @@
 //! `A -> D1 -> B` pushforward.
 
 use feec_gmrf::prelude::{
-    FeecGmrfError, LinearMap, MagneticVolumeSensorBank3d, Result, WendlandC2Kernel3d,
+    axis_aligned_flux_patch_cochain_map_3d, magnetic_flux_cochain_map_3d, AxisAlignedFluxPatch3d,
+    EssentialBoundaryElimination, FeecGmrfError, LinearMap, MagneticVolumeSensorBank3d, Result,
+    WendlandC2Kernel3d,
 };
 use manifold::{geometry::coord::mesh::MeshCoords, topology::complex::Complex};
 
@@ -36,6 +38,12 @@ pub const C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT: usize =
 pub const C51_FLUX_COCHAIN_DESIGN_ID: &str = "c51-flux-cochain-hashed-split-v1";
 /// Frozen seed for the direct flux-cochain row ordering.
 pub const C51_FLUX_COCHAIN_DESIGN_SEED: u64 = 0xC51F_1A5C_0A17;
+/// Local face-flux rows reserved for approximation diagnostics.
+pub const C51_FLUX_COCHAIN_SELECTION_COUNT: usize = 64;
+/// Disjoint local face-flux rows reserved for approximation validation.
+pub const C51_FLUX_COCHAIN_HELD_OUT_COUNT: usize = 64;
+/// Immutable direct integral surface-flux QoI design.
+pub const C51_SURFACE_FLUX_QOI_DESIGN_ID: &str = "c51-midplane-quadrant-fluxes-v1";
 
 const SELECTION_CENTERS: [[f64; 3]; 3] =
     [[0.25, 0.25, 0.25], [0.75, 0.25, 0.75], [0.25, 0.75, 0.75]];
@@ -78,6 +86,27 @@ pub struct C51FluxCochainSplit {
     observation_indices: Vec<usize>,
     selection_indices: Vec<usize>,
     held_out_indices: Vec<usize>,
+}
+
+/// Disjoint six-row banks of exact mid-plane quadrant fluxes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51SurfaceFluxSplit {
+    selection: LinearMap,
+    held_out: LinearMap,
+}
+
+impl C51SurfaceFluxSplit {
+    pub fn selection(&self) -> &LinearMap {
+        &self.selection
+    }
+
+    pub fn held_out(&self) -> &LinearMap {
+        &self.held_out
+    }
+
+    pub fn stacked(&self) -> Result<LinearMap> {
+        LinearMap::stack(&[self.selection.clone(), self.held_out.clone()])
+    }
 }
 
 impl C51FluxCochainSplit {
@@ -229,6 +258,70 @@ pub fn assemble_c51_flux_cochain_split(
         observation_indices,
         selection_indices,
         held_out_indices,
+    })
+}
+
+/// Assemble the homogeneous full-relative active magnetic cochain map without
+/// point reconstruction.
+pub fn assemble_c51_active_flux_cochain_map(
+    topology: &Complex,
+    state_elimination: &EssentialBoundaryElimination,
+    flux_elimination: &EssentialBoundaryElimination,
+) -> Result<LinearMap> {
+    let full_flux = magnetic_flux_cochain_map_3d(topology)?;
+    let state_reduced =
+        state_elimination.eliminate_map(&full_flux, &vec![0.0; full_flux.output_dimension()])?;
+    if state_reduced
+        .fixed_offset()
+        .iter()
+        .any(|value| *value != 0.0)
+    {
+        return Err(FeecGmrfError::Assembly(
+            "C51 homogeneous magnetic cochain map acquired a boundary offset".to_string(),
+        ));
+    }
+    LinearMap::new(flux_elimination.active_to_full().matrix().transpose())?
+        .compose(state_reduced.reduced())
+}
+
+/// Assemble the exact mesh-conforming mid-plane quadrant surface fluxes used
+/// by C51 and split them into fixed selection and held-out banks.
+pub fn assemble_c51_surface_flux_split(
+    topology: &Complex,
+    coordinates: &MeshCoords,
+    flux_elimination: &EssentialBoundaryElimination,
+    active_flux_cochain: &LinearMap,
+) -> Result<C51SurfaceFluxSplit> {
+    let mut patches = Vec::with_capacity(12);
+    for normal_axis in 0..3 {
+        for first_half in 0..2 {
+            for second_half in 0..2 {
+                patches.push(AxisAlignedFluxPatch3d::new(
+                    normal_axis,
+                    0.5,
+                    [
+                        [0.5 * first_half as f64, 0.5 * (first_half + 1) as f64],
+                        [0.5 * second_half as f64, 0.5 * (second_half + 1) as f64],
+                    ],
+                )?);
+            }
+        }
+    }
+    let full_patch_map = axis_aligned_flux_patch_cochain_map_3d(topology, coordinates, &patches)?;
+    let eliminated = flux_elimination.eliminate_map(&full_patch_map, &vec![0.0; patches.len()])?;
+    if eliminated
+        .fixed_offset()
+        .iter()
+        .any(|offset| *offset != 0.0)
+    {
+        return Err(FeecGmrfError::Assembly(
+            "C51 homogeneous surface-flux QoIs acquired a boundary offset".to_string(),
+        ));
+    }
+    let state_patch_map = eliminated.reduced().compose(active_flux_cochain)?;
+    Ok(C51SurfaceFluxSplit {
+        selection: state_patch_map.select_outputs(&[0, 2, 4, 6, 8, 10])?,
+        held_out: state_patch_map.select_outputs(&[1, 3, 5, 7, 9, 11])?,
     })
 }
 
@@ -485,6 +578,45 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(first.observation().apply(&input).unwrap(), expected);
         assert!(assemble_c51_flux_cochain_split(&flux, 14, 2, 1).is_err());
+    }
+
+    #[test]
+    fn active_flux_and_surface_maps_match_full_relative_feec_chain() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0);
+        let (topology, coordinates) = mesh.compute_coord_complex();
+        let metric = coordinates.to_edge_lengths(&topology);
+        let operators =
+            feec_gmrf::prelude::ExactFormOperators::from_feec_homogeneous_full_relative(
+                &topology, &metric, 1,
+            )
+            .unwrap();
+        let state_elimination = feec_gmrf::prelude::EssentialBoundaryElimination::from_layout(
+            operators.state().boundary_layout().clone(),
+        )
+        .unwrap();
+        let outgoing = operators.outgoing().unwrap();
+        let flux_elimination = feec_gmrf::prelude::EssentialBoundaryElimination::from_layout(
+            outgoing.upper().boundary_layout().clone(),
+        )
+        .unwrap();
+        let active_flux =
+            assemble_c51_active_flux_cochain_map(&topology, &state_elimination, &flux_elimination)
+                .unwrap();
+        assert_eq!(&active_flux, outgoing.active_derivative());
+
+        let surface = assemble_c51_surface_flux_split(
+            &topology,
+            &coordinates,
+            &flux_elimination,
+            &active_flux,
+        )
+        .unwrap();
+        assert_eq!(surface.selection().output_dimension(), 6);
+        assert_eq!(surface.held_out().output_dimension(), 6);
+        assert_eq!(
+            surface.stacked().unwrap().input_dimension(),
+            active_flux.input_dimension()
+        );
     }
 
     fn legacy_observation_kernels(count: usize, radius: f64) -> Result<Vec<WendlandC2Kernel3d>> {
