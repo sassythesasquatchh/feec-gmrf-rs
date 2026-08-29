@@ -301,13 +301,73 @@ class FreshProcessRunnerTests(unittest.TestCase):
             "method_performance_timing_eligible": "true",
             "method_performance_timing_ineligibility_reason": "",
             "observation_class": "fixed_footprint_magnetic_volume",
-            "exact_gp_conditioning_route": "observation_space",
-            "exact_gp_kernel_construction_in_headline_total": "false",
+            "solver": "exact_observation_space_dense_cholesky",
         }
         reasons = runner.performance_ineligibility_reasons(
             row, {"method": "exact_observation_gp", "spectral_rank": None}
         )
         self.assertTrue(any("kernel construction" in reason for reason in reasons))
+
+    def test_exact_observation_gp_accepts_auditable_headline_sum(self):
+        row = {
+            "available": "true",
+            "common_physical_uq_workload_eligible": "true",
+            "matched_physical_qoi_eligible": "true",
+            "full_uq_workload_eligible": "true",
+            "method_performance_timing_eligible": "true",
+            "method_performance_timing_ineligibility_reason": "",
+            "observation_class": "local_physical_b",
+            "observation_design_id": runner.JUQ_SENSOR_DESIGN_ID,
+            "observation_fixed_radius_status": "measured",
+            "observation_fixed_radius_value": "0.16",
+            "observation_vector_center_count_status": "measured",
+            "observation_vector_center_count_value": "1366",
+            "observation_component_x_count_status": "measured",
+            "observation_component_x_count_value": "1366",
+            "observation_component_y_count_status": "measured",
+            "observation_component_y_count_value": "1365",
+            "observation_component_z_count_status": "measured",
+            "observation_component_z_count_value": "1365",
+            "physical_qoi_design_id": runner.JUQ_PHYSICAL_QOI_DESIGN_ID,
+            "physical_qoi_output_count": "18",
+            "solver": "exact_observation_space_dense_cholesky",
+        }
+        for name, value in (
+            ("feec_assembly_ns", 2),
+            ("prior_build_ns", 3),
+            ("exact_gp_covariance_construction_ns", 5),
+            ("exact_gp_dense_conditioning_ns", 7),
+            ("exact_gp_end_to_end_setup_ns", 17),
+        ):
+            row[f"{name}_status"] = "measured"
+            row[f"{name}_value"] = str(value)
+        selection = {
+            "method": "exact_observation_gp",
+            "spectral_rank": None,
+            "sensor_target_value": 4096,
+        }
+        self.assertEqual(runner.performance_ineligibility_reasons(row, selection), [])
+
+    def test_exact_projected_profile_accepts_whitney_compact(self):
+        common = [
+            "--refinement",
+            "8",
+            "--observation-class",
+            "fixed_footprint_magnetic_volume",
+            "--sensor-count",
+            "4096",
+            "--repeated-data",
+            "100",
+            "--workload-phase",
+            "cold_setup",
+            "--resource-method",
+            "whitney_compact",
+        ]
+        args = runner.parse_args(
+            ["--profile", runner.EXACT_PROJECTED_PROFILE, *common]
+        )
+        selection = runner.requested_resource_selection(args)
+        self.assertEqual(selection["method"], "whitney_compact")
 
     def test_frozen_juq_sensor_and_qoi_metadata_pass_the_performance_gate(self):
         selection = {

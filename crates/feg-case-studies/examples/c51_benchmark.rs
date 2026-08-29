@@ -76,10 +76,13 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     let profile = &arguments[0];
     if !matches!(
         profile.as_str(),
-        "smoke" | "juq-performance-v1" | "juq-exact-performance-v1"
+        "smoke"
+            | "juq-performance-v1"
+            | "juq-exact-performance-v1"
+            | "juq-exact-projected-performance-v1"
     ) {
         return Err(format!(
-            "resource profile {profile:?} is unavailable; use smoke, juq-performance-v1, or juq-exact-performance-v1"
+            "resource profile {profile:?} is unavailable; use smoke, juq-performance-v1, juq-exact-performance-v1, or juq-exact-projected-performance-v1"
         )
         .into());
     }
@@ -129,9 +132,9 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let config = match profile.as_str() {
         "smoke" => C51ResourceConfig::smoke(selection),
-        "juq-performance-v1" | "juq-exact-performance-v1" => {
-            C51ResourceConfig::juq_performance(selection)
-        }
+        "juq-performance-v1"
+        | "juq-exact-performance-v1"
+        | "juq-exact-projected-performance-v1" => C51ResourceConfig::juq_performance(selection),
         _ => unreachable!("validated resource profile"),
     };
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");

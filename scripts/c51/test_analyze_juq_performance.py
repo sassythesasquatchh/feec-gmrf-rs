@@ -106,6 +106,31 @@ class AnalyzeJuqPerformanceTests(unittest.TestCase):
         with self.assertRaisesRegex(analysis.AnalysisError, "at least three"):
             analysis.exact_paired_bootstrap_median_ci([0.5, 0.6])
 
+    def test_projected_context_reports_ratios_without_a_pass_label(self):
+        points = self.points(compact_time=40.0, compact_rss=50.0)
+        for refinement in analysis.REFINEMENTS:
+            for data_count in analysis.DATA_COUNTS:
+                for replicate in range(3):
+                    points.append(
+                        analysis.ResourcePoint(
+                            refinement,
+                            data_count,
+                            replicate,
+                            "fm_aug",
+                            80.0,
+                            100.0,
+                            75.0,
+                        )
+                    )
+        summaries = analysis.context_resource_ratios(
+            points,
+            "whitney_compact",
+            ("fm_aug", "exact_observation_gp", "spectral_low_rank"),
+        )
+        self.assertEqual(len(summaries), 12)
+        self.assertTrue(all(summary.time_ratio_median <= 0.5 for summary in summaries))
+        self.assertFalse(hasattr(summaries[0], "practical_advantage"))
+
 
 if __name__ == "__main__":
     unittest.main()

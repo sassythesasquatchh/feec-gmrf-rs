@@ -168,6 +168,61 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
             campaign.should_continue_after_cell(self.profile, {"status": "failed"})
         )
 
+    def test_exact_projected_profile_adds_context_method_without_changing_exact_gate(self):
+        profile_path = SCRIPT_DIR / "juq-exact-projected-performance-v1.json"
+        profile = campaign.read_json(profile_path)
+        campaign.validate_profile(profile)
+        decisions = []
+        for refinement in (8, 10):
+            one = self.decision(refinement, 4096)
+            one["spectral_low_rank"]["qualification_rule"] = (
+                "pre_registered_2pct_sensitivity"
+            )
+            one["spectral_low_rank"]["rank_selection_tolerance"] = 0.02
+            one["exact_constrained"] = {
+                "validation_status": "perf0_same_law_validated",
+                "fixture_id": "PERF-0",
+                "fixture_artifact_sha256": "d" * 64,
+            }
+            one["whitney_compact"].update(
+                {
+                    "validation_status": "measured_accuracy_context",
+                    "selection_relative_error": 0.13,
+                    "heldout_relative_error": 0.19,
+                    "fixed_tau_unnormalized": True,
+                }
+            )
+            decisions.append(one)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "exact-projected-decisions.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": campaign.RANK_DECISION_SCHEMA_VERSION,
+                        "profile": campaign.EXACT_PROJECTED_PROFILE_NAME,
+                        "status": "frozen_heldout_validated",
+                        "decisions": decisions,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            indexed, _ = campaign.load_rank_decisions(path, profile)
+        cells = campaign.generate_cells(profile, indexed)
+        self.assertEqual(len(cells), 128)
+        self.assertEqual(
+            {cell.method for cell in cells},
+            {
+                "fm_aug",
+                "whitney_compact",
+                "exact_observation_gp",
+                "spectral_low_rank",
+            },
+        )
+        self.assertEqual(
+            profile["decision_rule"]["projected_whitney_role"],
+            "fixed_tau_accuracy_unmatched_pareto_context_not_a_claim_clearing_comparator",
+        )
+
     def test_selected_primary_tier_requires_only_its_two_rank_decisions(self):
         decisions = {
             campaign.rank_key(refinement, 2048, self.profile): self.decision(

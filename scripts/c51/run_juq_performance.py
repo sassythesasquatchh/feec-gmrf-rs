@@ -33,6 +33,7 @@ PROFILE_SCHEMA_VERSION = "c51-juq-performance-profile-v1"
 RANK_DECISION_SCHEMA_VERSION = "c51-performance-rank-decisions-v2"
 COMPACT_PROFILE_NAME = "juq-performance-v1"
 EXACT_PROFILE_NAME = "juq-exact-performance-v1"
+EXACT_PROJECTED_PROFILE_NAME = "juq-exact-projected-performance-v1"
 DEFAULT_PROFILE = pathlib.Path(__file__).with_name("juq-performance-v1.json")
 DEFAULT_RANK_DECISIONS = pathlib.Path(__file__).with_name(
     "juq-performance-v1-rank-decisions.template.json"
@@ -92,6 +93,14 @@ EXACT_EXPECTED_AXES = {
     "workload_phases": ["cold_setup", "query_physical_uq"],
     "observation_class": "fixed_footprint_magnetic_volume",
 }
+EXACT_PROJECTED_EXPECTED_AXES = EXACT_EXPECTED_AXES | {
+    "methods": [
+        "fm_aug",
+        "whitney_compact",
+        "exact_observation_gp",
+        "spectral_low_rank",
+    ],
+}
 EXACT_EXPECTED_EVIDENCE_TIERS = [
     {
         "id": "claim_primary_exact",
@@ -103,10 +112,21 @@ EXACT_EXPECTED_EVIDENCE_TIERS = [
         "measured_replicates": 3,
     }
 ]
+EXACT_PROJECTED_EXPECTED_EVIDENCE_TIERS = [
+    EXACT_EXPECTED_EVIDENCE_TIERS[0]
+    | {
+        "role": "claim_bearing_exact_time_throughput_with_projected_accuracy_resource_context"
+    }
+]
 PROFILE_CONTRACTS = {
     COMPACT_PROFILE_NAME: (COMPACT_EXPECTED_AXES, COMPACT_EXPECTED_EVIDENCE_TIERS),
     EXACT_PROFILE_NAME: (EXACT_EXPECTED_AXES, EXACT_EXPECTED_EVIDENCE_TIERS),
+    EXACT_PROJECTED_PROFILE_NAME: (
+        EXACT_PROJECTED_EXPECTED_AXES,
+        EXACT_PROJECTED_EXPECTED_EVIDENCE_TIERS,
+    ),
 }
+EXACT_LIKE_PROFILE_NAMES = {EXACT_PROFILE_NAME, EXACT_PROJECTED_PROFILE_NAME}
 # Backward-compatible names used by the compact-v1 tests and downstream
 # validation code. New code resolves its contract from the profile payload.
 PROFILE_NAME = COMPACT_PROFILE_NAME
@@ -233,7 +253,7 @@ def validate_profile(profile: Mapping[str, Any]) -> None:
         raise ValueError(f"{profile_name} evidence tiers differ from the immutable contract")
     expected_execution = (
         EXACT_EXPECTED_EXECUTION
-        if profile_name == EXACT_PROFILE_NAME
+        if profile_name in EXACT_LIKE_PROFILE_NAMES
         else EXPECTED_EXECUTION
     )
     if profile.get("execution") != expected_execution:
@@ -355,7 +375,7 @@ def load_rank_decisions(
             )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"rank decision {index} has invalid qualification metrics") from error
-        if profile_name == EXACT_PROFILE_NAME:
+        if profile_name in EXACT_LIKE_PROFILE_NAMES:
             if spectral.get("qualification_rule") != "pre_registered_2pct_sensitivity":
                 raise ValueError(
                     f"rank decision {index} exact campaign requires the preregistered 2 percent sensitivity rule"
@@ -413,7 +433,44 @@ def load_rank_decisions(
                 raise ValueError(f"rank decision {index} compact method lacks identical H/G maps")
             if compact.get("method_performance_timing_eligible") is not False:
                 raise ValueError(f"rank decision {index} compact accuracy row is timing eligible")
-        else:
+        elif profile_name == EXACT_PROJECTED_PROFILE_NAME:
+            try:
+                compact = decision["whitney_compact"]
+                compact_error = float(compact["heldout_relative_error"])
+                compact_selection_error = float(compact["selection_relative_error"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"rank decision {index} lacks projected-Whitney context accuracy: {error}"
+                ) from error
+            if compact.get("validation_status") != "measured_accuracy_context":
+                raise ValueError(
+                    f"rank decision {index} projected-Whitney context is not measured"
+                )
+            if compact.get("fixed_tau_unnormalized") is not True:
+                raise ValueError(
+                    f"rank decision {index} projected-Whitney context changes the fixed-tau law"
+                )
+            if not 0.0 <= compact_error or not 0.0 <= compact_selection_error:
+                raise ValueError(
+                    f"rank decision {index} projected-Whitney context has invalid errors"
+                )
+            compact_hash = require_sha256(
+                compact.get("accuracy_artifact_sha256", ""),
+                f"rank decision {index} projected-Whitney accuracy artifact",
+            )
+            if compact_hash != common_hash:
+                raise ValueError(
+                    f"rank decision {index} does not bind projected Whitney and spectral accuracy"
+                )
+            if compact.get("identical_observation_and_output_maps") is not True:
+                raise ValueError(
+                    f"rank decision {index} projected Whitney lacks identical H/G maps"
+                )
+            if compact.get("method_performance_timing_eligible") is not False:
+                raise ValueError(
+                    f"rank decision {index} projected-Whitney accuracy row is timing eligible"
+                )
+        if profile_name in EXACT_LIKE_PROFILE_NAMES:
             try:
                 exact_constrained = decision["exact_constrained"]
             except (KeyError, TypeError) as error:
@@ -438,7 +495,7 @@ def load_rank_decisions(
             exact_gp.get("fixture_artifact_sha256", ""),
             f"rank decision {index} PERF-0 fixture artifact",
         )
-        if profile_name == EXACT_PROFILE_NAME and exact_constrained_hash != exact_gp_hash:
+        if profile_name in EXACT_LIKE_PROFILE_NAMES and exact_constrained_hash != exact_gp_hash:
             raise ValueError(
                 f"rank decision {index} exact methods do not share one PERF-0 artifact"
             )

@@ -204,6 +204,56 @@ python3 scripts/c51/run_juq_performance.py --dry-run \
   --rank-decisions out/c51/primary-rank-decisions.json
 ```
 
+## Four-method exact plus projected campaign
+
+`juq-exact-projected-performance-v1.json` preserves the frozen three-method
+exact campaign and adds `whitney_compact` as a fourth, explicitly
+accuracy-unmatched Pareto point. The claim-bearing comparison remains
+`fm_aug` versus the exact observation-space GP and the independently
+2%-qualified spectral GP. Projected-Whitney resource ratios are descriptive:
+they cannot clear the exact-law claim because the separately archived fixed-
+`tau` covariance errors are material.
+
+For state degree one, let `E0` and `E1` denote the FEEC projected sparse
+approximations to the lower and state mass inverses. The fourth model assembles
+
+```text
+L_projected = D1^T M2 D1 + M1 D0 E0 D0^T M1
+A_projected = kappa^2 M1 + L_projected
+Q_projected = tau^2 A_projected E1 A_projected       (alpha = 2)
+```
+
+and conditions the ordinary `N`-coefficient GMRF through
+`Q_projected + H^T R^-1 H`. There are no auxiliary variables or KKT
+constraints. Both inverse sites use the canonical
+`MaternPriorBuilder::from_feec_whitney_projected` path; the benchmark does not
+reimplement either projection. The current submitted-policy implementation
+assembles on the full cochain spaces and then applies active principal
+restriction, rather than silently substituting the later boundary-first
+ablation.
+
+Derive a four-method decision artifact from the same `m=4096` accuracy
+attempts and PERF-0 archive used by the exact campaign:
+
+```text
+python3 scripts/c51/derive_exact_rank_decisions.py \
+  --profile juq-exact-projected-performance-v1 \
+  --perf0-archive <perf0-archive> \
+  --output out/c51/exact-projected-rank-decisions.json \
+  <n8-m4096-attempt> <n10-m4096-attempt>
+
+python3 scripts/c51/run_juq_performance.py \
+  --profile-file scripts/c51/juq-exact-projected-performance-v1.json \
+  --rank-decisions out/c51/exact-projected-rank-decisions.json \
+  --evidence-tier claim_primary_exact \
+  --output out/c51/juq-exact-projected-performance-v1-macos
+```
+
+The profile runs 32 warm-up and 96 measured method-phase processes. The
+analyzer adjudicates only the two fair exact/spectral comparators and emits a
+separate projected-Whitney table containing fixed-`tau` accuracy and paired
+time, RSS, and persistent-storage ratios.
+
 ## Spectral covariance-rank discovery guard
 
 The dedicated rank-discovery study has a separate capped runner:

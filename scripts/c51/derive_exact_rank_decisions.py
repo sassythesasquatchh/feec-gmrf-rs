@@ -16,6 +16,7 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA_VERSION = "c51-performance-rank-decisions-v2"
 PROFILE = "juq-exact-performance-v1"
+PROJECTED_PROFILE = "juq-exact-projected-performance-v1"
 SENSOR_DESIGN = "c51-magnetic-fixed-footprint-maximin-12-v1"
 OUTPUT_DESIGN = "rank_study_selection_and_held_out_wendland_c2_18"
 CAMPAIGN_TOLERANCE = 0.05
@@ -106,7 +107,9 @@ def validate_perf0(directory: pathlib.Path) -> str:
     return named_files_hash(directory, PERF0_FILES)
 
 
-def derive_one(attempt: pathlib.Path, perf0_hash: str) -> dict[str, Any]:
+def derive_one(
+    attempt: pathlib.Path, perf0_hash: str, profile_name: str = PROFILE
+) -> dict[str, Any]:
     manifest_path = attempt / "attempt_manifest.json"
     manifest = read_json(manifest_path)
     if manifest.get("outcome") != "completed" or manifest.get("raw_return_code") != 0:
@@ -178,7 +181,7 @@ def derive_one(attempt: pathlib.Path, perf0_hash: str) -> dict[str, Any]:
         for name in ("feec", "gmrf")
     ):
         raise ValueError(f"{attempt} replay source is dirty")
-    return {
+    result = {
         "decision_id": f"exact-rank-n{refinement}-m4096-r{rank}",
         "source_accuracy_profile": profile,
         "source_attempt_manifest_sha256": sha256_file(manifest_path),
@@ -224,20 +227,76 @@ def derive_one(attempt: pathlib.Path, perf0_hash: str) -> dict[str, Any]:
         },
         "accuracy_artifact_hash_scope": "canonical_c51_accuracy_archive_files_v1",
     }
+    if profile_name == PROJECTED_PROFILE:
+        compact_rows = load_csv(study / "compact_accuracy.csv")
+        matching_compact = [
+            row
+            for row in compact_rows
+            if row.get("method") == "whitney_compact_projected"
+            and row.get("refinement") == str(refinement)
+            and row.get("alpha") == "2"
+            and row.get("design") == "high_m4096"
+            and row.get("observation_count") == "4096"
+        ]
+        if len(matching_compact) != 1:
+            raise ValueError(
+                f"{attempt} has {len(matching_compact)} projected-Whitney m=4096 rows instead of one"
+            )
+        compact = matching_compact[0]
+        if compact.get("status") != "measured":
+            raise ValueError(f"{attempt} projected-Whitney context is not measured")
+        if compact.get("method_performance_timing_eligible") != "false":
+            raise ValueError(
+                f"{attempt} projected-Whitney accuracy row is incorrectly timing eligible"
+            )
+        selection_primary = float(compact["selection_e_primary"])
+        heldout_primary = float(compact["heldout_e_primary"])
+        selection_correlation = float(compact["selection_e_corr"])
+        heldout_correlation = float(compact["heldout_e_corr"])
+        if any(
+            value < 0.0
+            for value in (
+                selection_primary,
+                heldout_primary,
+                selection_correlation,
+                heldout_correlation,
+            )
+        ):
+            raise ValueError(f"{attempt} projected-Whitney context has negative error")
+        result["whitney_compact"] = {
+            "validation_status": "measured_accuracy_context",
+            "selection_relative_error": selection_primary,
+            "heldout_relative_error": heldout_primary,
+            "selection_correlation_relative_error": selection_correlation,
+            "heldout_correlation_relative_error": heldout_correlation,
+            "passes_primary_5pct_envelope": max(selection_primary, heldout_primary)
+            <= CAMPAIGN_TOLERANCE,
+            "fixed_tau_unnormalized": True,
+            "identical_observation_and_output_maps": True,
+            "method_performance_timing_eligible": False,
+            "accuracy_artifact_sha256": archive_hash,
+        }
+    return result
 
 
-def derive(attempts: Sequence[pathlib.Path], perf0: pathlib.Path) -> dict[str, Any]:
+def derive(
+    attempts: Sequence[pathlib.Path],
+    perf0: pathlib.Path,
+    profile_name: str = PROFILE,
+) -> dict[str, Any]:
+    if profile_name not in (PROFILE, PROJECTED_PROFILE):
+        raise ValueError(f"unsupported exact rank-decision profile {profile_name!r}")
     if not attempts:
         raise ValueError("at least one replay attempt is required")
     perf0_hash = validate_perf0(perf0)
-    decisions = [derive_one(path, perf0_hash) for path in attempts]
+    decisions = [derive_one(path, perf0_hash, profile_name) for path in attempts]
     decisions.sort(key=lambda item: int(item["refinement"]))
     refinements = [int(item["refinement"]) for item in decisions]
     if len(refinements) != len(set(refinements)):
         raise ValueError("replay attempts contain duplicate refinements")
     return {
         "schema_version": SCHEMA_VERSION,
-        "profile": PROFILE,
+        "profile": profile_name,
         "status": "frozen_heldout_validated",
         "source_attempts": [str(path) for path in attempts],
         "perf0_archive": str(perf0),
@@ -259,6 +318,11 @@ def write_atomic(path: pathlib.Path, payload: Mapping[str, Any]) -> None:
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--perf0-archive", type=pathlib.Path, required=True)
+    parser.add_argument(
+        "--profile",
+        choices=(PROFILE, PROJECTED_PROFILE),
+        default=PROFILE,
+    )
     parser.add_argument("--output", type=pathlib.Path, required=True)
     parser.add_argument("attempts", type=pathlib.Path, nargs="+")
     return parser.parse_args(argv)
@@ -267,7 +331,10 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     try:
-        write_atomic(args.output, derive(args.attempts, args.perf0_archive))
+        write_atomic(
+            args.output,
+            derive(args.attempts, args.perf0_archive, args.profile),
+        )
     except (OSError, ValueError) as error:
         print(f"C51 exact rank decision failed: {error}", file=sys.stderr)
         return 2

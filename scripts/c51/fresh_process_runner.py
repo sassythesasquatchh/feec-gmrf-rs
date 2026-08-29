@@ -42,8 +42,19 @@ THREAD_ENV_NAMES = (
     "RAYON_NUM_THREADS",
     "FAER_NUM_THREADS",
 )
-SUPPORTED_PROFILES = ("smoke", "juq-performance-v1", "juq-exact-performance-v1")
-PUBLICATION_PROFILES = ("juq-performance-v1", "juq-exact-performance-v1")
+EXACT_PROFILE = "juq-exact-performance-v1"
+EXACT_PROJECTED_PROFILE = "juq-exact-projected-performance-v1"
+SUPPORTED_PROFILES = (
+    "smoke",
+    "juq-performance-v1",
+    EXACT_PROFILE,
+    EXACT_PROJECTED_PROFILE,
+)
+PUBLICATION_PROFILES = (
+    "juq-performance-v1",
+    EXACT_PROFILE,
+    EXACT_PROJECTED_PROFILE,
+)
 RESOURCE_METHODS = (
     "fm_direct",
     "fm_aug",
@@ -69,6 +80,12 @@ JUQ_PERFORMANCE_METHODS = (
 )
 JUQ_EXACT_PERFORMANCE_METHODS = (
     "fm_aug",
+    "exact_observation_gp",
+    "spectral_low_rank",
+)
+JUQ_EXACT_PROJECTED_PERFORMANCE_METHODS = (
+    "fm_aug",
+    "whitney_compact",
     "exact_observation_gp",
     "spectral_low_rank",
 )
@@ -774,9 +791,9 @@ def validate_publication_peak_rss_mode(profile: str, cgroup_mode: str) -> None:
         raise ValueError(
             "juq-performance-v1 requires --cgroup-mode required for process-tree RSS"
         )
-    if profile == "juq-exact-performance-v1" and cgroup_mode == "off":
+    if profile in (EXACT_PROFILE, EXACT_PROJECTED_PROFILE) and cgroup_mode == "off":
         raise ValueError(
-            "juq-exact-performance-v1 requires automatic external peak-RSS measurement"
+            f"{profile} requires automatic external peak-RSS measurement"
         )
 
 
@@ -804,11 +821,12 @@ def validate_juq_performance_selection(
             f"{profile} replacement-data count must be one of "
             + ", ".join(map(str, JUQ_PERFORMANCE_REPEATED_DATA_COUNTS))
         )
-    methods = (
-        JUQ_EXACT_PERFORMANCE_METHODS
-        if profile == "juq-exact-performance-v1"
-        else JUQ_PERFORMANCE_METHODS
-    )
+    if profile == EXACT_PROFILE:
+        methods = JUQ_EXACT_PERFORMANCE_METHODS
+    elif profile == EXACT_PROJECTED_PROFILE:
+        methods = JUQ_EXACT_PROJECTED_PERFORMANCE_METHODS
+    else:
+        methods = JUQ_PERFORMANCE_METHODS
     if selection["method"] not in methods:
         raise ValueError(
             f"{profile} method must be one of " + ", ".join(methods)
@@ -981,7 +999,7 @@ def validate_publication_peak_source(
     source = peak_rss.get("source")
     if profile == "juq-performance-v1":
         allowed = {"cgroup_v2_memory_peak"}
-    elif profile == "juq-exact-performance-v1":
+    elif profile in (EXACT_PROFILE, EXACT_PROJECTED_PROFILE):
         allowed = {"cgroup_v2_memory_peak", "macos_bsd_time_maximum_rss"}
     else:
         raise ValueError(f"unknown publication profile for peak-RSS policy: {profile!r}")
@@ -1059,10 +1077,23 @@ def performance_ineligibility_reasons(
         if row.get("spectral_shared_maximum_basis_rank_status") != "not_recorded":
             reasons.append("spectral row records a shared maximum basis")
     if selection["method"] == "exact_observation_gp":
-        if row.get("exact_gp_conditioning_route") != "observation_space":
+        if row.get("solver") != "exact_observation_space_dense_cholesky":
             reasons.append("exact GP is not identified as observation-space conditioning")
-        if row.get("exact_gp_kernel_construction_in_headline_total") != "true":
+        required_timings = (
+            "feec_assembly_ns",
+            "prior_build_ns",
+            "exact_gp_covariance_construction_ns",
+            "exact_gp_dense_conditioning_ns",
+            "exact_gp_end_to_end_setup_ns",
+        )
+        if any(row.get(f"{name}_status") != "measured" for name in required_timings):
             reasons.append("exact GP headline total omits or does not certify kernel construction")
+        else:
+            components = sum(float(row[f"{name}_value"]) for name in required_timings[:-1])
+            total = float(row["exact_gp_end_to_end_setup_ns_value"])
+            timing_roundoff = max(1.0, 1.0e-12 * max(abs(total), abs(components)))
+            if abs(total - components) > timing_roundoff:
+                reasons.append("exact GP headline total does not equal assembly, prior, kernel, and dense-conditioning costs")
     return reasons
 
 

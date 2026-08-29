@@ -67,6 +67,21 @@ class PairedComparison:
     reason: str
 
 
+@dataclass(frozen=True)
+class PairedResourceRatio:
+    refinement: int
+    replacement_data_count: int
+    comparator: str
+    replicate_count: int
+    time_ratio_median: float
+    time_ratio_ci95_low: float
+    time_ratio_ci95_high: float
+    peak_rss_ratio_median: float
+    peak_rss_ratio_ci95_low: float
+    peak_rss_ratio_ci95_high: float
+    storage_ratio_median: float
+
+
 def read_json(path: pathlib.Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -297,6 +312,63 @@ def compare(
     return comparisons
 
 
+def context_resource_ratios(
+    points: Sequence[ResourcePoint],
+    baseline: str,
+    comparators: Sequence[str],
+) -> list[PairedResourceRatio]:
+    indexed = {
+        (point.refinement, point.replacement_data_count, point.replicate, point.method): point
+        for point in points
+    }
+    summaries: list[PairedResourceRatio] = []
+    for refinement, data_count, comparator in itertools.product(
+        REFINEMENTS, DATA_COUNTS, comparators
+    ):
+        replicates = sorted(
+            {
+                point.replicate
+                for point in points
+                if point.refinement == refinement
+                and point.replacement_data_count == data_count
+            }
+        )
+        if len(replicates) != 3:
+            raise AnalysisError(
+                f"n={refinement}, D={data_count} has {len(replicates)} replicates instead of 3"
+            )
+        time_ratios: list[float] = []
+        rss_ratios: list[float] = []
+        storage_ratios: list[float] = []
+        for replicate in replicates:
+            try:
+                candidate = indexed[(refinement, data_count, replicate, baseline)]
+                other = indexed[(refinement, data_count, replicate, comparator)]
+            except KeyError as error:
+                raise AnalysisError(f"missing paired context method row: {error}") from error
+            time_ratios.append(candidate.end_to_end_time_ns / other.end_to_end_time_ns)
+            rss_ratios.append(candidate.gross_peak_rss_bytes / other.gross_peak_rss_bytes)
+            storage_ratios.append(candidate.persistent_values / other.persistent_values)
+        time_low, time_high = exact_paired_bootstrap_median_ci(time_ratios)
+        rss_low, rss_high = exact_paired_bootstrap_median_ci(rss_ratios)
+        summaries.append(
+            PairedResourceRatio(
+                refinement,
+                data_count,
+                comparator,
+                len(replicates),
+                median(time_ratios),
+                time_low,
+                time_high,
+                median(rss_ratios),
+                rss_low,
+                rss_high,
+                median(storage_ratios),
+            )
+        )
+    return summaries
+
+
 def analyze(
     campaign_directory: pathlib.Path, rank_decisions: pathlib.Path
 ) -> dict[str, Any]:
@@ -306,13 +378,12 @@ def analyze(
     profile_name = str(manifest.get("profile"))
     if profile_name not in campaign.PROFILE_CONTRACTS:
         raise AnalysisError("campaign manifest has the wrong profile")
-    exact_campaign = profile_name == campaign.EXACT_PROFILE_NAME
-    evidence_tier = "claim_primary_exact" if exact_campaign else "claim_primary"
-    methods = (
-        ("fm_aug", "exact_observation_gp", "spectral_low_rank")
-        if exact_campaign
-        else METHODS
+    exact_campaign = profile_name in campaign.EXACT_LIKE_PROFILE_NAMES
+    projected_context_campaign = (
+        profile_name == campaign.EXACT_PROJECTED_PROFILE_NAME
     )
+    evidence_tier = "claim_primary_exact" if exact_campaign else "claim_primary"
+    methods = tuple(campaign.PROFILE_CONTRACTS[profile_name][0]["methods"])
     baseline = "fm_aug" if exact_campaign else "whitney_compact"
     comparators = COMPARATORS
     observation_count = 4096 if exact_campaign else OBSERVATION_COUNT
@@ -382,7 +453,7 @@ def analyze(
     if (
         combined_record.get("path") != "combined-rows.csv"
         or combined_record.get("sha256") != campaign.sha256_file(combined_path)
-        or combined_record.get("count") != 36
+        or combined_record.get("count") != (48 if projected_context_campaign else 36)
     ):
         raise AnalysisError("combined rows do not match their frozen manifest record")
     with combined_path.open(
@@ -415,8 +486,11 @@ def analyze(
         )
         for row in rows
     ]
-    if len(points) != 36:
-        raise AnalysisError(f"primary campaign requires 36 measured combined rows, found {len(points)}")
+    expected_point_count = 48 if projected_context_campaign else 36
+    if len(points) != expected_point_count:
+        raise AnalysisError(
+            f"primary campaign requires {expected_point_count} measured combined rows, found {len(points)}"
+        )
     if len(
         {
             (point.refinement, point.replacement_data_count, point.replicate, point.method)
@@ -430,7 +504,38 @@ def analyze(
         comparators,
         memory_noninferiority_required=not exact_campaign,
     )
+    projected_context_ratios = (
+        context_resource_ratios(
+            points,
+            "whitney_compact",
+            ("fm_aug", "exact_observation_gp", "spectral_low_rank"),
+        )
+        if projected_context_campaign
+        else []
+    )
+    projected_accuracy = (
+        [
+            {
+                "refinement": refinement,
+                **decisions[campaign.rank_key(refinement, observation_count, profile)][
+                    "whitney_compact"
+                ],
+            }
+            for refinement in REFINEMENTS
+        ]
+        if projected_context_campaign
+        else []
+    )
     passed = all(comparison.practical_advantage for comparison in comparisons)
+    limitations = [
+        "This is a bounded n=8,10 regime result, not an asymptotic complexity proof.",
+        "Only three measured replicate pairs make the interval conservative and low-resolution.",
+        "Gross process peak RSS, not analytic storage, controls the memory claim.",
+    ]
+    if projected_context_campaign:
+        limitations.append(
+            "Projected-Whitney resource ratios do not clear the exact-law claim because its separately archived fixed-tau posterior covariance error is material."
+        )
     return {
         "schema_version": SCHEMA_VERSION,
         "claim": "C51",
@@ -455,11 +560,15 @@ def analyze(
         "rank_decision_status": decision_payload.get("status"),
         "point_count": len(points),
         "comparisons": [asdict(comparison) for comparison in comparisons],
-        "limitations": [
-            "This is a bounded n=8,10 regime result, not an asymptotic complexity proof.",
-            "Only three measured replicate pairs make the interval conservative and low-resolution.",
-            "Gross process peak RSS, not analytic storage, controls the memory claim.",
-        ],
+        "projected_whitney_context": {
+            "claim_bearing": False,
+            "reason": "fixed-tau projected inverse is reported as an accuracy-resource Pareto point and is not accuracy-matched to the exact law",
+            "accuracy": projected_accuracy,
+            "resource_ratios": [
+                asdict(summary) for summary in projected_context_ratios
+            ],
+        },
+        "limitations": limitations,
     }
 
 
@@ -480,6 +589,42 @@ def write_markdown(path: pathlib.Path, result: Mapping[str, Any]) -> None:
                 **item, passed="yes" if item["practical_advantage"] else "no"
             )
         )
+    projected = result.get("projected_whitney_context", {})
+    if projected.get("resource_ratios"):
+        lines.extend(
+            [
+                "",
+                "## Projected-Whitney accuracy--resource context",
+                "",
+                "These ratios are descriptive only; the projected law is not accuracy-matched to the exact law.",
+                "",
+                "| n | selection covariance error | held-out covariance error | selection correlation error | held-out correlation error | 5% pass |",
+                "|---:|---:|---:|---:|---:|:---:|",
+            ]
+        )
+        for item in projected["accuracy"]:
+            lines.append(
+                "| {refinement} | {selection_relative_error:.3%} | {heldout_relative_error:.3%} | "
+                "{selection_correlation_relative_error:.3%} | {heldout_correlation_relative_error:.3%} | {passed} |".format(
+                    **item,
+                    passed="yes" if item["passes_primary_5pct_envelope"] else "no",
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "| n | D | denominator | time ratio median [95%] | RSS ratio median [95%] |",
+                "|---:|---:|---|---:|---:|",
+            ]
+        )
+        for item in projected["resource_ratios"]:
+            lines.append(
+                "| {refinement} | {replacement_data_count} | {comparator} | "
+                "{time_ratio_median:.3f} [{time_ratio_ci95_low:.3f}, {time_ratio_ci95_high:.3f}] | "
+                "{peak_rss_ratio_median:.3f} [{peak_rss_ratio_ci95_low:.3f}, {peak_rss_ratio_ci95_high:.3f}] |".format(
+                    **item
+                )
+            )
     lines.extend(["", *[f"- {item}" for item in result["limitations"]]])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

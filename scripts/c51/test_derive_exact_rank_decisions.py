@@ -99,6 +99,39 @@ class DeriveExactRankDecisionTests(unittest.TestCase):
                     "method_performance_timing_eligible": "false",
                 }
             )
+        compact_fields = [
+            "method",
+            "method_performance_timing_eligible",
+            "refinement",
+            "alpha",
+            "design",
+            "observation_count",
+            "status",
+            "selection_e_primary",
+            "heldout_e_primary",
+            "selection_e_corr",
+            "heldout_e_corr",
+        ]
+        with (study / "compact_accuracy.csv").open(
+            "w", encoding="utf-8", newline=""
+        ) as stream:
+            writer = csv.DictWriter(stream, fieldnames=compact_fields)
+            writer.writeheader()
+            writer.writerow(
+                {
+                    "method": "whitney_compact_projected",
+                    "method_performance_timing_eligible": "false",
+                    "refinement": 8,
+                    "alpha": 2,
+                    "design": "high_m4096",
+                    "observation_count": 4096,
+                    "status": "measured",
+                    "selection_e_primary": 0.13,
+                    "heldout_e_primary": 0.19,
+                    "selection_e_corr": 0.02,
+                    "heldout_e_corr": 0.01,
+                }
+            )
         manifest = {
             "outcome": "completed",
             "raw_return_code": 0,
@@ -148,6 +181,25 @@ class DeriveExactRankDecisionTests(unittest.TestCase):
             self.write_attempt(attempt, dirty=True)
             with self.assertRaisesRegex(ValueError, "dirty"):
                 decision.derive([attempt], perf0)
+
+    def test_projected_profile_archives_fixed_tau_accuracy_context(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            perf0 = root / "perf0"
+            attempt = root / "attempt"
+            perf0.mkdir()
+            self.write_perf0(perf0)
+            self.write_attempt(attempt)
+            payload = decision.derive(
+                [attempt], perf0, decision.PROJECTED_PROFILE
+            )
+        compact = payload["decisions"][0]["whitney_compact"]
+        self.assertEqual(payload["profile"], decision.PROJECTED_PROFILE)
+        self.assertEqual(compact["validation_status"], "measured_accuracy_context")
+        self.assertTrue(compact["fixed_tau_unnormalized"])
+        self.assertFalse(compact["passes_primary_5pct_envelope"])
+        self.assertEqual(compact["selection_relative_error"], 0.13)
+        self.assertEqual(compact["heldout_relative_error"], 0.19)
 
 
 if __name__ == "__main__":
