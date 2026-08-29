@@ -46,6 +46,32 @@ RANK_EXTENSION_PROFILES = {
         "evidence_tier": "rank_extension",
     },
 }
+HIGH_OBSERVATION_PROFILES = {
+    "high-observation-primary-m2048-v1-n8": {
+        "refinement": 8,
+        "state_dimension": 3032,
+        "ranks": (512, 768, 1024, 1280, 1536, 1792, 2000, 2048, 2304, 2560, 2816, 3000, 3032),
+        "evidence_tier": "high_observation_primary_accuracy",
+    },
+    "high-observation-primary-m2048-v1-n10": {
+        "refinement": 10,
+        "state_dimension": 6130,
+        "ranks": (512, 768, 1024, 1280, 1536, 1792, 2000, 2048, 2560, 3072, 3584, 4096, 4608, 5120, 5632, 6000, 6130),
+        "evidence_tier": "high_observation_primary_accuracy",
+    },
+    "high-observation-confirmatory-m4096-v1-n8": {
+        "refinement": 8,
+        "state_dimension": 3032,
+        "ranks": (512, 768, 1024, 1280, 1536, 1792, 2000, 2048, 2304, 2560, 2816, 3000, 3032),
+        "evidence_tier": "high_observation_confirmatory_accuracy",
+    },
+    "high-observation-confirmatory-m4096-v1-n10": {
+        "refinement": 10,
+        "state_dimension": 6130,
+        "ranks": (512, 768, 1024, 1280, 1536, 1792, 2000, 2048, 2560, 3072, 3584, 4096, 4608, 5120, 5632, 6000, 6130),
+        "evidence_tier": "high_observation_confirmatory_accuracy",
+    },
+}
 RANK_EXTENSION_RATIONALE = (
     "post-primary extension frozen after publication-discovery-v1 left corrected "
     "alpha=2 5%/2% decisions unresolved; shared-basis rows are timing ineligible"
@@ -235,6 +261,7 @@ def scientific_command(
     refinement: int,
     maximum_rank: int | None,
     study_output: pathlib.Path,
+    perf0_archive: pathlib.Path | None = None,
 ) -> list[str]:
     command = [
         str(binary),
@@ -247,6 +274,15 @@ def scientific_command(
     ]
     if maximum_rank is not None:
         command[5:5] = ["--maximum-rank", str(maximum_rank)]
+    if perf0_archive is not None:
+        command.extend(
+            [
+                "--perf0-archive",
+                str(perf0_archive),
+                "--rank-decision-output",
+                str(study_output / "rank-decision.json"),
+            ]
+        )
     return command
 
 
@@ -267,6 +303,7 @@ def resolve_profile(
             "evidence_tier": "rank_discovery",
             "post_primary": False,
             "post_primary_rationale": None,
+            "rank_decision_required": False,
         }
     if profile in RANK_EXTENSION_PROFILES:
         frozen = RANK_EXTENSION_PROFILES[profile]
@@ -285,6 +322,26 @@ def resolve_profile(
             "evidence_tier": frozen["evidence_tier"],
             "post_primary": True,
             "post_primary_rationale": RANK_EXTENSION_RATIONALE,
+            "rank_decision_required": False,
+        }
+    if profile in HIGH_OBSERVATION_PROFILES:
+        frozen = HIGH_OBSERVATION_PROFILES[profile]
+        if refinement != frozen["refinement"]:
+            raise ValueError(
+                f"{profile} requires refinement {frozen['refinement']}, received {refinement}"
+            )
+        if maximum_rank is not None:
+            raise ValueError(f"{profile} has an immutable grid and rejects --maximum-rank")
+        return {
+            "profile": profile,
+            "refinement": refinement,
+            "maximum_rank": frozen["ranks"][-1],
+            "rank_grid": list(frozen["ranks"]),
+            "expected_state_dimension": frozen["state_dimension"],
+            "evidence_tier": frozen["evidence_tier"],
+            "post_primary": False,
+            "post_primary_rationale": "pre-performance held-out rank qualification",
+            "rank_decision_required": True,
         }
     raise ValueError(f"unknown C51 spectral covariance profile {profile}")
 
@@ -672,10 +729,17 @@ def dry_run_plan(
         "maximum_rank": profile["maximum_rank"],
         "rank_grid": profile["rank_grid"],
         "expected_state_dimension": profile["expected_state_dimension"],
+        "rank_decision_required": profile["rank_decision_required"],
+        "perf0_archive": str(args.perf0_archive.resolve()) if args.perf0_archive else None,
         "build_command": build_command(args.cargo),
         "anticipated_binary": str(binary),
         "scientific_command": scientific_command(
-            binary, args.profile, args.refinement, args.maximum_rank, output / "study"
+            binary,
+            args.profile,
+            args.refinement,
+            args.maximum_rank,
+            output / "study",
+            args.perf0_archive.resolve() if args.perf0_archive else None,
         ),
         "caps": {
             "wall_time_seconds": args.wall_time_limit_seconds,
@@ -706,7 +770,12 @@ def initial_manifest(
     profile: Mapping[str, Any],
 ) -> dict[str, Any]:
     scientific = scientific_command(
-        binary, args.profile, args.refinement, args.maximum_rank, output / "study"
+        binary,
+        args.profile,
+        args.refinement,
+        args.maximum_rank,
+        output / "study",
+        args.perf0_archive.resolve() if args.perf0_archive else None,
     )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -722,6 +791,8 @@ def initial_manifest(
         "maximum_rank": profile["maximum_rank"],
         "rank_grid": profile["rank_grid"],
         "expected_state_dimension": profile["expected_state_dimension"],
+        "rank_decision_required": profile["rank_decision_required"],
+        "perf0_archive": str(args.perf0_archive.resolve()) if args.perf0_archive else None,
         "requested_maximum_rank": args.maximum_rank,
         "attempt_output": str(output),
         "study_output": str(output / "study"),
@@ -761,6 +832,13 @@ def run_attempt(args: argparse.Namespace) -> int:
     try:
         validate_positive("refinement", args.refinement)
         profile = resolve_profile(args.profile, args.refinement, args.maximum_rank)
+        if profile["rank_decision_required"]:
+            if args.perf0_archive is None:
+                raise ValueError(f"{args.profile} requires --perf0-archive")
+            if not args.perf0_archive.resolve().is_dir():
+                raise ValueError("--perf0-archive must name a completed archive directory")
+        elif args.perf0_archive is not None:
+            raise ValueError("--perf0-archive is accepted only by focused high-observation profiles")
         validate_positive("maximum rank", profile["maximum_rank"])
         validate_positive("wall-time limit", args.wall_time_limit_seconds)
         validate_positive("RSS cap", args.rss_cap_bytes)
@@ -829,11 +907,18 @@ def run_attempt(args: argparse.Namespace) -> int:
             "maximum_rank": profile["maximum_rank"],
             "rank_grid": profile["rank_grid"],
             "expected_state_dimension": profile["expected_state_dimension"],
+            "rank_decision_required": profile["rank_decision_required"],
+            "perf0_archive": str(args.perf0_archive.resolve()) if args.perf0_archive else None,
             "requested_maximum_rank": args.maximum_rank,
             "attempt_output": str(output),
             "study_output": str(output / "study"),
             "command": scientific_command(
-                binary, args.profile, args.refinement, args.maximum_rank, output / "study"
+                binary,
+                args.profile,
+                args.refinement,
+                args.maximum_rank,
+                output / "study",
+                args.perf0_archive.resolve() if args.perf0_archive else None,
             ),
             "caps": {
                 "wall_time_seconds": args.wall_time_limit_seconds,
@@ -925,7 +1010,12 @@ def run_attempt(args: argparse.Namespace) -> int:
         return 2
 
     command = scientific_command(
-        binary, args.profile, args.refinement, args.maximum_rank, output / "study"
+        binary,
+        args.profile,
+        args.refinement,
+        args.maximum_rank,
+        output / "study",
+        args.perf0_archive.resolve() if args.perf0_archive else None,
     )
     result = run_monitored_process(
         command=command,
@@ -1020,12 +1110,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     )
     parser.add_argument(
         "--profile",
-        choices=(PRIMARY_PROFILE, *RANK_EXTENSION_PROFILES),
+        choices=(PRIMARY_PROFILE, *RANK_EXTENSION_PROFILES, *HIGH_OBSERVATION_PROFILES),
         default=PRIMARY_PROFILE,
     )
     parser.add_argument("--refinement", required=True, type=int)
     parser.add_argument("--maximum-rank", type=int)
     parser.add_argument("--output", required=True, type=pathlib.Path)
+    parser.add_argument("--perf0-archive", type=pathlib.Path)
     parser.add_argument("--wall-time-limit-seconds", type=float, default=DEFAULT_WALL_TIME_SECONDS)
     parser.add_argument("--rss-cap-bytes", type=int, default=DEFAULT_RSS_CAP_BYTES)
     parser.add_argument("--disk-cap-bytes", type=int, default=DEFAULT_DISK_CAP_BYTES)

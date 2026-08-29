@@ -24,9 +24,11 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA_VERSION = "c51-accuracy-resource-v4"
+SCHEMA_VERSION = "c51-accuracy-resource-v6"
 TIMING_SCHEMA_VERSIONS = {
     "c51-accuracy-resource-v3",
+    "c51-accuracy-resource-v4",
+    "c51-accuracy-resource-v5",
     SCHEMA_VERSION,
 }
 SUPPORTED_SCHEMA_VERSIONS = {
@@ -46,6 +48,16 @@ MEASUREMENT_FIELDS = (
     "factor_storage_nnz",
     "certificate_factor_storage_nnz",
     "fill_ratio",
+    "exact_gp_dense_factor_dimension",
+    "exact_gp_dense_factor_allocated_values",
+    "exact_gp_dense_factor_triangular_values",
+    "exact_gp_output_observation_covariance_values",
+    "exact_gp_posterior_output_covariance_values",
+    "exact_gp_persistent_storage_values",
+    "exact_gp_posterior_covariance_max_abs_skew",
+    "exact_gp_prior_covariance_raw_max_relative_skew",
+    "exact_gp_prior_covariance_projection_frobenius_correction",
+    "exact_gp_prior_covariance_audit_residual_aware",
     "spectral_rank",
     "spectral_basis_storage_values",
     "spectral_gp_storage_values",
@@ -56,6 +68,9 @@ MEASUREMENT_FIELDS = (
     "spectral_sampling_normal_dimension",
     "feec_assembly_ns",
     "prior_build_ns",
+    "exact_gp_covariance_construction_ns",
+    "exact_gp_dense_conditioning_ns",
+    "exact_gp_end_to_end_setup_ns",
     "spectral_operator_recovery_ns",
     "spectral_eigensolve_ns",
     "spectral_gp_build_ns",
@@ -74,6 +89,7 @@ MEASUREMENT_FIELDS = (
     "posterior_mean_relative_error",
     "covariance_action_relative_error",
     "physical_covariance_action_relative_error",
+    "physical_output_covariance_action_relative_error",
     "physical_variance_relative_error",
     "physical_transformed_variance_relative_error",
     "physical_mean_relative_error",

@@ -139,6 +139,30 @@ class SpectralRankRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "rejects --maximum-rank"):
             runner.resolve_profile("rank-extension-v1-n8", 8, 3032)
 
+    def test_high_observation_profile_reaches_n10_full_rank_and_exports_decision(self):
+        profile = "high-observation-primary-m2048-v1-n10"
+        resolved = runner.resolve_profile(profile, 10, None)
+        self.assertEqual(resolved["maximum_rank"], 6130)
+        self.assertEqual(resolved["rank_grid"][-3:], [5632, 6000, 6130])
+        self.assertTrue(resolved["rank_decision_required"])
+        command = runner.scientific_command(
+            pathlib.Path("/tmp/bin"),
+            profile,
+            10,
+            None,
+            pathlib.Path("/tmp/out/study"),
+            pathlib.Path("/tmp/perf0"),
+        )
+        self.assertNotIn("--maximum-rank", command)
+        self.assertEqual(command[-4:], [
+            "--perf0-archive",
+            "/tmp/perf0",
+            "--rank-decision-output",
+            "/tmp/out/study/rank-decision.json",
+        ])
+        with self.assertRaisesRegex(ValueError, "requires refinement 10"):
+            runner.resolve_profile(profile, 8, None)
+
     def test_build_is_locked_release_example(self):
         self.assertEqual(
             runner.build_command("cargo"),

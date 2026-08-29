@@ -1,6 +1,9 @@
 use feg_case_studies::c51_spectral_covariance_rank::{
     run_c51_spectral_covariance_rank, C51SpectralCovarianceRankConfig,
-    C51SpectralCovarianceRankMetadata, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10,
+    C51SpectralCovarianceRankMetadata, C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10,
+    C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8, C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10,
+    C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8, C51_HIGH_OBSERVATION_PROFILE_N10,
+    C51_HIGH_OBSERVATION_PROFILE_N8, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10,
     C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8,
 };
 use std::env;
@@ -12,6 +15,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut output = PathBuf::from("out/c51_spectral_covariance_rank");
     let mut refinement = None;
     let mut maximum_rank = None;
+    let mut rank_decision_output = None;
+    let mut perf0_archive = None;
     let mut index = 1;
     while index < arguments.len() {
         match arguments[index].as_str() {
@@ -43,6 +48,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .ok_or("--maximum-rank requires a value")?
                         .parse::<usize>()?,
                 );
+            }
+            "--rank-decision-output" => {
+                index += 1;
+                rank_decision_output = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or("--rank-decision-output requires a value")?,
+                ));
+            }
+            "--perf0-archive" => {
+                index += 1;
+                perf0_archive = Some(PathBuf::from(
+                    arguments
+                        .get(index)
+                        .ok_or("--perf0-archive requires a value")?,
+                ));
             }
             flag => return Err(format!("unknown argument {flag}").into()),
         }
@@ -94,6 +115,57 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             C51SpectralCovarianceRankConfig::rank_extension(refinement)?
         }
+        C51_HIGH_OBSERVATION_PROFILE_N8 | C51_HIGH_OBSERVATION_PROFILE_N10 => {
+            let expected_refinement = if profile == C51_HIGH_OBSERVATION_PROFILE_N8 {
+                8
+            } else {
+                10
+            };
+            let refinement = refinement
+                .ok_or_else(|| format!("{profile} requires --refinement {expected_refinement}"))?;
+            if refinement != expected_refinement {
+                return Err(format!(
+                    "{profile} requires --refinement {expected_refinement}, received {refinement}"
+                )
+                .into());
+            }
+            if maximum_rank.is_some() {
+                return Err(format!(
+                    "{profile} has immutable observation and rank ladders and rejects --maximum-rank"
+                )
+                .into());
+            }
+            C51SpectralCovarianceRankConfig::high_observation_accuracy(refinement)?
+        }
+        C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8 | C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10 => {
+            let expected_refinement = if profile == C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8 {
+                8
+            } else {
+                10
+            };
+            validate_focused_profile_arguments(
+                &profile,
+                refinement,
+                expected_refinement,
+                maximum_rank,
+            )?;
+            C51SpectralCovarianceRankConfig::high_observation_primary(expected_refinement)?
+        }
+        C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8
+        | C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => {
+            let expected_refinement = if profile == C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 {
+                8
+            } else {
+                10
+            };
+            validate_focused_profile_arguments(
+                &profile,
+                refinement,
+                expected_refinement,
+                maximum_rank,
+            )?;
+            C51SpectralCovarianceRankConfig::high_observation_confirmatory(expected_refinement)?
+        }
         _ => return Err(format!("unknown C51 spectral covariance profile {profile}").into()),
     };
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -101,11 +173,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         C51SpectralCovarianceRankMetadata::from_repository(arguments.join(" "), &repository_root)?;
     let archive = run_c51_spectral_covariance_rank(&config, metadata)?;
     archive.write_directory(&output)?;
+    match (rank_decision_output, perf0_archive) {
+        (Some(decision_output), Some(perf0_archive)) => {
+            archive.write_performance_rank_decision(&output, &perf0_archive, &decision_output)?;
+            println!("wrote rank decision to {}", decision_output.display());
+        }
+        (None, None) => {}
+        _ => {
+            return Err(
+                "--rank-decision-output and --perf0-archive must be supplied together".into(),
+            )
+        }
+    }
     println!(
         "wrote {} rows for {} to {}",
         archive.rows.len(),
         config.profile,
         output.display()
     );
+    Ok(())
+}
+
+fn validate_focused_profile_arguments(
+    profile: &str,
+    refinement: Option<usize>,
+    expected_refinement: usize,
+    maximum_rank: Option<usize>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let refinement = refinement
+        .ok_or_else(|| format!("{profile} requires --refinement {expected_refinement}"))?;
+    if refinement != expected_refinement {
+        return Err(format!(
+            "{profile} requires --refinement {expected_refinement}, received {refinement}"
+        )
+        .into());
+    }
+    if maximum_rank.is_some() {
+        return Err(format!(
+            "{profile} has immutable observation and rank ladders and rejects --maximum-rank"
+        )
+        .into());
+    }
     Ok(())
 }

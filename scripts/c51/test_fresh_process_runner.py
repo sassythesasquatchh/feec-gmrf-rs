@@ -192,6 +192,108 @@ class FreshProcessRunnerTests(unittest.TestCase):
                     runner.measured(4096, "bytes", "test_peak"),
                 )
 
+    def test_juq_profile_accepts_only_frozen_resource_axes(self):
+        arguments = runner.parse_args(
+            [
+                "--profile",
+                "juq-performance-v1",
+                "--resource-method",
+                "spectral_low_rank",
+                "--refinement",
+                "8",
+                "--observation-class",
+                "fixed_footprint_magnetic_volume",
+                "--sensor-count",
+                "5184",
+                "--repeated-data",
+                "100",
+                "--spectral-rank",
+                "2560",
+                "--workload-phase",
+                "query_physical_uq",
+                "--cgroup-mode",
+                "required",
+            ]
+        )
+        selection = runner.requested_resource_selection(arguments)
+        self.assertEqual(selection["sensor_target_value"], 5184)
+        self.assertEqual(selection["spectral_rank"], 2560)
+        arguments.sensor_count = 32
+        with self.assertRaisesRegex(ValueError, "sensor count must be one of"):
+            runner.requested_resource_selection(arguments)
+
+    def test_performance_eligibility_rejects_shared_spectral_basis(self):
+        selection = {
+            "method": "spectral_low_rank",
+            "spectral_rank": 2560,
+        }
+        row = {
+            "available": "true",
+            "common_physical_uq_workload_eligible": "true",
+            "matched_physical_qoi_eligible": "true",
+            "full_uq_workload_eligible": "true",
+            "method_performance_timing_eligible": "true",
+            "method_performance_timing_ineligibility_reason": "",
+            "observation_class": "fixed_footprint_magnetic_volume",
+            "spectral_basis_source": "partial_shared_maximum_mixed_shell",
+            "spectral_rank_status": "measured",
+            "spectral_rank_value": "2560",
+            "spectral_partial_requested_rank_status": "measured",
+            "spectral_partial_requested_rank_value": "2560",
+            "spectral_partial_retained_rank_status": "measured",
+            "spectral_partial_retained_rank_value": "2560",
+            "spectral_shared_maximum_basis_rank_status": "measured",
+        }
+        reasons = runner.performance_ineligibility_reasons(row, selection)
+        self.assertTrue(any("exact-request" in reason for reason in reasons))
+        self.assertTrue(any("shared maximum" in reason for reason in reasons))
+
+    def test_exact_observation_gp_requires_kernel_cost_in_headline(self):
+        row = {
+            "available": "true",
+            "common_physical_uq_workload_eligible": "true",
+            "matched_physical_qoi_eligible": "true",
+            "full_uq_workload_eligible": "true",
+            "method_performance_timing_eligible": "true",
+            "method_performance_timing_ineligibility_reason": "",
+            "observation_class": "fixed_footprint_magnetic_volume",
+            "exact_gp_conditioning_route": "observation_space",
+            "exact_gp_kernel_construction_in_headline_total": "false",
+        }
+        reasons = runner.performance_ineligibility_reasons(
+            row, {"method": "exact_observation_gp", "spectral_rank": None}
+        )
+        self.assertTrue(any("kernel construction" in reason for reason in reasons))
+
+    def test_frozen_juq_sensor_and_qoi_metadata_pass_the_performance_gate(self):
+        selection = {
+            "method": "whitney_compact",
+            "spectral_rank": None,
+            "sensor_target_value": 2048,
+        }
+        row = {
+            "available": "true",
+            "common_physical_uq_workload_eligible": "true",
+            "matched_physical_qoi_eligible": "true",
+            "full_uq_workload_eligible": "true",
+            "method_performance_timing_eligible": "true",
+            "method_performance_timing_ineligibility_reason": "",
+            "observation_class": "local_physical_b",
+            "observation_design_id": runner.JUQ_SENSOR_DESIGN_ID,
+            "observation_fixed_radius_status": "measured",
+            "observation_fixed_radius_value": "0.16",
+            "observation_vector_center_count_status": "measured",
+            "observation_vector_center_count_value": "683",
+            "physical_qoi_design_id": runner.JUQ_PHYSICAL_QOI_DESIGN_ID,
+            "physical_qoi_output_count": "18",
+        }
+        for component, count in (("x", 683), ("y", 683), ("z", 682)):
+            row[f"observation_component_{component}_count_status"] = "measured"
+            row[f"observation_component_{component}_count_value"] = str(count)
+        self.assertEqual(
+            runner.performance_ineligibility_reasons(row, selection), []
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

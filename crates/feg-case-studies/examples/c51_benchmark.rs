@@ -1,7 +1,7 @@
 use feg_case_studies::experimental::c51_benchmark::{
-    run_c51_benchmark, run_c51_resource, run_c51_spectral_rank_pilot, C51BenchmarkConfig,
-    C51MethodId, C51ObservationClass, C51ResourceConfig, C51ResourcePhase, C51ResourceSelection,
-    C51ResourceSensorTarget, C51RunMetadata,
+    run_c51_benchmark, run_c51_juq_accuracy, run_c51_resource, run_c51_spectral_rank_pilot,
+    C51BenchmarkConfig, C51MethodId, C51ObservationClass, C51ResourceConfig, C51ResourcePhase,
+    C51ResourceSelection, C51ResourceSensorTarget, C51RunMetadata,
 };
 use std::error::Error;
 use std::path::PathBuf;
@@ -23,9 +23,17 @@ fn run_accuracy(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "smoke" => C51BenchmarkConfig::smoke(),
         "reference_ladder" => C51BenchmarkConfig::reference_ladder(),
         "spectral_rank_pilot" => C51BenchmarkConfig::spectral_rank_pilot(),
+        "juq_accuracy_perf0" => {
+            let mut config = C51BenchmarkConfig::juq_performance();
+            config.refinements = vec![4];
+            config.local_sensor_counts = vec![4];
+            config.repeated_data_counts = vec![1];
+            config.posterior_sample_count = 1;
+            config
+        }
         other => {
             return Err(format!(
-                "unknown C51 profile {other:?}; use smoke, reference_ladder, spectral_rank_pilot, or resource"
+                "unknown C51 profile {other:?}; use smoke, reference_ladder, spectral_rank_pilot, juq_accuracy_perf0, or resource"
             )
             .into())
         }
@@ -43,10 +51,10 @@ fn run_accuracy(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "cargo run --release -p feg-case-studies --features {enabled_features} --example c51_benchmark -- {profile}"
     ));
     metadata.profile = profile;
-    let archive = if metadata.profile == "spectral_rank_pilot" {
-        run_c51_spectral_rank_pilot(&config, metadata)?
-    } else {
-        run_c51_benchmark(&config, metadata)?
+    let archive = match metadata.profile.as_str() {
+        "spectral_rank_pilot" => run_c51_spectral_rank_pilot(&config, metadata)?,
+        "juq_accuracy_perf0" => run_c51_juq_accuracy(&config, metadata)?,
+        _ => run_c51_benchmark(&config, metadata)?,
     };
     archive.write_directory(&output)?;
     println!(
@@ -60,18 +68,23 @@ fn run_accuracy(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     if arguments.len() != 10 {
         return Err(
-            "resource usage: c51_benchmark resource <profile> <output> <refinement> <observation-class> <count|density> <target> <D> <method> <rank|none> <cold_setup|query_full_uq>"
+            "resource usage: c51_benchmark resource <profile> <output> <refinement> <observation-class> <count|density> <target> <D> <method> <rank|none> <cold_setup|query_physical_uq|query_full_uq>"
                 .into(),
         );
     }
     let profile = &arguments[0];
-    if profile != "smoke" {
-        return Err(format!("resource profile {profile:?} is unavailable; use smoke").into());
+    if !matches!(profile.as_str(), "smoke" | "juq-performance-v1") {
+        return Err(format!(
+            "resource profile {profile:?} is unavailable; use smoke or juq-performance-v1"
+        )
+        .into());
     }
     let output = PathBuf::from(&arguments[1]);
     let refinement = parse_usize("refinement", &arguments[2])?;
     let observation_class = match arguments[3].as_str() {
-        "local_physical_b" => C51ObservationClass::LocalPhysicalB,
+        "local_physical_b" | "fixed_footprint_magnetic_volume" => {
+            C51ObservationClass::LocalPhysicalB
+        }
         "local_selectors" => C51ObservationClass::LocalSelectors,
         "global_row" => C51ObservationClass::GlobalRow,
         value => return Err(format!("unknown C51 observation class {value:?}").into()),
@@ -86,6 +99,7 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "fm_direct" => C51MethodId::FullMetricDirect,
         "fm_aug" => C51MethodId::FullMetricAugmented,
         "whitney_compact" => C51MethodId::WhitneyCompact,
+        "exact_observation_gp" => C51MethodId::ExactObservationSpaceGp,
         "spectral_full_rank" => C51MethodId::SpectralFullRank,
         "spectral_low_rank" => C51MethodId::SpectralLowRank,
         value => return Err(format!("unknown C51 method {value:?}").into()),
@@ -96,6 +110,7 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
     };
     let phase = match arguments[9].as_str() {
         "cold_setup" => C51ResourcePhase::ColdSetup,
+        "query_physical_uq" => C51ResourcePhase::QueryPhysicalUq,
         "query_full_uq" => C51ResourcePhase::QueryFullUq,
         value => return Err(format!("unknown C51 resource phase {value:?}").into()),
     };
@@ -108,7 +123,11 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         spectral_rank,
         phase,
     };
-    let config = C51ResourceConfig::smoke(selection);
+    let config = match profile.as_str() {
+        "smoke" => C51ResourceConfig::smoke(selection),
+        "juq-performance-v1" => C51ResourceConfig::juq_performance(selection),
+        _ => unreachable!("validated resource profile"),
+    };
     let mut metadata = C51RunMetadata::smoke(std::env::args().collect::<Vec<_>>().join(" "));
     metadata.profile = format!("resource/{profile}");
     let archive = run_c51_resource(&config, metadata)?;

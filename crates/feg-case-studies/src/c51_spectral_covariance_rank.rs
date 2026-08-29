@@ -6,17 +6,22 @@
 
 #[cfg(any(feature = "external-solvers", test))]
 use crate::c51_magnetic_sensor_design::{
-    held_out_kernels, primary_observation_kernels, selection_kernels,
-    C51_PRIMARY_SCALAR_OBSERVATION_COUNT,
+    assemble_juq_performance_observation_prefix, held_out_kernels,
+    juq_performance_observation_kernel_prefix, primary_observation_kernels, selection_kernels,
+};
+use crate::c51_magnetic_sensor_design::{
+    C51ScalarObservationPrefixMetadata, C51_FIXED_OBSERVATION_RADIUS,
+    C51_JUQ_PERFORMANCE_GRID_POINTS_PER_AXIS, C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT,
+    C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID, C51_PRIMARY_SCALAR_OBSERVATION_COUNT,
 };
 #[cfg(any(feature = "external-solvers", test))]
 use common::linalg::nalgebra::CsrMatrix;
 use common::linalg::nalgebra::Matrix;
 #[cfg(feature = "external-solvers")]
 use feec_gmrf::prelude::{
-    AuditedSupportedCovariance, ExactFormOperators, ExactMaternPriorBuilder,
-    LinearGaussianModelBuilder, LinearObservation, MagneticFieldMaps3d,
-    SupportedCovarianceSymmetryAudit, SupportedMaternPriorBuilder,
+    AuditedSupportedCovariance, EssentialBoundaryConditions, ExactFormOperators,
+    ExactMaternPriorBuilder, LinearGaussianModelBuilder, LinearObservation, MagneticFieldMaps3d,
+    MaternPriorBuilder, SupportedCovarianceSymmetryAudit, SupportedMaternPriorBuilder,
 };
 #[cfg(any(feature = "external-solvers", test))]
 use feec_gmrf::prelude::{
@@ -36,6 +41,7 @@ use feec_gmrf::spectral::{
 use feg_gp::{EigenBasis, SpectralMaternConfig, SpectralMaternGp};
 #[cfg(feature = "external-solvers")]
 use manifold::gen::cartesian::CartesianMeshInfo;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::fs::{self, File};
@@ -54,6 +60,15 @@ pub const C51_SPECTRAL_RANK_EXTENSION_N8_GRID: [usize; 6] =
 /// Frozen post-primary alpha-2 rank grid for the `n=10` extension.
 pub const C51_SPECTRAL_RANK_EXTENSION_N10_GRID: [usize; 5] = [2_048, 2_560, 3_072, 3_584, 4_096];
 pub const C51_COVARIANCE_THRESHOLDS: [f64; 3] = [0.10, 0.05, 0.02];
+/// Frozen scalar-observation prefixes for the pre-performance accuracy ladder.
+pub const C51_HIGH_OBSERVATION_COUNTS: [usize; 7] = [32, 128, 512, 1_024, 2_048, 4_096, 5_184];
+pub const C51_HIGH_OBSERVATION_RANKS_N8: [usize; 13] = [
+    512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048, 2_304, 2_560, 2_816, 3_000, 3_032,
+];
+pub const C51_HIGH_OBSERVATION_RANKS_N10: [usize; 17] = [
+    512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048, 2_560, 3_072, 3_584, 4_096, 4_608, 5_120,
+    5_632, 6_000, 6_130,
+];
 
 /// Immutable CLI/archive profile for the `n=8` post-primary extension.
 pub const C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8: &str = "rank-extension-v1-n8";
@@ -61,6 +76,34 @@ pub const C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8: &str = "rank-extension-v1-n8";
 pub const C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10: &str = "rank-extension-v1-n10";
 /// Frozen explanation for why the extension follows, but does not mutate, the primary study.
 pub const C51_SPECTRAL_RANK_EXTENSION_RATIONALE: &str = "post-primary extension frozen after publication-discovery-v1 left corrected alpha=2 5%/2% decisions unresolved; it may resolve registered thresholds but may not support method timing";
+pub const C51_HIGH_OBSERVATION_PROFILE_N8: &str = "high-observation-accuracy-v1-n8";
+pub const C51_HIGH_OBSERVATION_PROFILE_N10: &str = "high-observation-accuracy-v1-n10";
+pub const C51_HIGH_OBSERVATION_RATIONALE: &str = "pre-performance accuracy ladder over fixed dimension-independent observation counts; shared spectral basis and exact references are permanently timing ineligible";
+pub const C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8: &str = "high-observation-primary-m2048-v1-n8";
+pub const C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10: &str = "high-observation-primary-m2048-v1-n10";
+pub const C51_HIGH_OBSERVATION_PRIMARY_COUNT: usize = 2_048;
+pub const C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8: &str =
+    "high-observation-confirmatory-m4096-v1-n8";
+pub const C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10: &str =
+    "high-observation-confirmatory-m4096-v1-n10";
+pub const C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT: usize = 4_096;
+pub const C51_PERFORMANCE_OUTPUT_DESIGN_ID: &str =
+    "rank_study_selection_and_held_out_wendland_c2_18";
+pub const C51_PERFORMANCE_RANK_DECISION_SCHEMA_VERSION: &str = "c51-performance-rank-decisions-v2";
+const C51_PERFORMANCE_PRIMARY_TOLERANCE: f64 = 0.05;
+const C51_ACCURACY_ARCHIVE_HASH_FILES: [&str; 10] = [
+    "basis_attempts.csv",
+    "compact_accuracy.csv",
+    "covariances.csv",
+    "exact_covariance_audits.csv",
+    "high_observation_kernels.csv",
+    "high_observation_prefixes.csv",
+    "manifest.yaml",
+    "rows.csv",
+    "sensor_banks.csv",
+    "sensor_overlaps.csv",
+];
+const C51_PERF0_ARCHIVE_HASH_FILES: [&str; 2] = ["manifest.yaml", "rows.csv"];
 
 const OUTPUT_DIMENSION: usize = 9;
 const EXACT_VARIANCE_RELATIVE_FLOOR: f64 = 1.0e-12;
@@ -145,8 +188,108 @@ impl C51SpectralCovarianceRankConfig {
         Ok(config)
     }
 
+    /// Frozen high-observation accuracy ladder evaluated before any timing run.
+    pub fn high_observation_accuracy(refinement: usize) -> Result<Self> {
+        let (profile, ranks) = match refinement {
+            8 => (
+                C51_HIGH_OBSERVATION_PROFILE_N8,
+                C51_HIGH_OBSERVATION_RANKS_N8.as_slice(),
+            ),
+            10 => (
+                C51_HIGH_OBSERVATION_PROFILE_N10,
+                C51_HIGH_OBSERVATION_RANKS_N10.as_slice(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "C51 high-observation accuracy refinement must be exactly 8 or 10",
+                ))
+            }
+        };
+        let config = Self {
+            profile: profile.to_string(),
+            refinements: vec![refinement],
+            ranks: ranks.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            observation_kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Claim-bearing `m=2048` accuracy gate required before primary timing cells.
+    pub fn high_observation_primary(refinement: usize) -> Result<Self> {
+        let (profile, ranks) = match refinement {
+            8 => (
+                C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8,
+                C51_HIGH_OBSERVATION_RANKS_N8.as_slice(),
+            ),
+            10 => (
+                C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10,
+                C51_HIGH_OBSERVATION_RANKS_N10.as_slice(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "C51 primary high-observation refinement must be 8 or 10",
+                ))
+            }
+        };
+        let config = Self {
+            profile: profile.to_string(),
+            refinements: vec![refinement],
+            ranks: ranks.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            observation_kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Confirmatory `m=4096` accuracy gate. This remains separate from both
+    /// the `m=2048` primary decision and the seven-count contextual ladder.
+    pub fn high_observation_confirmatory(refinement: usize) -> Result<Self> {
+        let (profile, ranks) = match refinement {
+            8 => (
+                C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8,
+                C51_HIGH_OBSERVATION_RANKS_N8.as_slice(),
+            ),
+            10 => (
+                C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10,
+                C51_HIGH_OBSERVATION_RANKS_N10.as_slice(),
+            ),
+            _ => {
+                return Err(invalid(
+                    "C51 confirmatory high-observation refinement must be 8 or 10",
+                ))
+            }
+        };
+        let config = Self {
+            profile: profile.to_string(),
+            refinements: vec![refinement],
+            ranks: ranks.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            observation_kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn evidence_tier(&self) -> &'static str {
-        if self.is_rank_extension() {
+        if self.is_high_observation_primary() {
+            "high_observation_primary_accuracy"
+        } else if self.is_high_observation_confirmatory() {
+            "high_observation_confirmatory_accuracy"
+        } else if self.is_high_observation_accuracy() {
+            "high_observation_accuracy"
+        } else if self.is_rank_extension() {
             "rank_extension"
         } else {
             "rank_discovery"
@@ -154,8 +297,16 @@ impl C51SpectralCovarianceRankConfig {
     }
 
     pub fn post_primary_rationale(&self) -> Option<&'static str> {
-        self.is_rank_extension()
-            .then_some(C51_SPECTRAL_RANK_EXTENSION_RATIONALE)
+        if self.is_high_observation_primary() {
+            Some("claim-bearing pre-performance m=2048 rank gate with 5% primary and 2% sensitivity thresholds")
+        } else if self.is_high_observation_confirmatory() {
+            Some("confirmatory pre-performance m=4096 rank gate with the same frozen 5% primary and 2% sensitivity thresholds")
+        } else if self.is_high_observation_accuracy() {
+            Some(C51_HIGH_OBSERVATION_RATIONALE)
+        } else {
+            self.is_rank_extension()
+                .then_some(C51_SPECTRAL_RANK_EXTENSION_RATIONALE)
+        }
     }
 
     /// Expected active Whitney dimension frozen into a mesh-specific extension.
@@ -163,6 +314,12 @@ impl C51SpectralCovarianceRankConfig {
         match self.profile.as_str() {
             C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 => Some(3_032),
             C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10 => Some(6_130),
+            C51_HIGH_OBSERVATION_PROFILE_N8 => Some(3_032),
+            C51_HIGH_OBSERVATION_PROFILE_N10 => Some(6_130),
+            C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8 => Some(3_032),
+            C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10 => Some(6_130),
+            C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => Some(3_032),
+            C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => Some(6_130),
             _ => None,
         }
     }
@@ -172,6 +329,58 @@ impl C51SpectralCovarianceRankConfig {
             self.profile.as_str(),
             C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8 | C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10
         )
+    }
+
+    fn is_high_observation_accuracy(&self) -> bool {
+        matches!(
+            self.profile.as_str(),
+            C51_HIGH_OBSERVATION_PROFILE_N8 | C51_HIGH_OBSERVATION_PROFILE_N10
+        )
+    }
+
+    fn is_high_observation_primary(&self) -> bool {
+        matches!(
+            self.profile.as_str(),
+            C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8 | C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10
+        )
+    }
+
+    fn is_high_observation_confirmatory(&self) -> bool {
+        matches!(
+            self.profile.as_str(),
+            C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8
+                | C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10
+        )
+    }
+
+    fn is_any_high_observation(&self) -> bool {
+        self.is_high_observation_primary()
+            || self.is_high_observation_confirmatory()
+            || self.is_high_observation_accuracy()
+    }
+
+    fn high_observation_counts(&self) -> &'static [usize] {
+        if self.is_high_observation_primary() {
+            &[C51_HIGH_OBSERVATION_PRIMARY_COUNT]
+        } else if self.is_high_observation_confirmatory() {
+            &[C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT]
+        } else if self.is_high_observation_accuracy() {
+            &C51_HIGH_OBSERVATION_COUNTS
+        } else {
+            &[]
+        }
+    }
+
+    fn covariance_designs(&self) -> &'static [C51CovarianceDesign] {
+        if self.is_high_observation_primary() {
+            &[C51CovarianceDesign::HighM2048]
+        } else if self.is_high_observation_confirmatory() {
+            &[C51CovarianceDesign::HighM4096]
+        } else if self.is_high_observation_accuracy() {
+            &C51CovarianceDesign::HIGH_OBSERVATION
+        } else {
+            &C51CovarianceDesign::ALL
+        }
     }
 
     /// Restrict a publication run to one mesh so n=8 can be inspected before n=10.
@@ -246,6 +455,22 @@ impl C51SpectralCovarianceRankConfig {
             C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10 => {
                 Some((10, C51_SPECTRAL_RANK_EXTENSION_N10_GRID.as_slice()))
             }
+            C51_HIGH_OBSERVATION_PROFILE_N8 => Some((8, C51_HIGH_OBSERVATION_RANKS_N8.as_slice())),
+            C51_HIGH_OBSERVATION_PROFILE_N10 => {
+                Some((10, C51_HIGH_OBSERVATION_RANKS_N10.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8 => {
+                Some((8, C51_HIGH_OBSERVATION_RANKS_N8.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10 => {
+                Some((10, C51_HIGH_OBSERVATION_RANKS_N10.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => {
+                Some((8, C51_HIGH_OBSERVATION_RANKS_N8.as_slice()))
+            }
+            C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => {
+                Some((10, C51_HIGH_OBSERVATION_RANKS_N10.as_slice()))
+            }
             _ => None,
         };
         if let Some((refinement, ranks)) = expected_extension {
@@ -253,9 +478,20 @@ impl C51SpectralCovarianceRankConfig {
                 || self.ranks != ranks
                 || self.requested_maximum_rank.is_some()
                 || self.alphas != [MaternAlpha::Two]
+                || (self.is_any_high_observation()
+                    && self.observation_kernel_radius != C51_FIXED_OBSERVATION_RADIUS)
+                || (self.is_any_high_observation()
+                    && (self.high_observation_counts().last().map_or(true, |count| {
+                        *count > C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT
+                    }) || self
+                        .covariance_designs()
+                        .iter()
+                        .map(|design| design.observation_count(1))
+                        .collect::<Vec<_>>()
+                        != self.high_observation_counts()))
             {
                 return Err(invalid(
-                    "C51 rank-extension profiles have immutable refinement, alpha, and rank grids",
+                    "C51 post-primary accuracy profiles have immutable refinement, alpha, rank grid, and sensor radius",
                 ));
             }
         } else if self.alphas != [MaternAlpha::Two, MaternAlpha::Three] {
@@ -338,6 +574,13 @@ pub enum C51CovarianceDesign {
     Fixed32,
     Density020,
     Density100,
+    HighM32,
+    HighM128,
+    HighM512,
+    HighM1024,
+    HighM2048,
+    HighM4096,
+    HighM5184,
 }
 
 impl C51CovarianceDesign {
@@ -347,6 +590,15 @@ impl C51CovarianceDesign {
         Self::Density020,
         Self::Density100,
     ];
+    pub const HIGH_OBSERVATION: [Self; 7] = [
+        Self::HighM32,
+        Self::HighM128,
+        Self::HighM512,
+        Self::HighM1024,
+        Self::HighM2048,
+        Self::HighM4096,
+        Self::HighM5184,
+    ];
 
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -354,16 +606,29 @@ impl C51CovarianceDesign {
             Self::Fixed32 => "fixed32",
             Self::Density020 => "density_0.02",
             Self::Density100 => "density_0.10",
+            Self::HighM32 => "high_m32",
+            Self::HighM128 => "high_m128",
+            Self::HighM512 => "high_m512",
+            Self::HighM1024 => "high_m1024",
+            Self::HighM2048 => "high_m2048",
+            Self::HighM4096 => "high_m4096",
+            Self::HighM5184 => "high_m5184",
         }
     }
 
-    #[cfg(any(feature = "external-solvers", test))]
     fn observation_count(self, state_dimension: usize) -> usize {
         match self {
             Self::Prior => 0,
             Self::Fixed32 => 32.min(C51_PRIMARY_SCALAR_OBSERVATION_COUNT),
             Self::Density020 => (0.02 * state_dimension as f64).ceil() as usize,
             Self::Density100 => (0.10 * state_dimension as f64).ceil() as usize,
+            Self::HighM32 => 32,
+            Self::HighM128 => 128,
+            Self::HighM512 => 512,
+            Self::HighM1024 => 1_024,
+            Self::HighM2048 => 2_048,
+            Self::HighM4096 => 4_096,
+            Self::HighM5184 => 5_184,
         }
     }
 }
@@ -494,6 +759,59 @@ pub struct C51SensorBankAudit {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct C51HighObservationDesignAudit {
+    pub refinement: usize,
+    pub sensor_design_id: &'static str,
+    pub grid_points_per_axis: usize,
+    pub kernel_radius: f64,
+    pub scalar_capacity: usize,
+    pub maximum_prefix_kernels: Vec<WendlandC2Kernel3d>,
+    pub maximum_prefix_quadrature_normalizations: Vec<f64>,
+    pub prefixes: Vec<C51ScalarObservationPrefixMetadata>,
+    pub scalar_map_nonzeros: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51CompactAccuracyRow {
+    pub refinement: usize,
+    pub state_dimension: usize,
+    pub alpha: u32,
+    pub design: C51CovarianceDesign,
+    pub observation_count: usize,
+    pub status: String,
+    pub unavailable_reason: String,
+    pub selection: Option<C51CovarianceErrorMetrics>,
+    pub held_out: Option<C51CovarianceErrorMetrics>,
+    pub latent_mass_action_relative_errors: Option<[f64; 2]>,
+    pub latent_mass_action_maximum_relative_error: Option<f64>,
+    pub method_performance_timing_eligible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51PerformanceRankDecision {
+    pub refinement: usize,
+    pub state_dimension: usize,
+    pub scalar_observation_count: usize,
+    pub alpha: u32,
+    pub relative_tolerance: f64,
+    pub sensor_design_id: &'static str,
+    pub output_design_id: &'static str,
+    pub selected_spectral_rank: usize,
+    pub lower_failing_rank: usize,
+    pub lower_failing_selection_primary_error: f64,
+    pub selection_primary_error: f64,
+    pub held_out_primary_error: f64,
+    pub validation_status: &'static str,
+    pub rank_status: &'static str,
+    pub compact_whitney_selection_primary_error: f64,
+    pub compact_whitney_held_out_primary_error: f64,
+    pub compact_whitney_validation_status: &'static str,
+    pub accuracy_archive_sha256: String,
+    pub timing_basis_source: &'static str,
+    pub shared_basis_timing_eligible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct C51FullRankPlumbingGate {
     pub refinement: usize,
     pub state_dimension: usize,
@@ -514,6 +832,8 @@ pub struct C51SpectralCovarianceRankArchive {
     pub covariances: Vec<C51OutputCovarianceRecord>,
     pub exact_covariance_audits: Vec<C51ExactCovarianceAuditRecord>,
     pub sensor_banks: Vec<C51SensorBankAudit>,
+    pub high_observation_designs: Vec<C51HighObservationDesignAudit>,
+    pub compact_accuracy_rows: Vec<C51CompactAccuracyRow>,
     pub plumbing_gates: Vec<C51FullRankPlumbingGate>,
 }
 
@@ -539,9 +859,80 @@ impl C51SpectralCovarianceRankArchive {
         if self.rows.is_empty() {
             return Err(invalid("C51 spectral-rank archive has no rows"));
         }
-        if self.sensor_banks.len() != 3 * self.config.refinements.len() {
+        let sensor_banks_per_refinement = if self.config.is_any_high_observation() {
+            2
+        } else {
+            3
+        };
+        if self.sensor_banks.len() != sensor_banks_per_refinement * self.config.refinements.len() {
             return Err(invalid(
-                "C51 spectral-rank archive must contain selection, held-out, and observation sensor audits per refinement",
+                "C51 spectral-rank archive has the wrong number of profile-specific sensor audits",
+            ));
+        }
+        if self.config.is_any_high_observation() {
+            if self.high_observation_designs.len() != self.config.refinements.len()
+                || self.high_observation_designs.iter().any(|audit| {
+                    audit.sensor_design_id != C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID
+                        || audit.grid_points_per_axis != C51_JUQ_PERFORMANCE_GRID_POINTS_PER_AXIS
+                        || audit.kernel_radius != C51_FIXED_OBSERVATION_RADIUS
+                        || audit.scalar_capacity != C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT
+                        || audit.maximum_prefix_kernels.len()
+                            != self
+                                .config
+                                .high_observation_counts()
+                                .last()
+                                .copied()
+                                .unwrap_or(0)
+                                .div_ceil(3)
+                        || audit.maximum_prefix_quadrature_normalizations.len()
+                            != audit.maximum_prefix_kernels.len()
+                        || audit.prefixes.len() != self.config.high_observation_counts().len()
+                        || audit.scalar_map_nonzeros.len() != audit.prefixes.len()
+                        || audit
+                            .prefixes
+                            .iter()
+                            .map(|prefix| prefix.scalar_observation_count)
+                            .collect::<Vec<_>>()
+                            != self.config.high_observation_counts()
+                })
+            {
+                return Err(invalid(
+                    "C51 high-observation archive lacks its frozen nested sensor provenance",
+                ));
+            }
+        } else if !self.high_observation_designs.is_empty() {
+            return Err(invalid(
+                "only high-observation profiles may archive high-observation sensor provenance",
+            ));
+        }
+        if self.config.is_any_high_observation() {
+            let expected =
+                self.config.refinements.len() * self.config.high_observation_counts().len();
+            if self.compact_accuracy_rows.len() != expected {
+                return Err(invalid(
+                    "C51 high-observation archive requires one projected Whitney-compact accuracy row per observation prefix",
+                ));
+            }
+            for row in &self.compact_accuracy_rows {
+                let measured = row.status == "measured";
+                if row.method_performance_timing_eligible
+                    || !C51_HIGH_OBSERVATION_COUNTS.contains(&row.observation_count)
+                    || measured
+                        != (row.selection.is_some()
+                            && row.held_out.is_some()
+                            && row.latent_mass_action_relative_errors.is_some()
+                            && row.latent_mass_action_maximum_relative_error.is_some())
+                    || (measured && !row.unavailable_reason.is_empty())
+                    || (!measured && row.unavailable_reason.is_empty())
+                {
+                    return Err(invalid(
+                        "C51 projected Whitney-compact accuracy row is incomplete or timing eligible",
+                    ));
+                }
+            }
+        } else if !self.compact_accuracy_rows.is_empty() {
+            return Err(invalid(
+                "only high-observation profiles may archive compact accuracy rows",
             ));
         }
         for bank in &self.sensor_banks {
@@ -685,8 +1076,85 @@ impl C51SpectralCovarianceRankArchive {
         self.write_basis_attempts(&directory.join("basis_attempts.csv"))?;
         self.write_sensor_banks(&directory.join("sensor_banks.csv"))?;
         self.write_sensor_overlaps(&directory.join("sensor_overlaps.csv"))?;
+        self.write_high_observation_prefixes(&directory.join("high_observation_prefixes.csv"))?;
+        self.write_high_observation_kernels(&directory.join("high_observation_kernels.csv"))?;
+        self.write_compact_accuracy(&directory.join("compact_accuracy.csv"))?;
         self.write_manifest(&directory.join("manifest.yaml"))?;
         Ok(())
+    }
+
+    /// Export the accuracy-gated rank consumed by the separately timed C51
+    /// performance campaign. The digest covers the canonical archive files in
+    /// a fixed order and therefore does not depend on filesystem traversal.
+    pub fn write_performance_rank_decision(
+        &self,
+        accuracy_archive_directory: &Path,
+        perf0_archive_directory: &Path,
+        output: &Path,
+    ) -> Result<C51PerformanceRankDecision> {
+        self.validate()?;
+        validate_c51_perf0_archive(perf0_archive_directory)?;
+        let digest = c51_accuracy_archive_sha256(accuracy_archive_directory)?;
+        let perf0_digest = c51_named_files_sha256(
+            perf0_archive_directory,
+            &C51_PERF0_ARCHIVE_HASH_FILES,
+            "C51 PERF-0 archive",
+        )?;
+        let decision = derive_performance_rank_decision(self, digest)?;
+        let payload = serde_json::json!({
+            "schema_version": C51_PERFORMANCE_RANK_DECISION_SCHEMA_VERSION,
+            "profile": "juq-performance-v1",
+            "status": "accuracy_validated",
+            "decisions": [{
+                "decision_id": format!(
+                    "rank-n{}-m{}-r{}",
+                    decision.refinement,
+                    decision.scalar_observation_count,
+                    decision.selected_spectral_rank
+                ),
+                "source_accuracy_profile": self.config.profile,
+                "refinement": decision.refinement,
+                "state_dimension": decision.state_dimension,
+                "scalar_observation_count": decision.scalar_observation_count,
+                "alpha": decision.alpha,
+                "relative_tolerance": decision.relative_tolerance,
+                "observation_design_id": decision.sensor_design_id,
+                "physical_qoi_design_id": decision.output_design_id,
+                "reference_discrete_law_id": "exact_full_metric_whitney",
+                "common_h_g_fixture_sha256": decision.accuracy_archive_sha256,
+                "spectral_low_rank": {
+                    "rank": decision.selected_spectral_rank,
+                    "lower_failing_rank": decision.lower_failing_rank,
+                    "lower_failing_selection_relative_error": decision.lower_failing_selection_primary_error,
+                    "selection_relative_error": decision.selection_primary_error,
+                    "heldout_relative_error": decision.held_out_primary_error,
+                    "validation_status": decision.validation_status,
+                    "rank_status": decision.rank_status,
+                    "accuracy_artifact_sha256": decision.accuracy_archive_sha256,
+                    "timing_basis_source": decision.timing_basis_source,
+                    "shared_maximum_basis_timing_eligible": decision.shared_basis_timing_eligible
+                },
+                "whitney_compact": {
+                    "selection_relative_error": decision.compact_whitney_selection_primary_error,
+                    "heldout_relative_error": decision.compact_whitney_held_out_primary_error,
+                    "validation_status": decision.compact_whitney_validation_status,
+                    "accuracy_artifact_sha256": decision.accuracy_archive_sha256,
+                    "identical_observation_and_output_maps": true,
+                    "method_performance_timing_eligible": false
+                },
+                "exact_observation_gp": {
+                    "validation_status": "perf0_same_law_validated",
+                    "fixture_id": "PERF-0",
+                    "fixture_artifact_sha256": perf0_digest,
+                    "fixture_hash_scope": "manifest.yaml+rows.csv"
+                },
+                "accuracy_artifact_hash_scope": "canonical_c51_accuracy_archive_files_v1"
+            }]
+        });
+        let writer = BufWriter::new(File::create(output)?);
+        serde_json::to_writer_pretty(writer, &payload)
+            .map_err(|error| invalid(format!("could not serialize C51 rank decision: {error}")))?;
+        Ok(decision)
     }
 
     fn write_rows(&self, path: &Path) -> Result<()> {
@@ -995,6 +1463,150 @@ impl C51SpectralCovarianceRankArchive {
         Ok(())
     }
 
+    fn write_high_observation_prefixes(&self, path: &Path) -> Result<()> {
+        let mut writer = csv::Writer::from_path(path).map_err(csv_error)?;
+        writer
+            .write_record([
+                "refinement",
+                "sensor_design_id",
+                "grid_points_per_axis",
+                "kernel_radius",
+                "scalar_capacity",
+                "scalar_observation_count",
+                "vector_center_count",
+                "bx_count",
+                "by_count",
+                "bz_count",
+                "selected_row_rule",
+                "scalar_map_nonzeros",
+            ])
+            .map_err(csv_error)?;
+        for audit in &self.high_observation_designs {
+            for (prefix, nonzeros) in audit.prefixes.iter().zip(&audit.scalar_map_nonzeros) {
+                writer
+                    .write_record([
+                        audit.refinement.to_string(),
+                        audit.sensor_design_id.to_string(),
+                        audit.grid_points_per_axis.to_string(),
+                        format_float(audit.kernel_radius),
+                        audit.scalar_capacity.to_string(),
+                        prefix.scalar_observation_count.to_string(),
+                        prefix.vector_center_count.to_string(),
+                        prefix.component_counts[0].to_string(),
+                        prefix.component_counts[1].to_string(),
+                        prefix.component_counts[2].to_string(),
+                        "contiguous_zero_based_scalar_prefix".to_string(),
+                        nonzeros.to_string(),
+                    ])
+                    .map_err(csv_error)?;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_high_observation_kernels(&self, path: &Path) -> Result<()> {
+        let mut writer = csv::Writer::from_path(path).map_err(csv_error)?;
+        writer
+            .write_record([
+                "refinement",
+                "sensor_design_id",
+                "kernel_index",
+                "center_x",
+                "center_y",
+                "center_z",
+                "radius",
+                "quadrature_normalization",
+            ])
+            .map_err(csv_error)?;
+        for audit in &self.high_observation_designs {
+            for (index, (kernel, normalization)) in audit
+                .maximum_prefix_kernels
+                .iter()
+                .zip(&audit.maximum_prefix_quadrature_normalizations)
+                .enumerate()
+            {
+                writer
+                    .write_record([
+                        audit.refinement.to_string(),
+                        audit.sensor_design_id.to_string(),
+                        index.to_string(),
+                        format_float(kernel.center()[0]),
+                        format_float(kernel.center()[1]),
+                        format_float(kernel.center()[2]),
+                        format_float(kernel.radius()),
+                        format_float(*normalization),
+                    ])
+                    .map_err(csv_error)?;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_compact_accuracy(&self, path: &Path) -> Result<()> {
+        let mut writer = csv::Writer::from_path(path).map_err(csv_error)?;
+        writer
+            .write_record([
+                "evidence_tier",
+                "method",
+                "method_performance_timing_eligible",
+                "refinement",
+                "state_dimension",
+                "alpha",
+                "design",
+                "observation_count",
+                "status",
+                "unavailable_reason",
+                "selection_e_f",
+                "selection_e_2",
+                "selection_e_diag",
+                "selection_e_dir",
+                "selection_e_corr",
+                "selection_e_primary",
+                "heldout_e_f",
+                "heldout_e_2",
+                "heldout_e_diag",
+                "heldout_e_dir",
+                "heldout_e_corr",
+                "heldout_e_primary",
+                "latent_mass_action_probe_0_relative_error",
+                "latent_mass_action_probe_1_relative_error",
+                "latent_mass_action_maximum_relative_error",
+            ])
+            .map_err(csv_error)?;
+        for row in &self.compact_accuracy_rows {
+            let mut record = vec![
+                self.config.evidence_tier().to_string(),
+                "whitney_compact_projected".to_string(),
+                row.method_performance_timing_eligible.to_string(),
+                row.refinement.to_string(),
+                row.state_dimension.to_string(),
+                row.alpha.to_string(),
+                row.design.as_str().to_string(),
+                row.observation_count.to_string(),
+                row.status.clone(),
+                row.unavailable_reason.clone(),
+            ];
+            append_metrics(&mut record, row.selection);
+            append_metrics(&mut record, row.held_out);
+            match row.latent_mass_action_relative_errors {
+                Some(errors) => record.extend([
+                    format_float(errors[0]),
+                    format_float(errors[1]),
+                    format_float(
+                        row.latent_mass_action_maximum_relative_error
+                            .expect("validated measured compact latent action maximum"),
+                    ),
+                ]),
+                None => record.extend([String::new(), String::new(), String::new()]),
+            }
+            writer.write_record(record).map_err(csv_error)?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
     fn write_manifest(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
         writeln!(
@@ -1016,6 +1628,41 @@ impl C51SpectralCovarianceRankArchive {
         }
         writeln!(writer, "method_performance_timing_eligible: false")?;
         writeln!(writer, "shared_maximum_basis: true")?;
+        writeln!(
+            writer,
+            "observation_counts_dimension_independent: {}",
+            self.config.is_any_high_observation()
+        )?;
+        if self.config.is_any_high_observation() {
+            writeln!(
+                writer,
+                "sensor_design_id: {C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID}"
+            )?;
+            writeln!(
+                writer,
+                "high_observation_counts: {}",
+                yaml_usizes(self.config.high_observation_counts())
+            )?;
+            let decision_scope = if self.config.is_high_observation_primary() {
+                "primary_m2048_only"
+            } else if self.config.is_high_observation_confirmatory() {
+                "confirmatory_m4096_only"
+            } else {
+                "contextual_stress_only_no_performance_rank_selection"
+            };
+            writeln!(writer, "performance_rank_decision_scope: {decision_scope}")?;
+            write_yaml_usize_option(
+                &mut writer,
+                "performance_rank_decision_observation_count",
+                if self.config.is_high_observation_primary() {
+                    Some(C51_HIGH_OBSERVATION_PRIMARY_COUNT)
+                } else if self.config.is_high_observation_confirmatory() {
+                    Some(C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT)
+                } else {
+                    None
+                },
+            )?;
+        }
         writeln!(writer, "command: {}", yaml_string(&self.metadata.command))?;
         write_yaml_option(&mut writer, "root_sha", self.metadata.root_sha.as_deref())?;
         write_yaml_option(&mut writer, "feec_sha", self.metadata.feec_sha.as_deref())?;
@@ -1040,6 +1687,18 @@ impl C51SpectralCovarianceRankArchive {
             self.config.requested_maximum_rank,
         )?;
         writeln!(writer, "thresholds: [0.10, 0.05, 0.02]")?;
+        writeln!(writer, "claim_bearing_physical_covariance_threshold: 0.05")?;
+        writeln!(writer, "sensitivity_physical_covariance_threshold: 0.02")?;
+        writeln!(writer, "contextual_physical_covariance_threshold: 0.10")?;
+        writeln!(writer, "performance_rank_rule: smallest_tested_sustained_selection_rank_with_lower_failing_bracket_and_held_out_pass")?;
+        writeln!(
+            writer,
+            "censored_endpoint_selectable_for_performance: false"
+        )?;
+        writeln!(
+            writer,
+            "state_dimension_endpoint_semantics: full_rank_required_not_low_rank_or_truncated"
+        )?;
         writeln!(
             writer,
             "alpha_values: {}",
@@ -1138,6 +1797,15 @@ impl C51SpectralCovarianceRankArchive {
         writeln!(writer, "basis_attempts_csv: basis_attempts.csv")?;
         writeln!(writer, "sensor_banks_csv: sensor_banks.csv")?;
         writeln!(writer, "sensor_overlaps_csv: sensor_overlaps.csv")?;
+        writeln!(
+            writer,
+            "high_observation_prefixes_csv: high_observation_prefixes.csv"
+        )?;
+        writeln!(
+            writer,
+            "high_observation_kernels_csv: high_observation_kernels.csv"
+        )?;
+        writeln!(writer, "compact_accuracy_csv: compact_accuracy.csv")?;
         writer.flush()?;
         Ok(())
     }
@@ -1161,6 +1829,8 @@ pub fn run_c51_spectral_covariance_rank(
         covariances: Vec::new(),
         exact_covariance_audits: Vec::new(),
         sensor_banks: Vec::new(),
+        high_observation_designs: Vec::new(),
+        compact_accuracy_rows: Vec::new(),
         plumbing_gates,
     };
     for &refinement in &config.refinements {
@@ -1330,22 +2000,30 @@ fn run_refinement(
         &coordinates,
         &held_out_kernels(config.qoi_kernel_radius)?,
     )?;
-    let candidates = MagneticVolumeSensorBank3d::from_feec(
-        &topology,
-        &coordinates,
-        &primary_observation_kernels(config.observation_kernel_radius)?,
-    )?;
     archive
         .sensor_banks
         .push(sensor_bank_audit(refinement, "selection", &selection)?);
     archive
         .sensor_banks
         .push(sensor_bank_audit(refinement, "held_out", &held_out)?);
-    archive.sensor_banks.push(sensor_bank_audit(
-        refinement,
-        "observation_candidates",
-        &candidates,
-    )?);
+    let candidate_map = if config.is_any_high_observation() {
+        let (map, audit) =
+            high_observation_candidate_map_and_audit(config, refinement, &topology, &coordinates)?;
+        archive.high_observation_designs.push(audit);
+        map
+    } else {
+        let candidates = MagneticVolumeSensorBank3d::from_feec(
+            &topology,
+            &coordinates,
+            &primary_observation_kernels(config.observation_kernel_radius)?,
+        )?;
+        archive.sensor_banks.push(sensor_bank_audit(
+            refinement,
+            "observation_candidates",
+            &candidates,
+        )?);
+        candidates.map().map().clone()
+    };
     let selection_full = selection.map().map().clone();
     let held_out_full = held_out.map().map().clone();
     if selection_full.output_dimension() != OUTPUT_DIMENSION
@@ -1359,7 +2037,12 @@ fn run_refinement(
     let held_out_reduced = eliminate_homogeneous_map(&elimination, &held_out_full)?;
     let selection_csr = to_csr(&selection_reduced);
     let held_out_csr = to_csr(&held_out_reduced);
-    let designs = build_designs(state_dimension, candidates.map().map(), &elimination)?;
+    let designs = build_designs(
+        config.covariance_designs(),
+        state_dimension,
+        &candidate_map,
+        &elimination,
+    )?;
 
     let valid_ranks = config
         .ranks
@@ -1407,6 +2090,13 @@ fn run_refinement(
             state_dimension,
             "rank_validation",
             "every requested rank exceeds the active state dimension",
+        );
+        append_unavailable_compact_for_config(
+            archive,
+            config,
+            refinement,
+            state_dimension,
+            "spectral basis unavailable before exact/compact comparison",
         );
         return Ok(());
     };
@@ -1458,6 +2148,13 @@ fn run_refinement(
             refinement,
             state_dimension,
             "basis_preflight",
+            &reason,
+        );
+        append_unavailable_compact_for_config(
+            archive,
+            config,
+            refinement,
+            state_dimension,
             &reason,
         );
         return Ok(());
@@ -1518,6 +2215,13 @@ fn run_refinement(
                     "mixed_eigensolve",
                     &reason,
                 );
+                append_unavailable_compact_for_config(
+                    archive,
+                    config,
+                    refinement,
+                    state_dimension,
+                    &reason,
+                );
                 return Ok(());
             }
         };
@@ -1530,11 +2234,14 @@ fn run_refinement(
         let row_start = archive.rows.len();
         let covariance_start = archive.covariances.len();
         let audit_start = archive.exact_covariance_audits.len();
+        let compact_start = archive.compact_accuracy_rows.len();
         if let Err(error) = run_alpha(
             config,
             refinement,
             state_dimension,
             alpha,
+            &topology,
+            &metric,
             &operators,
             &basis,
             &selection_full,
@@ -1547,6 +2254,17 @@ fn run_refinement(
             archive.rows.truncate(row_start);
             archive.covariances.truncate(covariance_start);
             archive.exact_covariance_audits.truncate(audit_start);
+            archive.compact_accuracy_rows.truncate(compact_start);
+            if config.is_any_high_observation() {
+                append_unavailable_compact_rows(
+                    archive,
+                    config,
+                    refinement,
+                    state_dimension,
+                    alpha,
+                    &error.to_string(),
+                );
+            }
             append_censored_alpha_rows(
                 archive,
                 config,
@@ -1568,6 +2286,8 @@ fn run_alpha(
     refinement: usize,
     state_dimension: usize,
     alpha: MaternAlpha,
+    topology: &manifold::topology::complex::Complex,
+    metric: &manifold::geometry::metric::mesh::MeshLengths,
     operators: &ExactFormOperators,
     maximum_basis: &EigenBasis,
     selection_full: &LinearMap,
@@ -1587,17 +2307,23 @@ fn run_alpha(
         .parameters(parameters)
         .build()?;
     let prior_factor = exact_prior.factor()?;
-    let mut exact_designs = vec![ExactDesignCovariance {
-        design: C51CovarianceDesign::Prior,
-        observation_count: 0,
-        observation_reduced: None,
-        selection: prior_factor.pushforward_covariance_audited(selection_full)?,
-        held_out: prior_factor.pushforward_covariance_audited(held_out_full)?,
-        latent_actions: latent_probe_rhs
-            .iter()
-            .map(|rhs| prior_factor.covariance_action(rhs))
-            .collect::<Result<Vec<_>>>()?,
-    }];
+    let mut exact_designs = Vec::new();
+    if config
+        .covariance_designs()
+        .contains(&C51CovarianceDesign::Prior)
+    {
+        exact_designs.push(ExactDesignCovariance {
+            design: C51CovarianceDesign::Prior,
+            observation_count: 0,
+            observation_reduced: None,
+            selection: prior_factor.pushforward_covariance_audited(selection_full)?,
+            held_out: prior_factor.pushforward_covariance_audited(held_out_full)?,
+            latent_actions: latent_probe_rhs
+                .iter()
+                .map(|rhs| prior_factor.covariance_action(rhs))
+                .collect::<Result<Vec<_>>>()?,
+        });
+    }
     for design in designs {
         let observation = LinearObservation::new(
             design.full.clone(),
@@ -1638,16 +2364,51 @@ fn run_alpha(
         );
     }
 
+    if config.is_any_high_observation() {
+        let compact_covariance_start = archive.covariances.len();
+        if let Err(error) = evaluate_compact_accuracy(
+            config,
+            refinement,
+            state_dimension,
+            alpha,
+            topology,
+            metric,
+            operators,
+            selection_full,
+            held_out_full,
+            designs,
+            &exact_designs,
+            &latent_probe_rhs,
+            archive,
+        ) {
+            archive
+                .compact_accuracy_rows
+                .retain(|row| !(row.refinement == refinement && row.alpha == alpha.as_u32()));
+            archive.covariances.truncate(compact_covariance_start);
+            append_unavailable_compact_rows(
+                archive,
+                config,
+                refinement,
+                state_dimension,
+                alpha,
+                &error.to_string(),
+            );
+        }
+    }
+
     for &rank in &config.ranks {
         if rank > state_dimension || rank > maximum_basis.len() {
             append_censored_rank_rows(
                 archive,
-                refinement,
-                state_dimension,
-                alpha,
-                rank,
-                "rank_validation",
-                "requested rank exceeds the available active eigenbasis",
+                config.covariance_designs(),
+                CensoredRankContext {
+                    refinement,
+                    state_dimension,
+                    alpha,
+                    rank,
+                    stage: "rank_validation",
+                    reason: "requested rank exceeds the available active eigenbasis",
+                },
             );
             continue;
         }
@@ -1670,12 +2431,15 @@ fn run_alpha(
             Err(error) => {
                 append_censored_rank_rows(
                     archive,
-                    refinement,
-                    state_dimension,
-                    alpha,
-                    rank,
-                    "spectral_rank_construction",
-                    &error.to_string(),
+                    config.covariance_designs(),
+                    CensoredRankContext {
+                        refinement,
+                        state_dimension,
+                        alpha,
+                        rank,
+                        stage: "spectral_rank_construction",
+                        reason: &error.to_string(),
+                    },
                 );
                 continue;
             }
@@ -1822,6 +2586,162 @@ fn run_alpha(
 }
 
 #[cfg(feature = "external-solvers")]
+#[allow(clippy::too_many_arguments)]
+fn evaluate_compact_accuracy(
+    config: &C51SpectralCovarianceRankConfig,
+    refinement: usize,
+    state_dimension: usize,
+    alpha: MaternAlpha,
+    topology: &manifold::topology::complex::Complex,
+    metric: &manifold::geometry::metric::mesh::MeshLengths,
+    operators: &ExactFormOperators,
+    selection_full: &LinearMap,
+    held_out_full: &LinearMap,
+    designs: &[ObservationDesign],
+    exact_designs: &[ExactDesignCovariance],
+    latent_probe_rhs: &[Vec<f64>],
+    archive: &mut C51SpectralCovarianceRankArchive,
+) -> Result<()> {
+    let parameters = MaternParameters::new(alpha, config.kappa, config.tau)?;
+    let compact_prior = MaternPriorBuilder::from_feec_whitney_projected(topology, metric, 1)?
+        .parameters(parameters)
+        .essential_boundary_conditions(EssentialBoundaryConditions::homogeneous_on_boundary(
+            topology, 1,
+        )?)
+        .build()?;
+    if compact_prior.dimension() != state_dimension {
+        return Err(FeecGmrfError::Dimension(format!(
+            "C51 compact prior dimension {} does not match exact active dimension {state_dimension}",
+            compact_prior.dimension()
+        )));
+    }
+    for design in designs {
+        let exact = exact_designs
+            .iter()
+            .find(|exact| exact.design == design.kind)
+            .ok_or_else(|| {
+                FeecGmrfError::Inference(format!(
+                    "C51 compact comparison lacks exact reference for {}",
+                    design.kind.as_str()
+                ))
+            })?;
+        let observation = LinearObservation::new(
+            design.full.clone(),
+            vec![0.0; design.count],
+            GaussianNoise::variance(config.observation_noise_variance)?,
+        )?;
+        let mut posterior = LinearGaussianModelBuilder::new(compact_prior.clone())
+            .observe(observation)?
+            .condition()?;
+        let selection_covariance = posterior.pushforward_covariance(selection_full)?;
+        let held_out_covariance = posterior.pushforward_covariance(held_out_full)?;
+        let approximate_latent_actions = latent_probe_rhs
+            .iter()
+            .map(|rhs| posterior.covariance_action(rhs))
+            .collect::<Result<Vec<_>>>()?;
+        let selection =
+            covariance_error_metrics(&selection_covariance, &exact.selection.symmetric)?;
+        let held_out = covariance_error_metrics(&held_out_covariance, &exact.held_out.symmetric)?;
+        let latent_errors = latent_action_errors(
+            operators.state().mass(),
+            &approximate_latent_actions,
+            &exact.latent_actions,
+        )?;
+        archive_covariance(
+            &mut archive.covariances,
+            refinement,
+            alpha,
+            design.kind,
+            None,
+            "selection",
+            "whitney_compact_projected",
+            &selection_covariance,
+        );
+        archive_covariance(
+            &mut archive.covariances,
+            refinement,
+            alpha,
+            design.kind,
+            None,
+            "held_out",
+            "whitney_compact_projected",
+            &held_out_covariance,
+        );
+        archive.compact_accuracy_rows.push(C51CompactAccuracyRow {
+            refinement,
+            state_dimension,
+            alpha: alpha.as_u32(),
+            design: design.kind,
+            observation_count: design.count,
+            status: "measured".to_string(),
+            unavailable_reason: String::new(),
+            selection: Some(selection),
+            held_out: Some(held_out),
+            latent_mass_action_relative_errors: Some(latent_errors),
+            latent_mass_action_maximum_relative_error: Some(
+                latent_errors.into_iter().fold(0.0, f64::max),
+            ),
+            method_performance_timing_eligible: false,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(feature = "external-solvers")]
+#[cfg(feature = "external-solvers")]
+fn append_unavailable_compact_rows(
+    archive: &mut C51SpectralCovarianceRankArchive,
+    config: &C51SpectralCovarianceRankConfig,
+    refinement: usize,
+    state_dimension: usize,
+    alpha: MaternAlpha,
+    reason: &str,
+) {
+    for &design in config.covariance_designs() {
+        if design == C51CovarianceDesign::Prior {
+            continue;
+        }
+        archive.compact_accuracy_rows.push(C51CompactAccuracyRow {
+            refinement,
+            state_dimension,
+            alpha: alpha.as_u32(),
+            design,
+            observation_count: design.observation_count(state_dimension),
+            status: "unavailable".to_string(),
+            unavailable_reason: reason.to_string(),
+            selection: None,
+            held_out: None,
+            latent_mass_action_relative_errors: None,
+            latent_mass_action_maximum_relative_error: None,
+            method_performance_timing_eligible: false,
+        });
+    }
+}
+
+#[cfg(feature = "external-solvers")]
+#[cfg(feature = "external-solvers")]
+fn append_unavailable_compact_for_config(
+    archive: &mut C51SpectralCovarianceRankArchive,
+    config: &C51SpectralCovarianceRankConfig,
+    refinement: usize,
+    state_dimension: usize,
+    reason: &str,
+) {
+    if config.is_any_high_observation() {
+        for &alpha in &config.alphas {
+            append_unavailable_compact_rows(
+                archive,
+                config,
+                refinement,
+                state_dimension,
+                alpha,
+                reason,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "external-solvers")]
 #[derive(Clone)]
 struct ObservationDesign {
     kind: C51CovarianceDesign,
@@ -1842,12 +2762,14 @@ struct ExactDesignCovariance {
 
 #[cfg(feature = "external-solvers")]
 fn build_designs(
+    kinds: &[C51CovarianceDesign],
     state_dimension: usize,
     candidates: &LinearMap,
     elimination: &EssentialBoundaryElimination,
 ) -> Result<Vec<ObservationDesign>> {
-    C51CovarianceDesign::ALL
-        .into_iter()
+    kinds
+        .iter()
+        .copied()
         .filter(|kind| *kind != C51CovarianceDesign::Prior)
         .map(|kind| {
             let count = kind.observation_count(state_dimension);
@@ -1868,6 +2790,50 @@ fn build_designs(
             })
         })
         .collect()
+}
+
+#[cfg(feature = "external-solvers")]
+fn high_observation_candidate_map_and_audit(
+    config: &C51SpectralCovarianceRankConfig,
+    refinement: usize,
+    topology: &manifold::topology::complex::Complex,
+    coordinates: &manifold::geometry::coord::mesh::MeshCoords,
+) -> Result<(LinearMap, C51HighObservationDesignAudit)> {
+    let counts = config.high_observation_counts();
+    let maximum_count = counts
+        .last()
+        .copied()
+        .ok_or_else(|| invalid("C51 high-observation profile has no frozen observation count"))?;
+    let maximum =
+        assemble_juq_performance_observation_prefix(topology, coordinates, maximum_count)?;
+    let mut prefixes = Vec::with_capacity(counts.len());
+    let mut scalar_map_nonzeros = Vec::with_capacity(counts.len());
+    for &count in counts {
+        let (_, metadata) = juq_performance_observation_kernel_prefix(count)?;
+        let map = maximum
+            .scalar_map()
+            .select_outputs(&metadata.selected_scalar_rows)?;
+        if map.output_dimension() != count {
+            return Err(FeecGmrfError::Dimension(format!(
+                "C51 high-observation prefix {count} assembled {} scalar rows",
+                map.output_dimension()
+            )));
+        }
+        prefixes.push(metadata);
+        scalar_map_nonzeros.push(map.matrix().triplet_iter().count());
+    }
+    let audit = C51HighObservationDesignAudit {
+        refinement,
+        sensor_design_id: C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+        grid_points_per_axis: C51_JUQ_PERFORMANCE_GRID_POINTS_PER_AXIS,
+        kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+        scalar_capacity: C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT,
+        maximum_prefix_kernels: maximum.kernels().to_vec(),
+        maximum_prefix_quadrature_normalizations: maximum.quadrature_normalizations().to_vec(),
+        prefixes,
+        scalar_map_nonzeros,
+    };
+    Ok((maximum.scalar_map().clone(), audit))
 }
 
 #[cfg(any(feature = "external-solvers", test))]
@@ -2339,38 +3305,47 @@ fn append_censored_alpha_rows(
     for &rank in &config.ranks {
         append_censored_rank_rows(
             archive,
-            refinement,
-            state_dimension,
-            alpha,
-            rank,
-            stage,
-            reason,
+            config.covariance_designs(),
+            CensoredRankContext {
+                refinement,
+                state_dimension,
+                alpha,
+                rank,
+                stage,
+                reason,
+            },
         );
     }
 }
 
 #[cfg(any(feature = "external-solvers", test))]
-fn append_censored_rank_rows(
-    archive: &mut C51SpectralCovarianceRankArchive,
+struct CensoredRankContext<'a> {
     refinement: usize,
     state_dimension: usize,
     alpha: MaternAlpha,
     rank: usize,
-    stage: &str,
-    reason: &str,
+    stage: &'a str,
+    reason: &'a str,
+}
+
+#[cfg(any(feature = "external-solvers", test))]
+fn append_censored_rank_rows(
+    archive: &mut C51SpectralCovarianceRankArchive,
+    designs: &[C51CovarianceDesign],
+    context: CensoredRankContext<'_>,
 ) {
-    for design in C51CovarianceDesign::ALL {
-        let observation_count = design.observation_count(state_dimension);
+    for &design in designs {
+        let observation_count = design.observation_count(context.state_dimension);
         append_censored_design_row(
             archive,
-            refinement,
-            state_dimension,
-            alpha,
-            rank,
+            context.refinement,
+            context.state_dimension,
+            context.alpha,
+            context.rank,
             design,
             observation_count,
-            stage,
-            reason,
+            context.stage,
+            context.reason,
         );
     }
 }
@@ -2586,6 +3561,255 @@ fn write_yaml_usize_option(
     }
 }
 
+fn derive_performance_rank_decision(
+    archive: &C51SpectralCovarianceRankArchive,
+    accuracy_archive_sha256: String,
+) -> Result<C51PerformanceRankDecision> {
+    if !(archive.config.is_high_observation_primary()
+        || archive.config.is_high_observation_confirmatory())
+    {
+        return Err(invalid(
+            "C51 performance rank decisions require a focused m=2048 or m=4096 accuracy profile",
+        ));
+    }
+    let refinement = archive.config.refinements[0];
+    let observation_count = archive.config.high_observation_counts()[0];
+    let design = archive.config.covariance_designs()[0];
+    let mut rows = archive
+        .rows
+        .iter()
+        .filter(|row| {
+            row.refinement == refinement
+                && row.alpha == 2
+                && row.design == design
+                && row.observation_count == observation_count
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by_key(|row| row.rank);
+    if rows.len() != archive.config.ranks.len()
+        || rows.iter().map(|row| row.rank).collect::<Vec<_>>() != archive.config.ranks
+    {
+        return Err(invalid(
+            "C51 focused rank decision lacks exactly one row for every frozen rank",
+        ));
+    }
+    if rows.iter().any(|row| row.status != "measured") {
+        return Err(invalid(
+            "C51 focused rank decision cannot be exported from a censored rank ladder",
+        ));
+    }
+    if rows
+        .iter()
+        .any(|row| row.method_performance_timing_eligible)
+    {
+        return Err(invalid(
+            "C51 shared-basis accuracy rows must remain timing ineligible",
+        ));
+    }
+    let primary_errors = rows
+        .iter()
+        .map(|row| {
+            let selection = row
+                .selection
+                .ok_or_else(|| invalid("C51 measured rank row lacks selection metrics"))?
+                .primary_envelope();
+            let held_out = row
+                .held_out
+                .ok_or_else(|| invalid("C51 measured rank row lacks held-out metrics"))?
+                .primary_envelope();
+            if !selection.is_finite() || !held_out.is_finite() {
+                return Err(invalid("C51 rank decision errors must be finite"));
+            }
+            Ok((selection, held_out))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let selected_index = (1..rows.len()).find(|&index| {
+        primary_errors[index].1 <= C51_PERFORMANCE_PRIMARY_TOLERANCE
+            && primary_errors[index - 1].0 > C51_PERFORMANCE_PRIMARY_TOLERANCE
+            && primary_errors[index..]
+                .iter()
+                .all(|(selection, _)| *selection <= C51_PERFORMANCE_PRIMARY_TOLERANCE)
+    });
+    let selected_index = selected_index.ok_or_else(|| {
+        invalid(
+            "C51 focused rank ladder has no 5% sustained selection pass with a lower failing bracket and held-out pass",
+        )
+    })?;
+    let selected = rows[selected_index];
+    let lower = rows[selected_index - 1];
+
+    let compact = archive
+        .compact_accuracy_rows
+        .iter()
+        .filter(|row| {
+            row.refinement == refinement
+                && row.alpha == 2
+                && row.design == design
+                && row.observation_count == observation_count
+        })
+        .collect::<Vec<_>>();
+    if compact.len() != 1 || compact[0].status != "measured" {
+        return Err(invalid(
+            "C51 rank decision requires one measured projected Whitney-compact accuracy row on the identical design",
+        ));
+    }
+    let compact = compact[0];
+    let compact_selection = compact
+        .selection
+        .ok_or_else(|| invalid("C51 compact row lacks selection metrics"))?
+        .primary_envelope();
+    let compact_held_out = compact
+        .held_out
+        .ok_or_else(|| invalid("C51 compact row lacks held-out metrics"))?
+        .primary_envelope();
+    if !compact_selection.is_finite()
+        || !compact_held_out.is_finite()
+        || compact_selection > C51_PERFORMANCE_PRIMARY_TOLERANCE
+        || compact_held_out > C51_PERFORMANCE_PRIMARY_TOLERANCE
+    {
+        return Err(invalid(
+            "C51 projected Whitney-compact method does not satisfy the frozen 5% selection and held-out envelope",
+        ));
+    }
+    if compact.method_performance_timing_eligible {
+        return Err(invalid(
+            "C51 compact accuracy evidence must remain timing ineligible",
+        ));
+    }
+
+    Ok(C51PerformanceRankDecision {
+        refinement,
+        state_dimension: selected.state_dimension,
+        scalar_observation_count: observation_count,
+        alpha: 2,
+        relative_tolerance: C51_PERFORMANCE_PRIMARY_TOLERANCE,
+        sensor_design_id: C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+        output_design_id: C51_PERFORMANCE_OUTPUT_DESIGN_ID,
+        selected_spectral_rank: selected.rank,
+        lower_failing_rank: lower.rank,
+        lower_failing_selection_primary_error: primary_errors[selected_index - 1].0,
+        selection_primary_error: primary_errors[selected_index].0,
+        held_out_primary_error: primary_errors[selected_index].1,
+        validation_status: "heldout_validated",
+        rank_status: if selected.rank == selected.state_dimension {
+            "full_rank_required"
+        } else {
+            "low_rank"
+        },
+        compact_whitney_selection_primary_error: compact_selection,
+        compact_whitney_held_out_primary_error: compact_held_out,
+        compact_whitney_validation_status: "heldout_validated",
+        accuracy_archive_sha256,
+        timing_basis_source: "partial_exact_requested_mixed_shell",
+        shared_basis_timing_eligible: false,
+    })
+}
+
+fn c51_accuracy_archive_sha256(directory: &Path) -> Result<String> {
+    c51_named_files_sha256(
+        directory,
+        &C51_ACCURACY_ARCHIVE_HASH_FILES,
+        "C51 accuracy archive",
+    )
+}
+
+fn c51_named_files_sha256(directory: &Path, files: &[&str], label: &str) -> Result<String> {
+    if !directory.is_dir() {
+        return Err(invalid(format!(
+            "{label} hash source must be a completed archive directory"
+        )));
+    }
+    let mut digest = Sha256::new();
+    for name in files {
+        let path = directory.join(name);
+        let bytes = fs::read(&path).map_err(|error| {
+            FeecGmrfError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "could not hash required {label} file {}: {error}",
+                    path.display()
+                ),
+            ))
+        })?;
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(&bytes);
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn validate_c51_perf0_archive(directory: &Path) -> Result<()> {
+    let rows_path = directory.join("rows.csv");
+    let mut reader = csv::Reader::from_path(&rows_path).map_err(csv_error)?;
+    let headers = reader.headers().map_err(csv_error)?.clone();
+    let index = |name: &str| {
+        headers
+            .iter()
+            .position(|header| header == name)
+            .ok_or_else(|| invalid(format!("C51 PERF-0 rows are missing column {name}")))
+    };
+    let method_index = index("method")?;
+    let same_law_index = index("same_discrete_law_eligible")?;
+    let observation_design_index = index("observation_design_id")?;
+    let output_design_index = index("physical_qoi_design_id")?;
+    let output_count_index = index("physical_qoi_output_count")?;
+    let error_columns = [
+        "physical_output_covariance_action_relative_error",
+        "physical_variance_relative_error",
+        "physical_transformed_variance_relative_error",
+        "physical_mean_relative_error",
+    ]
+    .map(|name| {
+        Ok((
+            index(&format!("{name}_status"))?,
+            index(&format!("{name}_value"))?,
+        ))
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>>>()?;
+    let mut exact_gp_rows = 0;
+    for record in reader.records() {
+        let record = record.map_err(csv_error)?;
+        if record.get(method_index) != Some("exact_observation_gp") {
+            continue;
+        }
+        exact_gp_rows += 1;
+        if record.get(same_law_index) != Some("true")
+            || record.get(observation_design_index) != Some(C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID)
+            || record.get(output_design_index) != Some(C51_PERFORMANCE_OUTPUT_DESIGN_ID)
+            || record.get(output_count_index) != Some("18")
+        {
+            return Err(invalid(
+                "C51 PERF-0 exact-GP row does not use the frozen same-law H/G fixture",
+            ));
+        }
+        for &(status_index, value_index) in &error_columns {
+            if record.get(status_index) != Some("measured") {
+                return Err(invalid(
+                    "C51 PERF-0 exact-GP physical error is not measured",
+                ));
+            }
+            let value = record
+                .get(value_index)
+                .ok_or_else(|| invalid("C51 PERF-0 exact-GP error value is missing"))?
+                .parse::<f64>()
+                .map_err(|error| invalid(format!("invalid C51 PERF-0 error: {error}")))?;
+            if !value.is_finite() || value > 1.0e-8 {
+                return Err(invalid(format!(
+                    "C51 PERF-0 exact-GP physical error {value} exceeds 1e-8"
+                )));
+            }
+        }
+    }
+    if exact_gp_rows != 1 {
+        return Err(invalid(format!(
+            "C51 PERF-0 requires exactly one exact-GP row, found {exact_gp_rows}"
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(any(feature = "external-solvers", test))]
 fn spectral_error(error: impl Display) -> FeecGmrfError {
     FeecGmrfError::Inference(format!("C51 spectral covariance error: {error}"))
@@ -2685,6 +3909,238 @@ mod tests {
     }
 
     #[test]
+    fn high_observation_profiles_freeze_counts_lower_brackets_and_dimension_independence() {
+        let n8 = C51SpectralCovarianceRankConfig::high_observation_accuracy(8).unwrap();
+        assert_eq!(n8.profile, C51_HIGH_OBSERVATION_PROFILE_N8);
+        assert_eq!(n8.ranks, C51_HIGH_OBSERVATION_RANKS_N8);
+        assert_eq!(n8.alphas, [MaternAlpha::Two]);
+        assert_eq!(n8.evidence_tier(), "high_observation_accuracy");
+        assert_eq!(
+            n8.covariance_designs(),
+            C51CovarianceDesign::HIGH_OBSERVATION
+        );
+        assert_eq!(n8.ranks[0], 512);
+        assert_eq!(n8.ranks.last(), Some(&3_032));
+        assert!(C51CovarianceDesign::HighM4096.observation_count(3_032) > 3_032);
+        assert_eq!(
+            C51CovarianceDesign::HIGH_OBSERVATION.map(|design| design.observation_count(17)),
+            C51_HIGH_OBSERVATION_COUNTS
+        );
+
+        let n10 = C51SpectralCovarianceRankConfig::high_observation_accuracy(10).unwrap();
+        assert_eq!(n10.ranks, C51_HIGH_OBSERVATION_RANKS_N10);
+        assert_eq!(n10.ranks.last(), Some(&6_130));
+        let mut mutated = n10;
+        mutated.ranks.remove(0);
+        assert!(mutated.validate().is_err());
+        assert!(C51SpectralCovarianceRankConfig::high_observation_accuracy(6).is_err());
+    }
+
+    #[test]
+    fn focused_high_observation_profiles_freeze_primary_and_confirmatory_cells() {
+        for refinement in [8, 10] {
+            let primary =
+                C51SpectralCovarianceRankConfig::high_observation_primary(refinement).unwrap();
+            assert_eq!(primary.high_observation_counts(), [2_048]);
+            assert_eq!(
+                primary.covariance_designs(),
+                [C51CovarianceDesign::HighM2048]
+            );
+            assert_eq!(primary.ranks[0], 512);
+            assert_eq!(primary.evidence_tier(), "high_observation_primary_accuracy");
+
+            let confirmatory =
+                C51SpectralCovarianceRankConfig::high_observation_confirmatory(refinement).unwrap();
+            assert_eq!(confirmatory.high_observation_counts(), [4_096]);
+            assert_eq!(
+                confirmatory.covariance_designs(),
+                [C51CovarianceDesign::HighM4096]
+            );
+            assert_eq!(confirmatory.ranks[0], 512);
+            assert_eq!(
+                confirmatory.evidence_tier(),
+                "high_observation_confirmatory_accuracy"
+            );
+
+            let mut mutated = confirmatory;
+            mutated.ranks.remove(0);
+            assert!(mutated.validate().is_err());
+        }
+        assert!(C51SpectralCovarianceRankConfig::high_observation_primary(6).is_err());
+        assert!(C51SpectralCovarianceRankConfig::high_observation_confirmatory(6).is_err());
+    }
+
+    #[test]
+    fn focused_high_observation_manifest_binds_rank_decision_and_endpoint_semantics() {
+        let path = std::env::temp_dir().join(format!(
+            "c51-focused-high-observation-manifest-{}-{}.yaml",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        let archive = C51SpectralCovarianceRankArchive {
+            metadata: C51SpectralCovarianceRankMetadata::discovery("test"),
+            config: C51SpectralCovarianceRankConfig::high_observation_primary(8).unwrap(),
+            basis_attempts: Vec::new(),
+            rows: Vec::new(),
+            covariances: Vec::new(),
+            exact_covariance_audits: Vec::new(),
+            sensor_banks: Vec::new(),
+            high_observation_designs: Vec::new(),
+            compact_accuracy_rows: Vec::new(),
+            plumbing_gates: Vec::new(),
+        };
+        archive.write_manifest(&path).unwrap();
+        let manifest = std::fs::read_to_string(&path).unwrap();
+        assert!(manifest.contains("performance_rank_decision_scope: primary_m2048_only"));
+        assert!(manifest.contains("performance_rank_decision_observation_count: 2048"));
+        assert!(manifest.contains("claim_bearing_physical_covariance_threshold: 0.05"));
+        assert!(manifest.contains("sensitivity_physical_covariance_threshold: 0.02"));
+        assert!(manifest.contains(
+            "state_dimension_endpoint_semantics: full_rank_required_not_low_rank_or_truncated"
+        ));
+
+        let confirmatory = C51SpectralCovarianceRankArchive {
+            config: C51SpectralCovarianceRankConfig::high_observation_confirmatory(10).unwrap(),
+            ..archive
+        };
+        confirmatory.write_manifest(&path).unwrap();
+        let manifest = std::fs::read_to_string(&path).unwrap();
+        assert!(manifest.contains("performance_rank_decision_scope: confirmatory_m4096_only"));
+        assert!(manifest.contains("performance_rank_decision_observation_count: 4096"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn decision_test_metrics(error: f64) -> C51CovarianceErrorMetrics {
+        C51CovarianceErrorMetrics {
+            relative_frobenius: error,
+            relative_spectral: error,
+            maximum_relative_diagonal: error,
+            maximum_relative_directional: error,
+            relative_correlation_frobenius: error,
+        }
+    }
+
+    fn decision_test_archive(selected_index: usize) -> C51SpectralCovarianceRankArchive {
+        let config = C51SpectralCovarianceRankConfig::high_observation_primary(8).unwrap();
+        let rows = config
+            .ranks
+            .iter()
+            .enumerate()
+            .map(|(index, &rank)| {
+                let error = if index < selected_index { 0.06 } else { 0.04 };
+                C51SpectralCovarianceRankRow {
+                    refinement: 8,
+                    state_dimension: 3_032,
+                    alpha: 2,
+                    design: C51CovarianceDesign::HighM2048,
+                    observation_count: 2_048,
+                    observation_density: 2_048.0 / 3_032.0,
+                    rank,
+                    shared_maximum_basis_rank: 3_032,
+                    rank_fraction: rank as f64 / 3_032.0,
+                    status: "measured".to_string(),
+                    censored_stage: String::new(),
+                    censored_reason: String::new(),
+                    selection: Some(decision_test_metrics(error)),
+                    held_out: Some(decision_test_metrics(0.04)),
+                    latent_mass_action_relative_errors: Some([0.01, 0.01]),
+                    latent_mass_action_maximum_relative_error: Some(0.01),
+                    basis_storage_bytes: 0,
+                    prepared_storage_bytes: None,
+                    method_performance_timing_eligible: false,
+                }
+            })
+            .collect();
+        C51SpectralCovarianceRankArchive {
+            metadata: C51SpectralCovarianceRankMetadata::discovery("test"),
+            config,
+            basis_attempts: Vec::new(),
+            rows,
+            covariances: Vec::new(),
+            exact_covariance_audits: Vec::new(),
+            sensor_banks: Vec::new(),
+            high_observation_designs: Vec::new(),
+            compact_accuracy_rows: vec![C51CompactAccuracyRow {
+                refinement: 8,
+                state_dimension: 3_032,
+                alpha: 2,
+                design: C51CovarianceDesign::HighM2048,
+                observation_count: 2_048,
+                status: "measured".to_string(),
+                unavailable_reason: String::new(),
+                selection: Some(decision_test_metrics(0.03)),
+                held_out: Some(decision_test_metrics(0.04)),
+                latent_mass_action_relative_errors: Some([0.01, 0.01]),
+                latent_mass_action_maximum_relative_error: Some(0.01),
+                method_performance_timing_eligible: false,
+            }],
+            plumbing_gates: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn performance_rank_decision_requires_bracket_and_classifies_full_rank() {
+        let low_rank = decision_test_archive(4);
+        let decision = derive_performance_rank_decision(&low_rank, "a".repeat(64)).unwrap();
+        assert_eq!(decision.selected_spectral_rank, low_rank.config.ranks[4]);
+        assert_eq!(decision.lower_failing_rank, low_rank.config.ranks[3]);
+        assert_eq!(decision.rank_status, "low_rank");
+        assert_eq!(decision.validation_status, "heldout_validated");
+        assert_eq!(
+            decision.output_design_id,
+            "rank_study_selection_and_held_out_wendland_c2_18"
+        );
+        assert_eq!(
+            decision.compact_whitney_validation_status,
+            "heldout_validated"
+        );
+        assert!(!decision.shared_basis_timing_eligible);
+
+        let full_rank = decision_test_archive(C51_HIGH_OBSERVATION_RANKS_N8.len() - 1);
+        let decision = derive_performance_rank_decision(&full_rank, "b".repeat(64)).unwrap();
+        assert_eq!(decision.selected_spectral_rank, 3_032);
+        assert_eq!(decision.rank_status, "full_rank_required");
+    }
+
+    #[test]
+    fn performance_rank_decision_rejects_censor_heldout_compact_and_missing_bracket() {
+        let mut censored = decision_test_archive(4);
+        censored.rows[2].status = "censored".to_string();
+        assert!(derive_performance_rank_decision(&censored, "a".repeat(64)).is_err());
+
+        let mut held_out = decision_test_archive(4);
+        held_out.rows[4].held_out = Some(decision_test_metrics(0.051));
+        assert!(derive_performance_rank_decision(&held_out, "a".repeat(64)).is_err());
+
+        let mut compact = decision_test_archive(4);
+        compact.compact_accuracy_rows[0].selection = Some(decision_test_metrics(0.051));
+        assert!(derive_performance_rank_decision(&compact, "a".repeat(64)).is_err());
+
+        let no_bracket = decision_test_archive(0);
+        assert!(derive_performance_rank_decision(&no_bracket, "a".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn canonical_accuracy_archive_digest_is_order_independent_and_content_sensitive() {
+        let directory = std::env::temp_dir().join(format!(
+            "c51-accuracy-digest-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("unnamed")
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        for name in C51_ACCURACY_ARCHIVE_HASH_FILES.into_iter().rev() {
+            std::fs::write(directory.join(name), name.as_bytes()).unwrap();
+        }
+        let first = c51_accuracy_archive_sha256(&directory).unwrap();
+        let second = c51_accuracy_archive_sha256(&directory).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        std::fs::write(directory.join("rows.csv"), b"changed").unwrap();
+        assert_ne!(first, c51_accuracy_archive_sha256(&directory).unwrap());
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn rank_extension_manifest_names_alpha_and_post_primary_tier_truthfully() {
         let path = std::env::temp_dir().join(format!(
             "c51-rank-extension-manifest-{}-{}.yaml",
@@ -2699,6 +4155,8 @@ mod tests {
             covariances: Vec::new(),
             exact_covariance_audits: Vec::new(),
             sensor_banks: Vec::new(),
+            high_observation_designs: Vec::new(),
+            compact_accuracy_rows: Vec::new(),
             plumbing_gates: Vec::new(),
         };
         archive.write_manifest(&path).unwrap();
@@ -2804,6 +4262,8 @@ mod tests {
                     overlapping_kernel_pairs: Vec::new(),
                 })
                 .collect(),
+            high_observation_designs: Vec::new(),
+            compact_accuracy_rows: Vec::new(),
             plumbing_gates: [2, 4]
                 .into_iter()
                 .map(|refinement| C51FullRankPlumbingGate {
@@ -2862,6 +4322,8 @@ mod tests {
                 ],
                 overlapping_kernel_pairs: vec![[0, 1]],
             }],
+            high_observation_designs: Vec::new(),
+            compact_accuracy_rows: Vec::new(),
             plumbing_gates: Vec::new(),
         };
         let weights_path = directory.join("sensor_banks.csv");
@@ -2911,6 +4373,8 @@ mod tests {
                 projection_frobenius_correction: 3.496_636_3e-14,
             }],
             sensor_banks: Vec::new(),
+            high_observation_designs: Vec::new(),
+            compact_accuracy_rows: Vec::new(),
             plumbing_gates: Vec::new(),
         };
         let path = directory.join("exact_covariance_audits.csv");

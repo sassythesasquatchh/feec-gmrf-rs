@@ -42,16 +42,33 @@ THREAD_ENV_NAMES = (
     "RAYON_NUM_THREADS",
     "FAER_NUM_THREADS",
 )
-SUPPORTED_PROFILES = ("smoke",)
+SUPPORTED_PROFILES = ("smoke", "juq-performance-v1")
 RESOURCE_METHODS = (
     "fm_direct",
     "fm_aug",
     "whitney_compact",
+    "exact_observation_gp",
     "spectral_full_rank",
     "spectral_low_rank",
 )
-OBSERVATION_CLASSES = ("local_physical_b", "local_selectors", "global_row")
-WORKLOAD_PHASES = ("cold_setup", "query_full_uq")
+OBSERVATION_CLASSES = (
+    "local_physical_b",
+    "fixed_footprint_magnetic_volume",
+    "local_selectors",
+    "global_row",
+)
+WORKLOAD_PHASES = ("cold_setup", "query_full_uq", "query_physical_uq")
+JUQ_PERFORMANCE_REFINEMENTS = (8, 10)
+JUQ_PERFORMANCE_SENSOR_COUNTS = (512, 2048, 4096, 5184)
+JUQ_PERFORMANCE_REPEATED_DATA_COUNTS = (1, 100)
+JUQ_PERFORMANCE_METHODS = (
+    "whitney_compact",
+    "exact_observation_gp",
+    "spectral_low_rank",
+)
+JUQ_SENSOR_DESIGN_ID = "c51-magnetic-fixed-footprint-maximin-12-v1"
+JUQ_SENSOR_RADIUS = 0.16
+JUQ_PHYSICAL_QOI_DESIGN_ID = "rank_study_selection_and_held_out_wendland_c2_18"
 
 
 def measured(value: Any, unit: str, source: str) -> dict[str, Any]:
@@ -700,6 +717,8 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
         )
         if any(value is not None for value in resource_values):
             raise ValueError("resource selectors require --resource-method")
+        if args.profile == "juq-performance-v1":
+            raise ValueError("juq-performance-v1 supports only one method-phase resource cell")
         return None
     required = {
         "--refinement": args.refinement,
@@ -727,7 +746,7 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
             raise ValueError("spectral_low_rank requires a positive --spectral-rank")
     elif args.spectral_rank is not None:
         raise ValueError("only spectral_low_rank accepts --spectral-rank")
-    return {
+    selection = {
         "method": args.resource_method,
         "refinement": args.refinement,
         "observation_class": args.observation_class,
@@ -739,6 +758,42 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
         "spectral_rank": args.spectral_rank,
         "workload_phase": args.workload_phase,
     }
+    if args.profile == "juq-performance-v1":
+        validate_juq_performance_selection(selection)
+    return selection
+
+
+def validate_juq_performance_selection(selection: Mapping[str, Any]) -> None:
+    if selection["refinement"] not in JUQ_PERFORMANCE_REFINEMENTS:
+        raise ValueError(
+            "juq-performance-v1 refinement must be one of "
+            + ", ".join(map(str, JUQ_PERFORMANCE_REFINEMENTS))
+        )
+    if selection["observation_class"] != "fixed_footprint_magnetic_volume":
+        raise ValueError(
+            "juq-performance-v1 requires the frozen fixed-footprint magnetic-volume design"
+        )
+    if selection["sensor_target_kind"] != "count":
+        raise ValueError("juq-performance-v1 requires an exact frozen scalar sensor count")
+    if selection["sensor_target_value"] not in JUQ_PERFORMANCE_SENSOR_COUNTS:
+        raise ValueError(
+            "juq-performance-v1 sensor count must be one of "
+            + ", ".join(map(str, JUQ_PERFORMANCE_SENSOR_COUNTS))
+        )
+    if selection["repeated_data_count"] not in JUQ_PERFORMANCE_REPEATED_DATA_COUNTS:
+        raise ValueError(
+            "juq-performance-v1 replacement-data count must be one of "
+            + ", ".join(map(str, JUQ_PERFORMANCE_REPEATED_DATA_COUNTS))
+        )
+    if selection["method"] not in JUQ_PERFORMANCE_METHODS:
+        raise ValueError(
+            "juq-performance-v1 method must be one of "
+            + ", ".join(JUQ_PERFORMANCE_METHODS)
+        )
+    if selection["workload_phase"] not in ("cold_setup", "query_physical_uq"):
+        raise ValueError(
+            "juq-performance-v1 requires cold_setup or the common query_physical_uq phase"
+        )
 
 
 def scientific_command(
@@ -765,19 +820,26 @@ def scientific_command(
     ]
 
 
-def resource_scope(selection: Mapping[str, Any] | None) -> dict[str, Any]:
+def resource_scope(
+    selection: Mapping[str, Any] | None, profile: str = "smoke"
+) -> dict[str, Any]:
     if selection is None:
         return {
             "kind": "archive_process",
             "publication_crossover_eligible": False,
             "reason": "the all-method accuracy archive shares one process and cannot own method RSS",
         }
+    publication_profile = profile == "juq-performance-v1"
     return {
         "kind": "method_phase",
         "row_attribution_eligible": True,
-        "publication_crossover_eligible": False,
+        "publication_crossover_eligible": publication_profile,
         "selection": dict(selection),
-        "reason": "one process owns one method-phase RSS measurement; publication eligibility still depends on the row's method-performance and full-UQ flags",
+        "reason": (
+            "juq-performance-v1 cell is provisionally attributable; final eligibility requires the row gate and a valid paired phase"
+            if publication_profile
+            else "one process owns one method-phase RSS measurement; discovery rows are not publication crossover evidence"
+        ),
     }
 
 
@@ -785,6 +847,8 @@ def attach_peak_rss_to_resource_row(
     rows_path: pathlib.Path,
     selection: Mapping[str, Any],
     peak_rss: Mapping[str, Any],
+    *,
+    require_performance_eligible: bool = False,
 ) -> dict[str, Any]:
     try:
         with rows_path.open("r", encoding="utf-8", newline="") as stream:
@@ -798,12 +862,17 @@ def attach_peak_rss_to_resource_row(
             f"resource RSS attribution requires exactly one CSV row; found {len(rows)}"
         )
     row = rows[0]
+    expected_observation_class = (
+        "local_physical_b"
+        if selection["observation_class"] == "fixed_footprint_magnetic_volume"
+        else str(selection["observation_class"])
+    )
     expected = {
         "resource_scope": "method_phase",
         "workload_phase": str(selection["workload_phase"]),
         "method": str(selection["method"]),
         "refinement": str(selection["refinement"]),
-        "observation_class": str(selection["observation_class"]),
+        "observation_class": expected_observation_class,
         "repeated_data_count": str(selection["repeated_data_count"]),
     }
     mismatches = {
@@ -829,6 +898,18 @@ def attach_peak_rss_to_resource_row(
             }
     if mismatches:
         raise ValueError(f"resource RSS row does not match selection: {mismatches}")
+    if require_performance_eligible:
+        reasons = performance_ineligibility_reasons(row, selection)
+        if reasons:
+            raise ValueError(
+                "resource row is performance-ineligible: " + "; ".join(reasons)
+            )
+        if peak_rss.get("status") != "measured":
+            raise ValueError("publication resource row has no measured process-tree peak RSS")
+        if peak_rss.get("source") != "cgroup_v2_memory_peak":
+            raise ValueError(
+                "publication resource row requires cgroup-v2 process-tree memory.peak"
+            )
     if peak_rss.get("status") != "measured":
         return unavailable(
             "method-phase RSS was not attached because no measured peak was available"
@@ -873,6 +954,81 @@ def attach_peak_rss_to_resource_row(
     }
 
 
+def performance_ineligibility_reasons(
+    row: Mapping[str, str], selection: Mapping[str, Any]
+) -> list[str]:
+    reasons: list[str] = []
+    for field in (
+        "available",
+        "method_performance_timing_eligible",
+        "common_physical_uq_workload_eligible",
+    ):
+        if row.get(field) != "true":
+            reasons.append(f"{field} is not true")
+    timing_reason = row.get("method_performance_timing_ineligibility_reason", "")
+    if timing_reason:
+        reasons.append(f"method timing ineligibility: {timing_reason}")
+    if row.get("observation_class") != "local_physical_b":
+        reasons.append("row does not use the local physical-B observation class")
+    if row.get("observation_design_id") != JUQ_SENSOR_DESIGN_ID:
+        reasons.append("row does not use the frozen JUQ fixed-footprint sensor design")
+    if (
+        row.get("observation_fixed_radius_status") != "measured"
+        or row.get("observation_fixed_radius_value") != str(JUQ_SENSOR_RADIUS)
+    ):
+        reasons.append("row does not certify the frozen 0.16 observation radius")
+    try:
+        expected_count = int(selection["sensor_target_value"])
+    except (KeyError, TypeError, ValueError):
+        expected_count = -1
+        reasons.append("selection does not contain an exact scalar observation count")
+    component_counts: list[int] = []
+    for component in ("x", "y", "z"):
+        prefix = f"observation_component_{component}_count"
+        try:
+            value = int(row.get(f"{prefix}_value", ""))
+        except ValueError:
+            value = -1
+        if row.get(f"{prefix}_status") != "measured" or value < 0:
+            reasons.append(f"row does not certify the {component}-component count")
+        component_counts.append(value)
+    if sum(component_counts) != expected_count or (
+        component_counts and max(component_counts) - min(component_counts) > 1
+    ):
+        reasons.append("observation component counts are not balanced and equal to scalar m")
+    expected_centers = (expected_count + 2) // 3 if expected_count >= 0 else -1
+    if (
+        row.get("observation_vector_center_count_status") != "measured"
+        or row.get("observation_vector_center_count_value") != str(expected_centers)
+    ):
+        reasons.append("observation vector-center count does not equal ceil(m/3)")
+    if row.get("physical_qoi_design_id") != JUQ_PHYSICAL_QOI_DESIGN_ID:
+        reasons.append("row does not use the frozen 18-output physical-QoI design")
+    if row.get("physical_qoi_output_count") != "18":
+        reasons.append("row does not certify all 18 physical-QoI outputs")
+    if selection["method"] == "spectral_low_rank":
+        selected_rank = str(selection["spectral_rank"])
+        if row.get("spectral_basis_source") != "partial_exact_requested_mixed_shell":
+            reasons.append("spectral basis is not one exact-request mixed solve")
+        for prefix in (
+            "spectral_rank",
+            "spectral_partial_requested_rank",
+            "spectral_partial_retained_rank",
+        ):
+            if row.get(f"{prefix}_status") != "measured" or row.get(
+                f"{prefix}_value"
+            ) != selected_rank:
+                reasons.append(f"{prefix} does not equal selected rank {selected_rank}")
+        if row.get("spectral_shared_maximum_basis_rank_status") != "not_recorded":
+            reasons.append("spectral row records a shared maximum basis")
+    if selection["method"] == "exact_observation_gp":
+        if row.get("exact_gp_conditioning_route") != "observation_space":
+            reasons.append("exact GP is not identified as observation-space conditioning")
+        if row.get("exact_gp_kernel_construction_in_headline_total") != "true":
+            reasons.append("exact GP headline total omits or does not certify kernel construction")
+    return reasons
+
+
 def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
     selection = requested_resource_selection(args)
     features = build_features(selection)
@@ -891,9 +1047,9 @@ def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
         "replicate": args.replicate,
         "profile_support": {
             "supported": list(SUPPORTED_PROFILES),
-            "note": "smoke supports either the all-method accuracy archive or one method-phase resource selection",
+            "note": "smoke supports discovery; juq-performance-v1 accepts only one frozen method-phase resource cell",
         },
-        "resource_scope": resource_scope(selection),
+        "resource_scope": resource_scope(selection, args.profile),
         "repository": str(repository),
         "output": str(args.output),
         "build_command": [
@@ -908,6 +1064,7 @@ def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
             "--example",
             "c51_benchmark",
         ],
+        "build_features": features,
         "anticipated_binary": str(binary),
         "scientific_command": scientific_command(binary, study_output, args.profile, selection),
         "thread_environment": thread_env,
@@ -928,6 +1085,12 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
         selection = requested_resource_selection(args)
     except ValueError as error:
         print(str(error), file=sys.stderr)
+        return 2
+    if args.profile == "juq-performance-v1" and args.cgroup_mode != "required":
+        print(
+            "juq-performance-v1 requires --cgroup-mode required for process-tree RSS",
+            file=sys.stderr,
+        )
         return 2
     if args.replicate < 0:
         print("replicate must be non-negative", file=sys.stderr)
@@ -962,9 +1125,9 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
         "replicate": args.replicate,
         "profile_support": {
             "supported": list(SUPPORTED_PROFILES),
-            "note": "smoke supports all-method accuracy and isolated resource modes; replicate identifies the fresh-process operations replicate",
+            "note": "smoke supports discovery; juq-performance-v1 is one immutable isolated resource cell",
         },
-        "resource_scope": resource_scope(selection),
+        "resource_scope": resource_scope(selection, args.profile),
         "runner": {
             "path": str(script_path),
             "sha256": sha256_file(script_path),
@@ -975,6 +1138,7 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
         "hardware": hardware,
         "environment": {name: environment[name] for name in (*THREAD_ENV_NAMES, "FEG_C51_PROFILE", "FEG_C51_REPLICATE")},
         "requested_output": str(output),
+        "build_features": build_features(selection),
         "started_at_utc": utc_now(),
     }
     manifest_path = output / "runner-manifest.json"
@@ -1033,12 +1197,13 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
             args.cgroup_mode,
             script_path,
         )
-        result.manifest["resource_scope"] = resource_scope(selection)
+        result.manifest["resource_scope"] = resource_scope(selection, args.profile)
         if result.shell_exit_status == 0 and selection is not None:
             result.manifest["peak_rss_row_attribution"] = attach_peak_rss_to_resource_row(
                 study_output / "rows.csv",
                 selection,
                 result.manifest["peak_rss_archive_process"],
+                require_performance_eligible=args.profile == "juq-performance-v1",
             )
         elif selection is not None:
             result.manifest["peak_rss_row_attribution"] = unavailable(

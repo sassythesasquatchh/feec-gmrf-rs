@@ -14,12 +14,18 @@
 //! never described as the same law. Tiny timings validate instrumentation
 //! only and are not evidence of a performance advantage.
 
+use crate::c51_magnetic_sensor_design::{
+    assemble_juq_performance_observation_prefix, held_out_kernels, selection_kernels,
+    C51_FIXED_OBSERVATION_RADIUS, C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT,
+    C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+};
 use common::linalg::nalgebra::CsrMatrix as FeecCsrMatrix;
 use feec_gmrf::prelude::{
     CholeskyOrderingKind, EssentialBoundaryConditions, EssentialBoundaryElimination,
-    ExactFormOperators, ExactMaternPriorBuilder, FeecGmrfError, GaussianNoise, GaussianPrior,
-    LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d, MaternAlpha,
-    MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
+    ExactFormOperators, ExactMaternPriorBuilder, ExactObservationCovarianceBlocks,
+    ExactObservationCovarianceProvenance, ExactObservationPosterior, FeecGmrfError, GaussianNoise,
+    GaussianPrior, LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d,
+    MaternAlpha, MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
     SupportedMaternPrior, SupportedMaternPriorBuilder, VarianceMethod,
 };
 #[cfg(feature = "external-solvers")]
@@ -45,12 +51,11 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v4";
-pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v2";
+pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v6";
+pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v4";
 pub const C51_STUDY_ID: &str = "c51/accuracy-resource";
 
 const EXACT_REFERENCE_MAXIMUM_DIMENSION: usize = 1_024;
-const PHYSICAL_QOI_OUTPUT_COUNT: usize = 3;
 const UPDATE_NNZ_PENDING_REASON: &str =
     "supported-law observation-update nnz is not yet exposed by the root API";
 const KKT_FILL_UNAVAILABLE_REASON: &str =
@@ -65,6 +70,9 @@ const EXACT_REQUESTED_MIXED_RESIDUAL_TOLERANCE: f64 = 1.0e-8;
 const EXACT_REQUESTED_MIXED_EIGENSOLVER_TOLERANCE: f64 = 1.0e-10;
 const EXACT_REQUESTED_MIXED_MASS_ORTHOGONALITY_TOLERANCE: f64 = 1.0e-8;
 const EXACT_REQUESTED_MIXED_EIGENVALUE_NEGATIVE_TOLERANCE: f64 = 1.0e-10;
+pub const C51_CLAIM_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT: f64 = 0.05;
+pub const C51_SENSITIVITY_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT: f64 = 0.02;
+pub const C51_CONTEXT_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT: f64 = 0.10;
 
 /// A resource or accuracy quantity with explicit availability semantics.
 #[derive(Debug, Clone, PartialEq)]
@@ -131,6 +139,7 @@ pub enum C51MethodId {
     FullMetricDirect,
     FullMetricAugmented,
     WhitneyCompact,
+    ExactObservationSpaceGp,
     SpectralFullRank,
     SpectralLowRank,
 }
@@ -141,8 +150,50 @@ impl C51MethodId {
             Self::FullMetricDirect => "fm_direct",
             Self::FullMetricAugmented => "fm_aug",
             Self::WhitneyCompact => "whitney_compact",
+            Self::ExactObservationSpaceGp => "exact_observation_gp",
             Self::SpectralFullRank => "spectral_full_rank",
             Self::SpectralLowRank => "spectral_low_rank",
+        }
+    }
+}
+
+/// Physical-B observation design used by a C51 invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C51PhysicalObservationDesign {
+    /// Legacy smoke design selecting scalar rows from the cellwise
+    /// reconstruction. Its physical footprint shrinks under refinement.
+    LegacyCellRows,
+    /// Frozen, nested Wendland-C2 volume sensors with fixed physical radius.
+    /// The scalar count is independent of the latent dimension.
+    JuqFixedFootprintPrefix,
+}
+
+impl C51PhysicalObservationDesign {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyCellRows => "legacy_cellwise_b_rows",
+            Self::JuqFixedFootprintPrefix => C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID,
+        }
+    }
+}
+
+/// Physical output bank used for method accuracy and covariance queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum C51PhysicalOutputDesign {
+    /// Three central-region volume-average components retained by smoke.
+    LegacyCentralRegionAverage,
+    /// The independent selection and held-out fixed-footprint banks used by
+    /// the spectral-rank study (nine scalar outputs per bank).
+    RankStudySelectionAndHeldOut,
+}
+
+impl C51PhysicalOutputDesign {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::LegacyCentralRegionAverage => "legacy_central_region_volume_average_3",
+            Self::RankStudySelectionAndHeldOut => {
+                "rank_study_selection_and_held_out_wendland_c2_18"
+            }
         }
     }
 }
@@ -192,6 +243,10 @@ impl C51ResourceSensorTarget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum C51ResourcePhase {
     ColdSetup,
+    /// Common claim-bearing physical-output workload: replacement-data output
+    /// means plus one full physical-output posterior covariance, action, and
+    /// diagonal. No latent covariance query or state sampling is included.
+    QueryPhysicalUq,
     QueryFullUq,
 }
 
@@ -199,6 +254,7 @@ impl C51ResourcePhase {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::ColdSetup => "cold_setup",
+            Self::QueryPhysicalUq => "query_physical_uq",
             Self::QueryFullUq => "query_full_uq",
         }
     }
@@ -275,6 +331,8 @@ impl C51ResourceSelection {
 #[derive(Debug, Clone, PartialEq)]
 pub struct C51ResourceConfig {
     pub selection: C51ResourceSelection,
+    pub physical_observation_design: C51PhysicalObservationDesign,
+    pub physical_output_design: C51PhysicalOutputDesign,
     pub spatial_dimension: usize,
     pub form_degree: usize,
     pub alpha: MaternAlpha,
@@ -295,6 +353,8 @@ impl C51ResourceConfig {
         let smoke = C51BenchmarkConfig::smoke();
         Self {
             selection,
+            physical_observation_design: smoke.physical_observation_design,
+            physical_output_design: smoke.physical_output_design,
             spatial_dimension: smoke.spatial_dimension,
             form_degree: smoke.form_degree,
             alpha: smoke.alpha,
@@ -311,6 +371,33 @@ impl C51ResourceConfig {
         }
     }
 
+    /// Resource configuration for the claim-bearing JUQ performance design.
+    ///
+    /// Unlike [`Self::smoke`], this selects the fixed-footprint Wendland sensor
+    /// prefix and can therefore request observation counts independently of
+    /// the latent state dimension.
+    pub fn juq_performance(selection: C51ResourceSelection) -> Self {
+        let performance = C51BenchmarkConfig::juq_performance();
+        Self {
+            selection,
+            physical_observation_design: performance.physical_observation_design,
+            physical_output_design: performance.physical_output_design,
+            spatial_dimension: performance.spatial_dimension,
+            form_degree: performance.form_degree,
+            alpha: performance.alpha,
+            kappa: performance.kappa,
+            tau: performance.tau,
+            observation_noise_variance: performance.observation_noise_variance,
+            physical_qoi_region_lower: performance.physical_qoi_region_lower,
+            physical_qoi_region_upper: performance.physical_qoi_region_upper,
+            spectral_reference_maximum_dimension: performance.spectral_reference_maximum_dimension,
+            spectral_operator_materialization_maximum_dimension: performance
+                .spectral_operator_materialization_maximum_dimension,
+            posterior_sample_count: performance.posterior_sample_count,
+            seed: performance.seed,
+        }
+    }
+
     fn benchmark_config(&self) -> C51BenchmarkConfig {
         let (local_sensor_counts, local_sensor_density_targets) = match self.selection.sensor_target
         {
@@ -319,6 +406,8 @@ impl C51ResourceConfig {
         };
         C51BenchmarkConfig {
             refinements: vec![self.selection.refinement],
+            physical_observation_design: self.physical_observation_design,
+            physical_output_design: self.physical_output_design,
             spatial_dimension: self.spatial_dimension,
             form_degree: self.form_degree,
             alpha: self.alpha,
@@ -345,6 +434,14 @@ impl C51ResourceConfig {
 
     fn validate(&self) -> Result<()> {
         self.selection.validate()?;
+        if self.selection.method == C51MethodId::ExactObservationSpaceGp
+            && self.selection.observation_class != C51ObservationClass::LocalPhysicalB
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "the exact observation-space GP resource method requires the common local physical-B design"
+                    .to_string(),
+            ));
+        }
         self.benchmark_config().validate()
     }
 }
@@ -401,6 +498,8 @@ impl C51RunMetadata {
 #[derive(Debug, Clone, PartialEq)]
 pub struct C51BenchmarkConfig {
     pub refinements: Vec<usize>,
+    pub physical_observation_design: C51PhysicalObservationDesign,
+    pub physical_output_design: C51PhysicalOutputDesign,
     pub spatial_dimension: usize,
     pub form_degree: usize,
     pub alpha: MaternAlpha,
@@ -440,6 +539,8 @@ impl C51BenchmarkConfig {
     pub fn smoke() -> Self {
         Self {
             refinements: vec![2],
+            physical_observation_design: C51PhysicalObservationDesign::LegacyCellRows,
+            physical_output_design: C51PhysicalOutputDesign::LegacyCentralRegionAverage,
             spatial_dimension: 3,
             form_degree: 1,
             alpha: MaternAlpha::Two,
@@ -459,6 +560,31 @@ impl C51BenchmarkConfig {
             spectral_operator_materialization_maximum_dimension: 512,
             posterior_sample_count: 4,
             seed: 0xC510_2026,
+        }
+    }
+
+    /// Claim-bearing resource profile with fixed-footprint physical-B sensors.
+    ///
+    /// This constructor is intentionally distinct from smoke. It never falls
+    /// back to shrinking cell rows, and its requested observation counts are
+    /// absolute scalar counts rather than fractions of `N`.
+    pub fn juq_performance() -> Self {
+        Self {
+            refinements: vec![8, 10],
+            physical_observation_design: C51PhysicalObservationDesign::JuqFixedFootprintPrefix,
+            physical_output_design: C51PhysicalOutputDesign::RankStudySelectionAndHeldOut,
+            local_sensor_counts: vec![32, 128, 512, 1_024, 2_048, 4_096, 5_184],
+            local_sensor_density_targets: Vec::new(),
+            repeated_data_counts: vec![1, 10],
+            include_global_row: false,
+            include_local_selectors: false,
+            spectral_low_ranks: vec![2_000],
+            spectral_rank_fractions: Vec::new(),
+            spectral_reference_maximum_dimension: 512,
+            spectral_operator_materialization_maximum_dimension: 6_000,
+            posterior_sample_count: 4,
+            seed: 0xC513_2026,
+            ..Self::smoke()
         }
     }
 
@@ -523,6 +649,42 @@ impl C51BenchmarkConfig {
         if self.local_sensor_counts.contains(&0) {
             return Err(FeecGmrfError::InvalidParameter(
                 "C51 local sensor counts must be positive".to_string(),
+            ));
+        }
+        if self.physical_observation_design == C51PhysicalObservationDesign::JuqFixedFootprintPrefix
+        {
+            if self.physical_output_design != C51PhysicalOutputDesign::RankStudySelectionAndHeldOut
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "the JUQ fixed-footprint observation design requires the frozen rank-study selection and held-out output banks"
+                        .to_string(),
+                ));
+            }
+            if self.include_global_row
+                || self.include_local_selectors
+                || !self.local_sensor_density_targets.is_empty()
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "the JUQ fixed-footprint profile accepts only absolute local physical-B counts"
+                        .to_string(),
+                ));
+            }
+            if self
+                .local_sensor_counts
+                .iter()
+                .any(|count| *count > C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT)
+            {
+                return Err(FeecGmrfError::InvalidParameter(format!(
+                    "the JUQ fixed-footprint sensor capacity is {C51_JUQ_PERFORMANCE_SCALAR_OBSERVATION_COUNT} scalar observations"
+                )));
+            }
+        }
+        if self.physical_observation_design == C51PhysicalObservationDesign::LegacyCellRows
+            && self.physical_output_design != C51PhysicalOutputDesign::LegacyCentralRegionAverage
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "legacy smoke observations require the legacy central-region physical output"
+                    .to_string(),
             ));
         }
         if self
@@ -600,6 +762,10 @@ pub struct C51BenchmarkRow {
     pub discrete_law_id: String,
     pub same_discrete_law_eligible: bool,
     pub matched_physical_qoi_eligible: bool,
+    /// Whether the row executed the common physical-output-only UQ workload
+    /// used for claim-bearing method comparisons. This is independent of the
+    /// row's separately validated accuracy qualification.
+    pub common_physical_uq_workload_eligible: bool,
     pub full_uq_workload_eligible: bool,
     /// Whether the recorded construction/setup timings are eligible for a
     /// method-performance comparison. Shared maximum-rank discovery bases are
@@ -627,6 +793,15 @@ pub struct C51BenchmarkRow {
     pub kappa: f64,
     pub tau: f64,
     pub observation_class: C51ObservationClass,
+    /// Immutable geometry/design identifier for the observation rows.
+    pub observation_design_id: String,
+    pub observation_fixed_radius: C51Measurement<f64>,
+    pub observation_vector_center_count: C51Measurement<usize>,
+    pub observation_component_x_count: C51Measurement<usize>,
+    pub observation_component_y_count: C51Measurement<usize>,
+    pub observation_component_z_count: C51Measurement<usize>,
+    pub physical_qoi_design_id: String,
+    pub physical_qoi_output_count: usize,
     pub physical_qoi_selected_cell_count: usize,
     pub physical_qoi_selected_volume_fraction: f64,
     pub sensor_count: usize,
@@ -647,6 +822,21 @@ pub struct C51BenchmarkRow {
     pub factor_storage_nnz: C51Measurement<usize>,
     pub certificate_factor_storage_nnz: C51Measurement<usize>,
     pub fill_ratio: C51Measurement<f64>,
+    /// Dense exact-GP diagnostics. These are deliberately separate from sparse
+    /// factor nonzeros and spectral feature storage.
+    pub exact_gp_dense_factor_dimension: C51Measurement<usize>,
+    pub exact_gp_dense_factor_allocated_values: C51Measurement<usize>,
+    pub exact_gp_dense_factor_triangular_values: C51Measurement<usize>,
+    pub exact_gp_output_observation_covariance_values: C51Measurement<usize>,
+    pub exact_gp_posterior_output_covariance_values: C51Measurement<usize>,
+    pub exact_gp_persistent_storage_values: C51Measurement<usize>,
+    pub exact_gp_posterior_covariance_max_abs_skew: C51Measurement<f64>,
+    pub exact_gp_prior_covariance_raw_max_relative_skew: C51Measurement<f64>,
+    pub exact_gp_prior_covariance_projection_frobenius_correction: C51Measurement<f64>,
+    pub exact_gp_prior_covariance_audit_residual_aware: C51Measurement<bool>,
+    pub exact_gp_prior_covariance_audit_policy: String,
+    pub exact_gp_prior_covariance_audit_status: String,
+    pub exact_gp_prior_covariance_audit_residual_status: String,
     pub spectral_rank: C51Measurement<usize>,
     pub spectral_basis_storage_values: C51Measurement<usize>,
     pub spectral_gp_storage_values: C51Measurement<usize>,
@@ -680,6 +870,13 @@ pub struct C51BenchmarkRow {
     pub ordering: String,
     pub feec_assembly_ns: C51Measurement<u128>,
     pub prior_build_ns: C51Measurement<u128>,
+    /// FEEC supported-law factorization plus requested Kyy/Kgy/Kgg actions.
+    pub exact_gp_covariance_construction_ns: C51Measurement<u128>,
+    /// Dense observation-space Cholesky and posterior output covariance.
+    pub exact_gp_dense_conditioning_ns: C51Measurement<u128>,
+    /// FEEC assembly, supported-law construction, covariance blocks, and dense
+    /// conditioning charged together.
+    pub exact_gp_end_to_end_setup_ns: C51Measurement<u128>,
     pub spectral_operator_recovery_ns: C51Measurement<u128>,
     pub spectral_eigensolve_ns: C51Measurement<u128>,
     pub spectral_gp_build_ns: C51Measurement<u128>,
@@ -698,6 +895,8 @@ pub struct C51BenchmarkRow {
     pub posterior_mean_relative_error: C51Measurement<f64>,
     pub covariance_action_relative_error: C51Measurement<f64>,
     pub physical_covariance_action_relative_error: C51Measurement<f64>,
+    /// Error in the common output-space action `G C_post G^T w`.
+    pub physical_output_covariance_action_relative_error: C51Measurement<f64>,
     pub physical_variance_relative_error: C51Measurement<f64>,
     pub physical_transformed_variance_relative_error: C51Measurement<f64>,
     pub physical_mean_relative_error: C51Measurement<f64>,
@@ -752,13 +951,44 @@ impl C51BenchmarkArchive {
                     row.method.as_str()
                 )));
             }
-            if row.physical_qoi_selected_cell_count == 0
-                || !row.physical_qoi_selected_volume_fraction.is_finite()
-                || row.physical_qoi_selected_volume_fraction <= 0.0
-                || row.physical_qoi_selected_volume_fraction >= 1.0
+            match row.physical_qoi_design_id.as_str() {
+                "legacy_central_region_volume_average_3"
+                    if row.physical_qoi_output_count == 3
+                        && row.physical_qoi_selected_cell_count > 0
+                        && row.physical_qoi_selected_volume_fraction.is_finite()
+                        && row.physical_qoi_selected_volume_fraction > 0.0
+                        && row.physical_qoi_selected_volume_fraction < 1.0 => {}
+                "rank_study_selection_and_held_out_wendland_c2_18"
+                    if row.physical_qoi_output_count == 18
+                        && row.physical_qoi_selected_cell_count == 0
+                        && row.physical_qoi_selected_volume_fraction == 0.0 => {}
+                _ => {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "C51 physical-QoI design metadata is missing or inconsistent".to_string(),
+                    ))
+                }
+            }
+            if row.observation_design_id == C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID
+                && (!matches!(row.observation_fixed_radius, C51Measurement::Measured(value) if value == C51_FIXED_OBSERVATION_RADIUS)
+                    || !matches!(
+                        row.observation_vector_center_count,
+                        C51Measurement::Measured(_)
+                    )
+                    || !matches!(
+                        row.observation_component_x_count,
+                        C51Measurement::Measured(_)
+                    )
+                    || !matches!(
+                        row.observation_component_y_count,
+                        C51Measurement::Measured(_)
+                    )
+                    || !matches!(
+                        row.observation_component_z_count,
+                        C51Measurement::Measured(_)
+                    ))
             {
                 return Err(FeecGmrfError::InvalidParameter(
-                    "C51 physical-QoI region metadata is missing or degenerate".to_string(),
+                    "C51 JUQ fixed-footprint observation metadata is incomplete".to_string(),
                 ));
             }
             if row.method == C51MethodId::FullMetricAugmented {
@@ -767,6 +997,34 @@ impl C51BenchmarkArchive {
                 {
                     return Err(FeecGmrfError::InvalidParameter(
                         "FM-AUG must distinguish KKT input nnz from unavailable LU fill"
+                            .to_string(),
+                    ));
+                }
+            } else if row.method == C51MethodId::ExactObservationSpaceGp {
+                if !row.same_discrete_law_eligible
+                    || exact_gp_maximum_physical_error(row) > 1.0e-8
+                    || !matches!(row.factor_storage_nnz, C51Measurement::Unavailable { .. })
+                    || !matches!(
+                        row.exact_gp_dense_factor_dimension,
+                        C51Measurement::Measured(value) if value == row.sensor_count
+                    )
+                    || !matches!(
+                        row.exact_gp_dense_factor_allocated_values,
+                        C51Measurement::Measured(value)
+                            if value == row.sensor_count * row.sensor_count
+                    )
+                    || !matches!(
+                        row.exact_gp_persistent_storage_values,
+                        C51Measurement::Measured(_)
+                    )
+                    || !matches!(
+                        row.exact_gp_prior_covariance_raw_max_relative_skew,
+                        C51Measurement::Measured(_)
+                    )
+                    || !matches!(row.sampling_ns, C51Measurement::Unavailable { .. })
+                {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "exact observation-space GP row is missing dense storage or covariance-audit diagnostics"
                             .to_string(),
                     ));
                 }
@@ -931,7 +1189,33 @@ impl C51BenchmarkArchive {
             writeln!(writer, "  - {}", yaml_scalar(frame.as_str()))?;
         }
         writeln!(writer, "study_status: discovery_in_process")?;
+        writeln!(writer, "physical_covariance_error_envelopes:")?;
+        writeln!(
+            writer,
+            "  claim: {}",
+            C51_CLAIM_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT
+        )?;
+        writeln!(
+            writer,
+            "  sensitivity: {}",
+            C51_SENSITIVITY_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT
+        )?;
+        writeln!(
+            writer,
+            "  context: {}",
+            C51_CONTEXT_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT
+        )?;
         writeln!(writer, "axes:")?;
+        writeln!(
+            writer,
+            "  physical_observation_design: {}",
+            yaml_scalar(self.config.physical_observation_design.as_str())
+        )?;
+        writeln!(
+            writer,
+            "  physical_output_design: {}",
+            yaml_scalar(self.config.physical_output_design.as_str())
+        )?;
         writeln!(
             writer,
             "  refinements: {}",
@@ -1130,6 +1414,35 @@ impl C51ResourceArchive {
                 self.row.sensor_count
             )));
         }
+        if self.config.physical_observation_design
+            == C51PhysicalObservationDesign::JuqFixedFootprintPrefix
+            && (self.row.observation_design_id != C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID
+                || self.row.physical_qoi_design_id
+                    != C51PhysicalOutputDesign::RankStudySelectionAndHeldOut.as_str()
+                || self.row.physical_qoi_output_count != 18)
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 JUQ resource row did not retain the frozen observation/output designs"
+                    .to_string(),
+            ));
+        }
+        if selection.method == C51MethodId::ExactObservationSpaceGp
+            && (!matches!(
+                self.row.exact_gp_dense_factor_dimension,
+                C51Measurement::Measured(value) if value == self.row.sensor_count
+            ) || !matches!(
+                self.row.exact_gp_persistent_storage_values,
+                C51Measurement::Measured(_)
+            ) || !matches!(
+                self.row.factor_storage_nnz,
+                C51Measurement::Unavailable { .. }
+            ))
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "C51 exact observation-space GP resource row is missing dense diagnostics"
+                    .to_string(),
+            ));
+        }
         if selection.method == C51MethodId::SpectralLowRank {
             let selected_rank = selection
                 .spectral_rank
@@ -1161,6 +1474,7 @@ impl C51ResourceArchive {
             &self.row.posterior_mean_relative_error,
             &self.row.covariance_action_relative_error,
             &self.row.physical_covariance_action_relative_error,
+            &self.row.physical_output_covariance_action_relative_error,
             &self.row.physical_variance_relative_error,
             &self.row.physical_transformed_variance_relative_error,
             &self.row.physical_mean_relative_error,
@@ -1183,7 +1497,9 @@ impl C51ResourceArchive {
         }
         match self.config.selection.phase {
             C51ResourcePhase::ColdSetup => self.row.record_factor_external_peak_rss(bytes),
-            C51ResourcePhase::QueryFullUq => self.row.record_query_external_peak_rss(bytes),
+            C51ResourcePhase::QueryPhysicalUq | C51ResourcePhase::QueryFullUq => {
+                self.row.record_query_external_peak_rss(bytes)
+            }
         }
         Ok(())
     }
@@ -1228,6 +1544,16 @@ impl C51ResourceArchive {
             writer,
             "  observation_class: {}",
             selection.observation_class.as_str()
+        )?;
+        writeln!(
+            writer,
+            "  physical_observation_design: {}",
+            yaml_scalar(self.config.physical_observation_design.as_str())
+        )?;
+        writeln!(
+            writer,
+            "  physical_output_design: {}",
+            yaml_scalar(self.config.physical_output_design.as_str())
         )?;
         writeln!(
             writer,
@@ -1330,6 +1656,98 @@ pub fn run_c51_benchmark(
     Ok(archive)
 }
 
+/// Accuracy-only hook for the common JUQ fixed-footprint observation and
+/// physical-output designs.
+///
+/// This route deliberately omits eigensolvers and the bounded dense eliminated
+/// prior. The exact-supported law is the reference for both WHITNEY-COMPACT
+/// and the exact observation-space GP. It is the qualification route that must
+/// accompany performance rows, whose accuracy fields are intentionally
+/// unavailable.
+pub fn run_c51_juq_accuracy(
+    config: &C51BenchmarkConfig,
+    metadata: C51RunMetadata,
+) -> Result<C51BenchmarkArchive> {
+    config.validate()?;
+    if config.physical_observation_design != C51PhysicalObservationDesign::JuqFixedFootprintPrefix
+        || config.physical_output_design != C51PhysicalOutputDesign::RankStudySelectionAndHeldOut
+    {
+        return Err(FeecGmrfError::InvalidParameter(
+            "C51 JUQ accuracy requires the frozen fixed-footprint observation and rank-study output designs"
+                .to_string(),
+        ));
+    }
+    let mut rows = Vec::new();
+    for &refinement in &config.refinements {
+        let assembled = assemble_refinement(config, refinement)?;
+        let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
+        let priors = build_scalable_priors(
+            config,
+            &assembled.topology,
+            &assembled.metric,
+            &assembled.operators,
+            parameters,
+        )?;
+        for design in assembled.designs {
+            if design.class != C51ObservationClass::LocalPhysicalB {
+                continue;
+            }
+            for &repeated_data_count in &config.repeated_data_counts {
+                let (supported_row, reference) = run_supported_method(
+                    &priors.supported,
+                    priors.supported_build,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    None,
+                )?;
+                rows.push(supported_row);
+                rows.push(
+                    run_spd_method(
+                        C51MethodId::WhitneyCompact,
+                        &priors.compact,
+                        priors.compact_build,
+                        assembled.feec_assembly,
+                        config,
+                        refinement,
+                        &design,
+                        repeated_data_count,
+                        &assembled.problem,
+                        Some(&reference),
+                    )?
+                    .0,
+                );
+                rows.push(run_exact_observation_gp_method(
+                    &priors.supported,
+                    priors.supported_build,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    C51ResourcePhase::QueryFullUq,
+                    Some(&reference),
+                )?);
+            }
+        }
+    }
+    let archive = C51BenchmarkArchive {
+        metadata,
+        config: config.clone(),
+        comparison_frames: [
+            C51ComparisonFrame::SameDiscreteLawRepresentation,
+            C51ComparisonFrame::MatchedPhysicalQoiMethod,
+        ],
+        rows,
+    };
+    archive.validate()?;
+    Ok(archive)
+}
+
 /// Execute exactly one selected scientific method and phase.
 ///
 /// Unlike the accuracy archive, this function never constructs an exact
@@ -1392,6 +1810,21 @@ pub fn run_c51_resource(
                 design,
                 &assembled.problem,
                 selection,
+            )?
+        }
+        C51MethodId::ExactObservationSpaceGp => {
+            let (prior, prior_build) = build_supported_prior(&assembled.operators, parameters)?;
+            run_exact_observation_gp_method(
+                &prior,
+                prior_build,
+                assembled.feec_assembly,
+                &benchmark,
+                selection.refinement,
+                design,
+                selection.repeated_data_count,
+                &assembled.problem,
+                selection.phase,
+                None,
             )?
         }
         C51MethodId::SpectralFullRank => {
@@ -1513,7 +1946,8 @@ struct BuiltScalablePriors {
 
 struct ProblemMaps {
     physical_qoi: LinearMap,
-    physical_observation: LinearMap,
+    physical_qoi_probe: Vec<f64>,
+    physical_qoi_design_id: String,
     latent_probe: Vec<f64>,
     physical_qoi_selected_cell_count: usize,
     physical_qoi_selected_volume_fraction: f64,
@@ -1575,12 +2009,17 @@ struct ObservationDesign {
     class: C51ObservationClass,
     operator: LinearMap,
     sensor_count: usize,
+    design_id: String,
+    fixed_radius: C51Measurement<f64>,
+    vector_center_count: C51Measurement<usize>,
+    component_counts: [C51Measurement<usize>; 3],
 }
 
 struct ReferenceAnswers {
     mean: Vec<f64>,
     covariance_action: Vec<f64>,
     physical_covariance_action: Vec<f64>,
+    physical_output_covariance_action: Vec<f64>,
     physical_variance: f64,
     physical_transformed_variances: Vec<f64>,
     physical_mean: Vec<f64>,
@@ -1590,6 +2029,7 @@ struct AccuracyMeasurements {
     posterior_mean: C51Measurement<f64>,
     covariance_action: C51Measurement<f64>,
     physical_covariance_action: C51Measurement<f64>,
+    physical_output_covariance_action: C51Measurement<f64>,
     physical_variance: C51Measurement<f64>,
     physical_transformed_variance: C51Measurement<f64>,
     physical_mean: C51Measurement<f64>,
@@ -1632,6 +2072,20 @@ fn run_refinement(config: &C51BenchmarkConfig, refinement: usize) -> Result<Vec<
             )?;
             let reference = exact.1;
             rows.push(exact.0);
+            if design.class == C51ObservationClass::LocalPhysicalB {
+                rows.push(run_exact_observation_gp_method(
+                    &priors.supported,
+                    priors.supported_build,
+                    assembled.feec_assembly,
+                    config,
+                    refinement,
+                    &design,
+                    repeated_data_count,
+                    &assembled.problem,
+                    C51ResourcePhase::QueryFullUq,
+                    Some(&reference),
+                )?);
+            }
             rows.push(
                 run_supported_method(
                     &priors.supported,
@@ -1806,42 +2260,71 @@ fn assemble_problem_maps(
     elimination: &EssentialBoundaryElimination,
     state_dimension: usize,
 ) -> Result<(ProblemMaps, Vec<ObservationDesign>)> {
-    let (physical_qoi_cells, physical_qoi_volume_fraction) = physical_qoi_region_cells(
-        topology,
-        coordinates,
-        config.physical_qoi_region_lower,
-        config.physical_qoi_region_upper,
-    )?;
-    let physical_maps = MagneticFieldMaps3d::from_feec_with_volume_average_cells(
-        topology,
-        coordinates,
-        &physical_qoi_cells,
-    )?;
-    let physical_observation = elimination
-        .eliminate_map(
-            physical_maps.magnetic_field.map(),
-            &vec![0.0; physical_maps.magnetic_field.map().output_dimension()],
-        )?
-        .reduced()
-        .clone();
-    let volume_average_components = physical_maps
-        .volume_average_components
-        .iter()
-        .map(|map| {
-            elimination
-                .eliminate_map(map, &[0.0])
-                .map(|eliminated| eliminated.reduced().clone())
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let physical_qoi = LinearMap::stack(&volume_average_components)?;
+    let (physical_qoi, legacy_observation, selected_cell_count, selected_volume_fraction) =
+        match config.physical_output_design {
+            C51PhysicalOutputDesign::LegacyCentralRegionAverage => {
+                let (cells, volume_fraction) = physical_qoi_region_cells(
+                    topology,
+                    coordinates,
+                    config.physical_qoi_region_lower,
+                    config.physical_qoi_region_upper,
+                )?;
+                let maps = MagneticFieldMaps3d::from_feec_with_volume_average_cells(
+                    topology,
+                    coordinates,
+                    &cells,
+                )?;
+                let components = maps
+                    .volume_average_components
+                    .iter()
+                    .map(|map| {
+                        elimination
+                            .eliminate_map(map, &[0.0])
+                            .map(|eliminated| eliminated.reduced().clone())
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (
+                    LinearMap::stack(&components)?,
+                    Some(maps.magnetic_field.map().clone()),
+                    cells.len(),
+                    volume_fraction,
+                )
+            }
+            C51PhysicalOutputDesign::RankStudySelectionAndHeldOut => {
+                let mut kernels = selection_kernels(C51_FIXED_OBSERVATION_RADIUS)?;
+                kernels.extend(held_out_kernels(C51_FIXED_OBSERVATION_RADIUS)?);
+                let bank = feec_gmrf::prelude::MagneticVolumeSensorBank3d::from_feec(
+                    topology,
+                    coordinates,
+                    &kernels,
+                )?;
+                let map = elimination
+                    .eliminate_map(
+                        bank.map().map(),
+                        &vec![0.0; bank.map().map().output_dimension()],
+                    )?
+                    .reduced()
+                    .clone();
+                (map, None, 0, 0.0)
+            }
+        };
+    let physical_qoi_probe = physical_qoi_probe(physical_qoi.output_dimension(), config.seed);
     let problem = ProblemMaps {
         physical_qoi,
-        physical_observation,
+        physical_qoi_probe,
+        physical_qoi_design_id: config.physical_output_design.as_str().to_string(),
         latent_probe: deterministic_probe(state_dimension, config.seed),
-        physical_qoi_selected_cell_count: physical_qoi_cells.len(),
-        physical_qoi_selected_volume_fraction: physical_qoi_volume_fraction,
+        physical_qoi_selected_cell_count: selected_cell_count,
+        physical_qoi_selected_volume_fraction: selected_volume_fraction,
     };
-    let designs = observation_designs(config, state_dimension, &problem.physical_observation)?;
+    let designs = observation_designs(
+        config,
+        topology,
+        coordinates,
+        elimination,
+        state_dimension,
+        legacy_observation.as_ref(),
+    )?;
     Ok((problem, designs))
 }
 
@@ -2389,6 +2872,7 @@ fn base_resource_row(
         discrete_law_id: match method {
             C51MethodId::FullMetricDirect
             | C51MethodId::FullMetricAugmented
+            | C51MethodId::ExactObservationSpaceGp
             | C51MethodId::SpectralFullRank => "exact_full_metric_whitney",
             C51MethodId::WhitneyCompact => "projected_inverse_whitney",
             C51MethodId::SpectralLowRank => "truncated_exact_full_metric_whitney_spectral",
@@ -2398,11 +2882,23 @@ fn base_resource_row(
             method,
             C51MethodId::FullMetricDirect
                 | C51MethodId::FullMetricAugmented
+                | C51MethodId::ExactObservationSpaceGp
                 | C51MethodId::SpectralFullRank
         ),
         matched_physical_qoi_eligible: false,
+        common_physical_uq_workload_eligible: matches!(
+            selection.phase,
+            C51ResourcePhase::ColdSetup | C51ResourcePhase::QueryPhysicalUq
+        ) && config.physical_observation_design
+            == C51PhysicalObservationDesign::JuqFixedFootprintPrefix
+            && config.physical_output_design
+                == C51PhysicalOutputDesign::RankStudySelectionAndHeldOut
+            && !matches!(method, C51MethodId::FullMetricAugmented),
         full_uq_workload_eligible: selection.phase == C51ResourcePhase::QueryFullUq
-            && method != C51MethodId::FullMetricAugmented,
+            && !matches!(
+                method,
+                C51MethodId::FullMetricAugmented | C51MethodId::ExactObservationSpaceGp
+            ),
         method_performance_timing_eligible: true,
         method_performance_timing_ineligibility_reason: String::new(),
         spectral_basis_source: "not_applicable".to_string(),
@@ -2419,6 +2915,14 @@ fn base_resource_row(
         kappa: config.kappa,
         tau: config.tau,
         observation_class: design.class,
+        observation_design_id: design.design_id.clone(),
+        observation_fixed_radius: design.fixed_radius.clone(),
+        observation_vector_center_count: design.vector_center_count.clone(),
+        observation_component_x_count: design.component_counts[0].clone(),
+        observation_component_y_count: design.component_counts[1].clone(),
+        observation_component_z_count: design.component_counts[2].clone(),
+        physical_qoi_design_id: problem.physical_qoi_design_id.clone(),
+        physical_qoi_output_count: problem.physical_qoi.output_dimension(),
         physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
         physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
         sensor_count: design.sensor_count,
@@ -2439,6 +2943,19 @@ fn base_resource_row(
         factor_storage_nnz: resource_phase_not_executed(),
         certificate_factor_storage_nnz: resource_phase_not_executed(),
         fill_ratio: resource_phase_not_executed(),
+        exact_gp_dense_factor_dimension: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_allocated_values: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_triangular_values: C51Measurement::NotRecorded,
+        exact_gp_output_observation_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_output_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_persistent_storage_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_covariance_max_abs_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_raw_max_relative_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_projection_frobenius_correction: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_residual_aware: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_policy: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_status: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_residual_status: "not_applicable".to_string(),
         spectral_rank: C51Measurement::NotRecorded,
         spectral_basis_storage_values: C51Measurement::NotRecorded,
         spectral_gp_storage_values: C51Measurement::NotRecorded,
@@ -2472,6 +2989,9 @@ fn base_resource_row(
         ordering: "not_applicable".to_string(),
         feec_assembly_ns: resource_phase_not_executed(),
         prior_build_ns: resource_phase_not_executed(),
+        exact_gp_covariance_construction_ns: C51Measurement::NotRecorded,
+        exact_gp_dense_conditioning_ns: C51Measurement::NotRecorded,
+        exact_gp_end_to_end_setup_ns: C51Measurement::NotRecorded,
         spectral_operator_recovery_ns: C51Measurement::NotRecorded,
         spectral_eigensolve_ns: C51Measurement::NotRecorded,
         spectral_gp_build_ns: C51Measurement::NotRecorded,
@@ -2490,6 +3010,7 @@ fn base_resource_row(
         posterior_mean_relative_error: accuracy_unavailable(),
         covariance_action_relative_error: accuracy_unavailable(),
         physical_covariance_action_relative_error: accuracy_unavailable(),
+        physical_output_covariance_action_relative_error: accuracy_unavailable(),
         physical_variance_relative_error: accuracy_unavailable(),
         physical_transformed_variance_relative_error: accuracy_unavailable(),
         physical_mean_relative_error: accuracy_unavailable(),
@@ -2509,6 +3030,8 @@ fn mark_resource_accuracy_unavailable(row: &mut C51BenchmarkRow) {
     row.covariance_action_relative_error =
         C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
     row.physical_covariance_action_relative_error =
+        C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
+    row.physical_output_covariance_action_relative_error =
         C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
     row.physical_variance_relative_error =
         C51Measurement::unavailable(RESOURCE_ACCURACY_UNAVAILABLE_REASON);
@@ -2592,6 +3115,53 @@ fn run_selected_spd_resource(
         duration_resource_measurement(&resource_report.numeric_factorization.wall_time);
     row.combined_factor_setup_ns =
         duration_resource_measurement(&resource_report.combined_factor_setup.wall_time);
+    if selection.phase == C51ResourcePhase::QueryPhysicalUq {
+        let values = repeated_observation_values(
+            design.sensor_count,
+            selection.repeated_data_count,
+            config.seed,
+        );
+        let repeated_start = Instant::now();
+        let mut final_posterior = None;
+        for (index, data) in values.iter().enumerate() {
+            if index + 1 == values.len() {
+                let posterior =
+                    prepared.condition_with_observation_values(std::slice::from_ref(data))?;
+                std::hint::black_box(posterior.pushforward_mean(&problem.physical_qoi)?);
+                final_posterior = Some(posterior);
+            } else {
+                let mean =
+                    prepared.latent_mean_with_observation_values(std::slice::from_ref(data))?;
+                std::hint::black_box(problem.physical_qoi.apply(&mean)?);
+            }
+        }
+        row.repeated_data_ns = duration_measurement(repeated_start.elapsed());
+        let mut posterior =
+            final_posterior.expect("positive replacement-data count produces a posterior");
+        let physical_start = Instant::now();
+        let covariance = posterior.pushforward_covariance(&problem.physical_qoi)?;
+        let covariance_action = dense_rows_times_vector(
+            &covariance,
+            &problem.physical_qoi_probe,
+            "C51 compact physical covariance",
+        )?;
+        std::hint::black_box(&covariance_action);
+        std::hint::black_box(dot(&problem.physical_qoi_probe, &covariance_action)?);
+        row.physical_qoi_ns = duration_measurement(physical_start.elapsed());
+        let variance_start = Instant::now();
+        let variances = dense_rows_diagonal(&covariance, "C51 compact physical covariance")?;
+        row.variance_estimation_ns = duration_measurement(variance_start.elapsed());
+        row.covariance_action_ns = C51Measurement::unavailable(
+            "the common physical-UQ workload excludes latent covariance actions",
+        );
+        row.sampling_ns = C51Measurement::unavailable(
+            "the common physical-UQ workload excludes latent state sampling",
+        );
+        row.physical_transformed_variance_min_raw =
+            C51Measurement::Measured(minimum_raw(&variances));
+        row.physical_transformed_variance_negative_count =
+            C51Measurement::Measured(negative_count(&variances));
+    }
     Ok(row)
 }
 
@@ -2711,12 +3281,17 @@ fn run_selected_spectral_resource(
     .map_err(spectral_error)?;
     let gp_build = gp_start.elapsed();
     let observation = feg_infer::sparse::core_triplet_to_feec_csr(design.operator.matrix());
+    let physical_qoi = feg_infer::sparse::core_triplet_to_feec_csr(problem.physical_qoi.matrix());
     let setup_start = Instant::now();
     let prepared = gp
         .prepare_linear_observations(&observation, config.observation_noise_variance)
         .map_err(spectral_error)?;
+    let prepared_output = prepared
+        .prepare_output(&physical_qoi)
+        .map_err(spectral_error)?;
     let setup_elapsed = setup_start.elapsed();
     let diagnostics = prepared.diagnostics();
+    let output_diagnostics = prepared_output.diagnostics();
     let mut row = base_resource_row(
         method,
         config,
@@ -2733,7 +3308,7 @@ fn run_selected_spectral_resource(
     row.spectral_gp_storage_values =
         C51Measurement::Measured(diagnostics.ambient_dimension * rank + 2 * rank);
     row.spectral_prepared_storage_values =
-        C51Measurement::Measured(diagnostics.persistent_f64_entries);
+        C51Measurement::Measured(output_diagnostics.combined_persistent_f64_entries);
     row.spectral_dense_factor_values =
         C51Measurement::Measured(diagnostics.dense_factor_allocated_entries);
     row.spectral_state_feature_values = C51Measurement::Measured(diagnostics.state_feature_entries);
@@ -2767,6 +3342,48 @@ fn run_selected_spectral_resource(
     row.numeric_factor_ns =
         C51Measurement::unavailable("prepared spectral API exposes combined dense setup time");
     row.combined_factor_setup_ns = duration_measurement(setup_elapsed);
+    if selection.phase == C51ResourcePhase::QueryPhysicalUq {
+        let values = repeated_observation_values(
+            design.sensor_count,
+            selection.repeated_data_count,
+            config.seed,
+        );
+        let repeated_start = Instant::now();
+        for data in &values {
+            std::hint::black_box(prepared_output.output_mean(data).map_err(spectral_error)?);
+        }
+        row.repeated_data_ns = duration_measurement(repeated_start.elapsed());
+        let physical_start = Instant::now();
+        let covariance = prepared_output.covariance().map_err(spectral_error)?;
+        let covariance_action = (0..covariance.nrows())
+            .map(|row_index| {
+                (0..covariance.ncols())
+                    .map(|column_index| {
+                        covariance[(row_index, column_index)]
+                            * problem.physical_qoi_probe[column_index]
+                    })
+                    .sum::<f64>()
+            })
+            .collect::<Vec<_>>();
+        std::hint::black_box(&covariance_action);
+        std::hint::black_box(dot(&problem.physical_qoi_probe, &covariance_action)?);
+        row.physical_qoi_ns = duration_measurement(physical_start.elapsed());
+        let variance_start = Instant::now();
+        let variances = (0..covariance.nrows())
+            .map(|index| covariance[(index, index)])
+            .collect::<Vec<_>>();
+        row.variance_estimation_ns = duration_measurement(variance_start.elapsed());
+        row.covariance_action_ns = C51Measurement::unavailable(
+            "the common physical-UQ workload excludes latent covariance actions",
+        );
+        row.sampling_ns = C51Measurement::unavailable(
+            "the common physical-UQ workload excludes latent state sampling",
+        );
+        row.physical_transformed_variance_min_raw =
+            C51Measurement::Measured(minimum_raw(&variances));
+        row.physical_transformed_variance_negative_count =
+            C51Measurement::Measured(negative_count(&variances));
+    }
     Ok(row)
 }
 
@@ -2820,9 +3437,13 @@ fn run_spd_method(
     let query_start = Instant::now();
     let covariance_action = posterior.covariance_action(&problem.latent_probe)?;
     let covariance_elapsed = query_start.elapsed();
-    let physical_rhs = problem.physical_qoi.apply_transpose(&[1.0, -0.5, 0.25])?;
+    let physical_rhs = problem
+        .physical_qoi
+        .apply_transpose(&problem.physical_qoi_probe)?;
     let physical_start = Instant::now();
     let physical_covariance_action = posterior.covariance_action(&physical_rhs)?;
+    let physical_output_covariance_action =
+        problem.physical_qoi.apply(&physical_covariance_action)?;
     let physical_variance = dot(&physical_rhs, &physical_covariance_action)?;
     let physical_mean = problem.physical_qoi.apply(posterior.mean())?;
     let physical_elapsed = physical_start.elapsed();
@@ -2841,6 +3462,7 @@ fn run_spd_method(
         mean: posterior.mean().to_vec(),
         covariance_action,
         physical_covariance_action,
+        physical_output_covariance_action,
         physical_variance,
         physical_transformed_variances,
         physical_mean,
@@ -2856,7 +3478,9 @@ fn run_spd_method(
             "projected_inverse_whitney".to_string()
         },
         same_discrete_law_eligible: method == C51MethodId::FullMetricDirect,
-        matched_physical_qoi_eligible: true,
+        matched_physical_qoi_eligible: method == C51MethodId::FullMetricDirect
+            || physical_covariance_accuracy_qualified(&errors),
+        common_physical_uq_workload_eligible: false,
         full_uq_workload_eligible: true,
         method_performance_timing_eligible: true,
         method_performance_timing_ineligibility_reason: String::new(),
@@ -2874,6 +3498,14 @@ fn run_spd_method(
         kappa: config.kappa,
         tau: config.tau,
         observation_class: design.class,
+        observation_design_id: design.design_id.clone(),
+        observation_fixed_radius: design.fixed_radius.clone(),
+        observation_vector_center_count: design.vector_center_count.clone(),
+        observation_component_x_count: design.component_counts[0].clone(),
+        observation_component_y_count: design.component_counts[1].clone(),
+        observation_component_z_count: design.component_counts[2].clone(),
+        physical_qoi_design_id: problem.physical_qoi_design_id.clone(),
+        physical_qoi_output_count: problem.physical_qoi.output_dimension(),
         physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
         physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
         sensor_count: design.sensor_count,
@@ -2898,6 +3530,19 @@ fn run_spd_method(
         factor_storage_nnz: usize_resource_measurement(&resource_report.factor_storage_nonzeros),
         certificate_factor_storage_nnz: C51Measurement::NotRecorded,
         fill_ratio: C51Measurement::Measured(factor.fill_ratio),
+        exact_gp_dense_factor_dimension: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_allocated_values: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_triangular_values: C51Measurement::NotRecorded,
+        exact_gp_output_observation_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_output_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_persistent_storage_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_covariance_max_abs_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_raw_max_relative_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_projection_frobenius_correction: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_residual_aware: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_policy: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_status: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_residual_status: "not_applicable".to_string(),
         spectral_rank: C51Measurement::NotRecorded,
         spectral_basis_storage_values: C51Measurement::NotRecorded,
         spectral_gp_storage_values: C51Measurement::NotRecorded,
@@ -2931,6 +3576,9 @@ fn run_spd_method(
         ordering: ordering_name(factor.ordering).to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
         prior_build_ns: duration_measurement(prior_build),
+        exact_gp_covariance_construction_ns: C51Measurement::NotRecorded,
+        exact_gp_dense_conditioning_ns: C51Measurement::NotRecorded,
+        exact_gp_end_to_end_setup_ns: C51Measurement::NotRecorded,
         spectral_operator_recovery_ns: C51Measurement::NotRecorded,
         spectral_eigensolve_ns: C51Measurement::NotRecorded,
         spectral_gp_build_ns: C51Measurement::NotRecorded,
@@ -2955,6 +3603,7 @@ fn run_spd_method(
         posterior_mean_relative_error: errors.posterior_mean,
         covariance_action_relative_error: errors.covariance_action,
         physical_covariance_action_relative_error: errors.physical_covariance_action,
+        physical_output_covariance_action_relative_error: errors.physical_output_covariance_action,
         physical_variance_relative_error: errors.physical_variance,
         physical_transformed_variance_relative_error: errors.physical_transformed_variance,
         physical_mean_relative_error: errors.physical_mean,
@@ -3007,9 +3656,13 @@ fn run_supported_method(
     let query_start = Instant::now();
     let covariance_action = posterior.covariance_action(&problem.latent_probe)?;
     let covariance_elapsed = query_start.elapsed();
-    let physical_rhs = problem.physical_qoi.apply_transpose(&[1.0, -0.5, 0.25])?;
+    let physical_rhs = problem
+        .physical_qoi
+        .apply_transpose(&problem.physical_qoi_probe)?;
     let physical_start = Instant::now();
     let physical_covariance_action = posterior.covariance_action(&physical_rhs)?;
+    let physical_output_covariance_action =
+        problem.physical_qoi.apply(&physical_covariance_action)?;
     let physical_variance = dot(&physical_rhs, &physical_covariance_action)?;
     let physical_mean = problem.physical_qoi.apply(posterior.mean())?;
     let physical_elapsed = physical_start.elapsed();
@@ -3020,6 +3673,7 @@ fn run_supported_method(
         mean: posterior.mean().to_vec(),
         covariance_action,
         physical_covariance_action,
+        physical_output_covariance_action,
         physical_variance,
         physical_transformed_variances,
         physical_mean,
@@ -3032,6 +3686,7 @@ fn run_supported_method(
         discrete_law_id: "exact_full_metric_whitney".to_string(),
         same_discrete_law_eligible: true,
         matched_physical_qoi_eligible: true,
+        common_physical_uq_workload_eligible: false,
         full_uq_workload_eligible: false,
         method_performance_timing_eligible: true,
         method_performance_timing_ineligibility_reason: String::new(),
@@ -3049,6 +3704,14 @@ fn run_supported_method(
         kappa: config.kappa,
         tau: config.tau,
         observation_class: design.class,
+        observation_design_id: design.design_id.clone(),
+        observation_fixed_radius: design.fixed_radius.clone(),
+        observation_vector_center_count: design.vector_center_count.clone(),
+        observation_component_x_count: design.component_counts[0].clone(),
+        observation_component_y_count: design.component_counts[1].clone(),
+        observation_component_z_count: design.component_counts[2].clone(),
+        physical_qoi_design_id: problem.physical_qoi_design_id.clone(),
+        physical_qoi_output_count: problem.physical_qoi.output_dimension(),
         physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
         physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
         sensor_count: design.sensor_count,
@@ -3075,6 +3738,19 @@ fn run_supported_method(
             diagnostics.constraint_gram_factor_nnz + diagnostics.supported_energy_factor_nnz,
         ),
         fill_ratio: C51Measurement::unavailable(KKT_FILL_UNAVAILABLE_REASON),
+        exact_gp_dense_factor_dimension: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_allocated_values: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_triangular_values: C51Measurement::NotRecorded,
+        exact_gp_output_observation_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_output_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_persistent_storage_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_covariance_max_abs_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_raw_max_relative_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_projection_frobenius_correction: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_residual_aware: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_policy: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_status: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_residual_status: "not_applicable".to_string(),
         spectral_rank: C51Measurement::NotRecorded,
         spectral_basis_storage_values: C51Measurement::NotRecorded,
         spectral_gp_storage_values: C51Measurement::NotRecorded,
@@ -3108,6 +3784,9 @@ fn run_supported_method(
         ordering: "backend_partial_pivoting".to_string(),
         feec_assembly_ns: duration_measurement(feec_assembly),
         prior_build_ns: duration_measurement(prior_build),
+        exact_gp_covariance_construction_ns: C51Measurement::NotRecorded,
+        exact_gp_dense_conditioning_ns: C51Measurement::NotRecorded,
+        exact_gp_end_to_end_setup_ns: C51Measurement::NotRecorded,
         spectral_operator_recovery_ns: C51Measurement::NotRecorded,
         spectral_eigensolve_ns: C51Measurement::NotRecorded,
         spectral_gp_build_ns: C51Measurement::NotRecorded,
@@ -3134,6 +3813,7 @@ fn run_supported_method(
         posterior_mean_relative_error: errors.posterior_mean,
         covariance_action_relative_error: errors.covariance_action,
         physical_covariance_action_relative_error: errors.physical_covariance_action,
+        physical_output_covariance_action_relative_error: errors.physical_output_covariance_action,
         physical_variance_relative_error: errors.physical_variance,
         physical_transformed_variance_relative_error: errors.physical_transformed_variance,
         physical_mean_relative_error: errors.physical_mean,
@@ -3145,6 +3825,221 @@ fn run_supported_method(
         )),
     };
     Ok((row, answers))
+}
+
+// This exact-GP comparator deliberately owns only observation/output-space
+// queries. It never materializes a latent covariance or labels any dense
+// quantity as a sparse precision/factor count.
+#[allow(clippy::too_many_arguments)]
+fn run_exact_observation_gp_method(
+    prior: &SupportedMaternPrior,
+    prior_build: Duration,
+    feec_assembly: Duration,
+    config: &C51BenchmarkConfig,
+    refinement: usize,
+    design: &ObservationDesign,
+    repeated_data_count: usize,
+    problem: &ProblemMaps,
+    phase: C51ResourcePhase,
+    reference: Option<&ReferenceAnswers>,
+) -> Result<C51BenchmarkRow> {
+    if design.class != C51ObservationClass::LocalPhysicalB {
+        return Err(FeecGmrfError::InvalidParameter(
+            "the exact observation-space GP comparator requires local physical-B observations"
+                .to_string(),
+        ));
+    }
+    let covariance_start = Instant::now();
+    let factor = prior.factor()?;
+    let factor_diagnostics = factor.diagnostics();
+    let stacked_dimension = design
+        .sensor_count
+        .checked_add(problem.physical_qoi.output_dimension())
+        .ok_or_else(|| {
+            FeecGmrfError::Dimension(
+                "C51 exact-GP stacked covariance dimension overflowed usize".to_string(),
+            )
+        })?;
+    let blocks = ExactObservationCovarianceBlocks::from_supported_matern_factor(
+        &factor,
+        &design.operator,
+        &problem.physical_qoi,
+        stacked_dimension,
+    )?;
+    let audit = match blocks.provenance() {
+        ExactObservationCovarianceProvenance::SupportedMaternStacked { audit } => audit.clone(),
+        ExactObservationCovarianceProvenance::CallerSuppliedExactlySymmetric => {
+            return Err(FeecGmrfError::Inference(
+                "C51 exact-GP supported covariance lost its raw-skew audit provenance".to_string(),
+            ))
+        }
+    };
+    let covariance_construction = covariance_start.elapsed();
+    let dense_start = Instant::now();
+    let posterior = ExactObservationPosterior::from_prior_covariance_blocks(
+        blocks,
+        config.observation_noise_variance,
+    )?;
+    let dense_conditioning = dense_start.elapsed();
+    let diagnostics = posterior.diagnostics();
+
+    let synthetic_selection = C51ResourceSelection {
+        refinement,
+        observation_class: design.class,
+        sensor_target: C51ResourceSensorTarget::Count(design.sensor_count),
+        repeated_data_count,
+        method: C51MethodId::ExactObservationSpaceGp,
+        spectral_rank: None,
+        phase,
+    };
+    let mut row = base_resource_row(
+        C51MethodId::ExactObservationSpaceGp,
+        config,
+        &synthetic_selection,
+        design,
+        problem,
+        prior.state_dimension(),
+        factor_diagnostics.ambient_dimension,
+        factor_diagnostics.constraint_dimension,
+    );
+    row.same_discrete_law_eligible = true;
+    row.matched_physical_qoi_eligible = phase == C51ResourcePhase::QueryFullUq;
+    row.common_physical_uq_workload_eligible = matches!(
+        phase,
+        C51ResourcePhase::ColdSetup | C51ResourcePhase::QueryPhysicalUq
+    ) && config.physical_observation_design
+        == C51PhysicalObservationDesign::JuqFixedFootprintPrefix
+        && config.physical_output_design == C51PhysicalOutputDesign::RankStudySelectionAndHeldOut;
+    row.full_uq_workload_eligible = false;
+    row.prior_precision_nnz = C51Measurement::unavailable(
+        "exact observation-space GP consumes covariance blocks, not a sparse precision",
+    );
+    row.observation_update_nnz = C51Measurement::unavailable(
+        "exact observation-space GP applies dense covariance conditioning, not a sparse update",
+    );
+    row.posterior_precision_nnz = C51Measurement::unavailable(
+        "exact observation-space GP does not assemble a latent posterior precision",
+    );
+    row.factor_storage_nnz = C51Measurement::unavailable(
+        "exact observation-space GP uses a dense observation factor; see exact_gp_dense fields",
+    );
+    row.fill_ratio = C51Measurement::unavailable(
+        "sparse fill is not applicable to exact dense observation-space conditioning",
+    );
+    row.exact_gp_dense_factor_dimension =
+        C51Measurement::Measured(diagnostics.dense_factor_dimension);
+    row.exact_gp_dense_factor_allocated_values =
+        C51Measurement::Measured(diagnostics.dense_factor_allocated_entries);
+    row.exact_gp_dense_factor_triangular_values =
+        C51Measurement::Measured(diagnostics.dense_factor_triangular_entries);
+    row.exact_gp_output_observation_covariance_values =
+        C51Measurement::Measured(diagnostics.output_observation_covariance_entries);
+    row.exact_gp_posterior_output_covariance_values =
+        C51Measurement::Measured(diagnostics.posterior_output_covariance_entries);
+    row.exact_gp_persistent_storage_values =
+        C51Measurement::Measured(diagnostics.persistent_f64_entries);
+    row.exact_gp_posterior_covariance_max_abs_skew =
+        C51Measurement::Measured(diagnostics.posterior_output_covariance_max_abs_skew);
+    row.exact_gp_prior_covariance_raw_max_relative_skew =
+        C51Measurement::Measured(audit.raw_maximum_relative_skew);
+    row.exact_gp_prior_covariance_projection_frobenius_correction =
+        C51Measurement::Measured(audit.projection_frobenius_correction);
+    row.exact_gp_prior_covariance_audit_residual_aware =
+        C51Measurement::Measured(audit.residual_aware);
+    row.exact_gp_prior_covariance_audit_policy = audit.policy_version.to_string();
+    row.exact_gp_prior_covariance_audit_status = audit.status.to_string();
+    row.exact_gp_prior_covariance_audit_residual_status = audit.residual_status.to_string();
+    row.solver = "exact_observation_space_dense_cholesky".to_string();
+    row.ordering = "not_applicable".to_string();
+    row.feec_assembly_ns = duration_measurement(feec_assembly);
+    row.prior_build_ns = duration_measurement(prior_build);
+    row.exact_gp_covariance_construction_ns = duration_measurement(covariance_construction);
+    row.exact_gp_dense_conditioning_ns = duration_measurement(dense_conditioning);
+    row.exact_gp_end_to_end_setup_ns = duration_measurement(
+        feec_assembly + prior_build + covariance_construction + dense_conditioning,
+    );
+    row.observation_update_assembly_ns =
+        C51Measurement::unavailable("exact GP covariance-block construction is charged separately");
+    row.observation_update_and_factor_ns = duration_measurement(dense_conditioning);
+    row.symbolic_analysis_ns = C51Measurement::unavailable(
+        "symbolic sparse analysis is not applicable to a dense observation Cholesky",
+    );
+    row.numeric_factor_ns = C51Measurement::unavailable(
+        "exact GP backend reports combined dense Cholesky and posterior-output covariance setup",
+    );
+    row.combined_factor_setup_ns =
+        duration_measurement(covariance_construction + dense_conditioning);
+    if phase == C51ResourcePhase::ColdSetup {
+        return Ok(row);
+    }
+
+    let values = repeated_observation_values(design.sensor_count, repeated_data_count, config.seed);
+    let repeated_start = Instant::now();
+    let mut physical_mean = Vec::new();
+    for data in &values {
+        physical_mean = posterior.output_mean(data)?;
+    }
+    let repeated_elapsed = repeated_start.elapsed();
+    let physical_start = Instant::now();
+    let physical_output_covariance_action =
+        posterior.posterior_output_covariance_action(&problem.physical_qoi_probe)?;
+    let physical_variance = dot(
+        &problem.physical_qoi_probe,
+        &physical_output_covariance_action,
+    )?;
+    let physical_elapsed = physical_start.elapsed();
+    let variance_start = Instant::now();
+    let covariance = posterior.posterior_output_covariance();
+    let physical_transformed_variances = (0..problem.physical_qoi.output_dimension())
+        .map(|index| covariance[index][index])
+        .collect::<Vec<_>>();
+    let variance_elapsed = variance_start.elapsed();
+
+    row.repeated_data_ns = duration_measurement(repeated_elapsed);
+    row.covariance_action_ns = C51Measurement::unavailable(
+        "exact observation-space GP does not construct a latent covariance action",
+    );
+    row.physical_qoi_ns = duration_measurement(physical_elapsed);
+    row.sampling_ns = C51Measurement::unavailable(
+        "the exact observation-space facade exposes output moments, not latent sampling",
+    );
+    row.variance_estimation_ns = duration_measurement(variance_elapsed);
+    row.physical_transformed_variance_min_raw =
+        C51Measurement::Measured(minimum_raw(&physical_transformed_variances));
+    row.physical_transformed_variance_negative_count =
+        C51Measurement::Measured(negative_count(&physical_transformed_variances));
+    row.posterior_mean_relative_error = C51Measurement::unavailable(
+        "exact observation-space GP does not construct a latent posterior mean",
+    );
+    row.covariance_action_relative_error = C51Measurement::unavailable(
+        "exact observation-space GP does not construct a latent covariance action",
+    );
+    row.physical_covariance_action_relative_error = C51Measurement::unavailable(
+        "exact observation-space GP does not construct the latent C G^T action",
+    );
+    if let Some(reference) = reference {
+        row.physical_output_covariance_action_relative_error =
+            C51Measurement::Measured(relative_l2(
+                &physical_output_covariance_action,
+                &reference.physical_output_covariance_action,
+            )?);
+        row.physical_variance_relative_error = C51Measurement::Measured(relative_scalar(
+            physical_variance,
+            reference.physical_variance,
+        ));
+        row.physical_transformed_variance_relative_error = C51Measurement::Measured(relative_l2(
+            &physical_transformed_variances,
+            &reference.physical_transformed_variances,
+        )?);
+        row.physical_mean_relative_error =
+            C51Measurement::Measured(relative_l2(&physical_mean, &reference.physical_mean)?);
+    } else {
+        row.physical_output_covariance_action_relative_error = C51Measurement::Measured(0.0);
+        row.physical_variance_relative_error = C51Measurement::Measured(0.0);
+        row.physical_transformed_variance_relative_error = C51Measurement::Measured(0.0);
+        row.physical_mean_relative_error = C51Measurement::Measured(0.0);
+    }
+    Ok(row)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3213,15 +4108,17 @@ fn run_spectral_method(
         .state_covariance_action(&problem.latent_probe)
         .map_err(spectral_error)?;
     let covariance_elapsed = covariance_start.elapsed();
-    let physical_rhs = problem.physical_qoi.apply_transpose(&[1.0, -0.5, 0.25])?;
+    let physical_rhs = problem
+        .physical_qoi
+        .apply_transpose(&problem.physical_qoi_probe)?;
     let physical_start = Instant::now();
     let physical_covariance_action = prepared
         .state_covariance_action(&physical_rhs)
         .map_err(spectral_error)?;
     let physical_output_action = prepared
-        .output_covariance_action(&physical_qoi, &[1.0, -0.5, 0.25])
+        .output_covariance_action(&physical_qoi, &problem.physical_qoi_probe)
         .map_err(spectral_error)?;
-    let physical_variance = dot(&[1.0, -0.5, 0.25], &physical_output_action)?;
+    let physical_variance = dot(&problem.physical_qoi_probe, &physical_output_action)?;
     let full_output = prepared
         .output_moments_with_covariance(&physical_qoi, final_values)
         .map_err(spectral_error)?;
@@ -3231,8 +4128,8 @@ fn run_spectral_method(
         .output_moments(&physical_qoi, final_values)
         .map_err(spectral_error)?;
     let variance_elapsed = variance_start.elapsed();
-    if full_output.covariance.nrows() != PHYSICAL_QOI_OUTPUT_COUNT
-        || full_output.covariance.ncols() != PHYSICAL_QOI_OUTPUT_COUNT
+    if full_output.covariance.nrows() != problem.physical_qoi.output_dimension()
+        || full_output.covariance.ncols() != problem.physical_qoi.output_dimension()
         || relative_l2(&full_output.mean, &output.mean)? > 1.0e-12
         || relative_l2(
             &mean,
@@ -3258,6 +4155,7 @@ fn run_spectral_method(
         mean,
         covariance_action,
         physical_covariance_action,
+        physical_output_covariance_action: physical_output_action,
         physical_variance,
         physical_transformed_variances: output.variance,
         physical_mean: output.mean,
@@ -3273,7 +4171,9 @@ fn run_spectral_method(
             "truncated_exact_full_metric_whitney_spectral".to_string()
         },
         same_discrete_law_eligible: method == C51MethodId::SpectralFullRank,
-        matched_physical_qoi_eligible: true,
+        matched_physical_qoi_eligible: method == C51MethodId::SpectralFullRank
+            || physical_covariance_accuracy_qualified(&errors),
+        common_physical_uq_workload_eligible: false,
         full_uq_workload_eligible: true,
         method_performance_timing_eligible: false,
         method_performance_timing_ineligibility_reason:
@@ -3292,6 +4192,14 @@ fn run_spectral_method(
         kappa: config.kappa,
         tau: config.tau,
         observation_class: design.class,
+        observation_design_id: design.design_id.clone(),
+        observation_fixed_radius: design.fixed_radius.clone(),
+        observation_vector_center_count: design.vector_center_count.clone(),
+        observation_component_x_count: design.component_counts[0].clone(),
+        observation_component_y_count: design.component_counts[1].clone(),
+        observation_component_z_count: design.component_counts[2].clone(),
+        physical_qoi_design_id: problem.physical_qoi_design_id.clone(),
+        physical_qoi_output_count: problem.physical_qoi.output_dimension(),
         physical_qoi_selected_cell_count: problem.physical_qoi_selected_cell_count,
         physical_qoi_selected_volume_fraction: problem.physical_qoi_selected_volume_fraction,
         sensor_count: design.sensor_count,
@@ -3316,6 +4224,19 @@ fn run_spectral_method(
         fill_ratio: C51Measurement::unavailable(
             "sparse Cholesky fill is not applicable to spectral conditioning",
         ),
+        exact_gp_dense_factor_dimension: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_allocated_values: C51Measurement::NotRecorded,
+        exact_gp_dense_factor_triangular_values: C51Measurement::NotRecorded,
+        exact_gp_output_observation_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_output_covariance_values: C51Measurement::NotRecorded,
+        exact_gp_persistent_storage_values: C51Measurement::NotRecorded,
+        exact_gp_posterior_covariance_max_abs_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_raw_max_relative_skew: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_projection_frobenius_correction: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_residual_aware: C51Measurement::NotRecorded,
+        exact_gp_prior_covariance_audit_policy: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_status: "not_applicable".to_string(),
+        exact_gp_prior_covariance_audit_residual_status: "not_applicable".to_string(),
         spectral_rank: C51Measurement::Measured(rank),
         spectral_basis_storage_values: C51Measurement::Measured(source.basis_storage_values),
         spectral_gp_storage_values: C51Measurement::Measured(
@@ -3369,6 +4290,9 @@ fn run_spectral_method(
         prior_build_ns: duration_measurement(
             source.operator_recovery + source.eigensolve + gp_build,
         ),
+        exact_gp_covariance_construction_ns: C51Measurement::NotRecorded,
+        exact_gp_dense_conditioning_ns: C51Measurement::NotRecorded,
+        exact_gp_end_to_end_setup_ns: C51Measurement::NotRecorded,
         spectral_operator_recovery_ns: duration_measurement(source.operator_recovery),
         spectral_eigensolve_ns: duration_measurement(source.eigensolve),
         spectral_gp_build_ns: duration_measurement(gp_build),
@@ -3393,6 +4317,7 @@ fn run_spectral_method(
         posterior_mean_relative_error: errors.posterior_mean,
         covariance_action_relative_error: errors.covariance_action,
         physical_covariance_action_relative_error: errors.physical_covariance_action,
+        physical_output_covariance_action_relative_error: errors.physical_output_covariance_action,
         physical_variance_relative_error: errors.physical_variance,
         physical_transformed_variance_relative_error: errors.physical_transformed_variance,
         physical_mean_relative_error: errors.physical_mean,
@@ -3409,28 +4334,81 @@ fn run_spectral_method(
 
 fn observation_designs(
     config: &C51BenchmarkConfig,
+    topology: &Complex,
+    coordinates: &manifold::geometry::coord::mesh::MeshCoords,
+    elimination: &EssentialBoundaryElimination,
     dimension: usize,
-    physical_observation: &LinearMap,
+    legacy_full_physical_observation: Option<&LinearMap>,
 ) -> Result<Vec<ObservationDesign>> {
     let mut designs = Vec::new();
     for requested in local_sensor_targets(config, dimension) {
         let sensor_count = requested.min(dimension);
-        let physical_sensor_count = requested.min(physical_observation.output_dimension());
-        let physical_rows = evenly_spaced_indices(
-            physical_observation.output_dimension(),
-            physical_sensor_count,
-        );
-        designs.push(ObservationDesign {
-            class: C51ObservationClass::LocalPhysicalB,
-            operator: physical_observation.select_outputs(&physical_rows)?,
-            sensor_count: physical_sensor_count,
-        });
+        match config.physical_observation_design {
+            C51PhysicalObservationDesign::LegacyCellRows => {
+                let legacy_full_physical_observation = legacy_full_physical_observation
+                    .ok_or_else(|| {
+                        FeecGmrfError::Inference(
+                            "legacy C51 observation design is missing its cellwise B map"
+                                .to_string(),
+                        )
+                    })?;
+                let physical_observation = elimination
+                    .eliminate_map(
+                        legacy_full_physical_observation,
+                        &vec![0.0; legacy_full_physical_observation.output_dimension()],
+                    )?
+                    .reduced()
+                    .clone();
+                let physical_sensor_count = requested.min(physical_observation.output_dimension());
+                let physical_rows = evenly_spaced_indices(
+                    physical_observation.output_dimension(),
+                    physical_sensor_count,
+                );
+                designs.push(ObservationDesign {
+                    class: C51ObservationClass::LocalPhysicalB,
+                    operator: physical_observation.select_outputs(&physical_rows)?,
+                    sensor_count: physical_sensor_count,
+                    design_id: C51PhysicalObservationDesign::LegacyCellRows
+                        .as_str()
+                        .to_string(),
+                    fixed_radius: C51Measurement::unavailable(
+                        "legacy cell-row footprint shrinks with the mesh",
+                    ),
+                    vector_center_count: C51Measurement::NotRecorded,
+                    component_counts: std::array::from_fn(|_| C51Measurement::NotRecorded),
+                });
+            }
+            C51PhysicalObservationDesign::JuqFixedFootprintPrefix => {
+                let prefix =
+                    assemble_juq_performance_observation_prefix(topology, coordinates, requested)?;
+                let eliminated = elimination.eliminate_map(
+                    prefix.scalar_map(),
+                    &vec![0.0; prefix.scalar_map().output_dimension()],
+                )?;
+                let metadata = prefix.metadata();
+                designs.push(ObservationDesign {
+                    class: C51ObservationClass::LocalPhysicalB,
+                    operator: eliminated.reduced().clone(),
+                    sensor_count: metadata.scalar_observation_count,
+                    design_id: C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID.to_string(),
+                    fixed_radius: C51Measurement::Measured(C51_FIXED_OBSERVATION_RADIUS),
+                    vector_center_count: C51Measurement::Measured(metadata.vector_center_count),
+                    component_counts: metadata.component_counts.map(C51Measurement::Measured),
+                });
+            }
+        }
         if config.include_local_selectors {
             let indices = evenly_spaced_indices(dimension, sensor_count);
             designs.push(ObservationDesign {
                 class: C51ObservationClass::LocalSelectors,
                 operator: LinearMap::selector(dimension, &indices)?,
                 sensor_count,
+                design_id: "coefficient_selectors".to_string(),
+                fixed_radius: C51Measurement::unavailable(
+                    "coefficient selectors have no fixed physical radius",
+                ),
+                vector_center_count: C51Measurement::NotRecorded,
+                component_counts: std::array::from_fn(|_| C51Measurement::NotRecorded),
             });
         }
     }
@@ -3446,6 +4424,12 @@ fn observation_designs(
             class: C51ObservationClass::GlobalRow,
             operator: LinearMap::weighted_row(dimension, &entries)?,
             sensor_count: 1,
+            design_id: "dense_alternating_global_row".to_string(),
+            fixed_radius: C51Measurement::unavailable(
+                "global control row has no bounded physical radius",
+            ),
+            vector_center_count: C51Measurement::NotRecorded,
+            component_counts: std::array::from_fn(|_| C51Measurement::NotRecorded),
         });
     }
     Ok(designs)
@@ -3455,7 +4439,10 @@ fn local_sensor_targets(config: &C51BenchmarkConfig, dimension: usize) -> Vec<us
     let mut targets = config
         .local_sensor_counts
         .iter()
-        .map(|count| (*count).min(dimension))
+        .map(|count| match config.physical_observation_design {
+            C51PhysicalObservationDesign::LegacyCellRows => (*count).min(dimension),
+            C51PhysicalObservationDesign::JuqFixedFootprintPrefix => *count,
+        })
         .collect::<BTreeSet<_>>();
     for density in &config.local_sensor_density_targets {
         let count = (*density * dimension as f64).ceil() as usize;
@@ -3529,6 +4516,21 @@ fn deterministic_probe(dimension: usize, seed: u64) -> Vec<f64> {
         .collect()
 }
 
+fn physical_qoi_probe(dimension: usize, seed: u64) -> Vec<f64> {
+    if dimension == 3 {
+        vec![1.0, -0.5, 0.25]
+    } else {
+        let mut probe = deterministic_probe(dimension, seed ^ 0xB0_0A71);
+        let norm = probe.iter().map(|value| value * value).sum::<f64>().sqrt();
+        if norm > 0.0 {
+            for value in &mut probe {
+                *value /= norm;
+            }
+        }
+        probe
+    }
+}
+
 fn errors_against(
     answers: &ReferenceAnswers,
     reference: Option<&ReferenceAnswers>,
@@ -3538,6 +4540,7 @@ fn errors_against(
             posterior_mean: C51Measurement::Measured(0.0),
             covariance_action: C51Measurement::Measured(0.0),
             physical_covariance_action: C51Measurement::Measured(0.0),
+            physical_output_covariance_action: C51Measurement::Measured(0.0),
             physical_variance: C51Measurement::Measured(0.0),
             physical_transformed_variance: C51Measurement::Measured(0.0),
             physical_mean: C51Measurement::Measured(0.0),
@@ -3553,6 +4556,10 @@ fn errors_against(
             &answers.physical_covariance_action,
             &reference.physical_covariance_action,
         )?),
+        physical_output_covariance_action: C51Measurement::Measured(relative_l2(
+            &answers.physical_output_covariance_action,
+            &reference.physical_output_covariance_action,
+        )?),
         physical_variance: C51Measurement::Measured(relative_scalar(
             answers.physical_variance,
             reference.physical_variance,
@@ -3565,6 +4572,20 @@ fn errors_against(
             &answers.physical_mean,
             &reference.physical_mean,
         )?),
+    })
+}
+
+fn physical_covariance_accuracy_qualified(errors: &AccuracyMeasurements) -> bool {
+    [
+        &errors.physical_output_covariance_action,
+        &errors.physical_variance,
+        &errors.physical_transformed_variance,
+    ]
+    .into_iter()
+    .all(|measurement| {
+        matches!(measurement, C51Measurement::Measured(value)
+            if value.is_finite()
+                && *value <= C51_CLAIM_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT)
     })
 }
 
@@ -3600,6 +4621,39 @@ fn negative_count(values: &[f64]) -> usize {
     values.iter().filter(|value| **value < 0.0).count()
 }
 
+fn dense_rows_times_vector(matrix: &[Vec<f64>], vector: &[f64], label: &str) -> Result<Vec<f64>> {
+    if matrix.len() != vector.len() || matrix.iter().any(|row| row.len() != vector.len()) {
+        return Err(FeecGmrfError::Dimension(format!(
+            "{label} must be square with dimension {}, got {} rows",
+            vector.len(),
+            matrix.len()
+        )));
+    }
+    Ok(matrix
+        .iter()
+        .map(|row| {
+            row.iter()
+                .zip(vector)
+                .map(|(entry, value)| entry * value)
+                .sum()
+        })
+        .collect())
+}
+
+fn dense_rows_diagonal(matrix: &[Vec<f64>], label: &str) -> Result<Vec<f64>> {
+    if matrix.iter().any(|row| row.len() != matrix.len()) {
+        return Err(FeecGmrfError::Dimension(format!(
+            "{label} must be square, got {} rows with inconsistent columns",
+            matrix.len()
+        )));
+    }
+    Ok(matrix
+        .iter()
+        .enumerate()
+        .map(|(index, row)| row[index])
+        .collect())
+}
+
 fn dot(lhs: &[f64], rhs: &[f64]) -> Result<f64> {
     if lhs.len() != rhs.len() {
         return Err(FeecGmrfError::Dimension(
@@ -3622,6 +4676,7 @@ fn method_seed(method: C51MethodId) -> u64 {
         C51MethodId::FullMetricDirect => 0xD1CE_C700,
         C51MethodId::FullMetricAugmented => 0xA090_0000,
         C51MethodId::WhitneyCompact => 0xC0A0_AC70,
+        C51MethodId::ExactObservationSpaceGp => 0xEAC7_600D,
         C51MethodId::SpectralFullRank => 0x5EEC_F011,
         C51MethodId::SpectralLowRank => 0x5EEC_10A0,
     }
@@ -3643,6 +4698,19 @@ fn full_rank_maximum_error(row: &C51BenchmarkRow) -> f64 {
         &row.posterior_mean_relative_error,
         &row.covariance_action_relative_error,
         &row.physical_covariance_action_relative_error,
+        &row.physical_output_covariance_action_relative_error,
+        &row.physical_variance_relative_error,
+        &row.physical_transformed_variance_relative_error,
+        &row.physical_mean_relative_error,
+    ]
+    .into_iter()
+    .map(measured_or_infinite)
+    .fold(0.0, f64::max)
+}
+
+fn exact_gp_maximum_physical_error(row: &C51BenchmarkRow) -> f64 {
+    [
+        &row.physical_output_covariance_action_relative_error,
         &row.physical_variance_relative_error,
         &row.physical_transformed_variance_relative_error,
         &row.physical_mean_relative_error,
@@ -3684,6 +4752,7 @@ fn csv_header() -> String {
         "discrete_law_id",
         "same_discrete_law_eligible",
         "matched_physical_qoi_eligible",
+        "common_physical_uq_workload_eligible",
         "full_uq_workload_eligible",
         "method_performance_timing_eligible",
         "method_performance_timing_ineligibility_reason",
@@ -3701,6 +4770,9 @@ fn csv_header() -> String {
         "kappa",
         "tau",
         "observation_class",
+        "observation_design_id",
+        "physical_qoi_design_id",
+        "physical_qoi_output_count",
         "physical_qoi_selected_cell_count",
         "physical_qoi_selected_volume_fraction",
         "sensor_count",
@@ -3714,6 +4786,9 @@ fn csv_header() -> String {
         "observation_nnz",
         "solver",
         "ordering",
+        "exact_gp_prior_covariance_audit_policy",
+        "exact_gp_prior_covariance_audit_status",
+        "exact_gp_prior_covariance_audit_residual_status",
     ];
     let measurement_fields = measurement_field_names();
     scalar_fields
@@ -3730,8 +4805,13 @@ fn csv_header() -> String {
         .join(",")
 }
 
-fn measurement_field_names() -> [&'static str; 63] {
+fn measurement_field_names() -> [&'static str; 82] {
     [
+        "observation_fixed_radius",
+        "observation_vector_center_count",
+        "observation_component_x_count",
+        "observation_component_y_count",
+        "observation_component_z_count",
         "prior_precision_nnz",
         "observation_update_nnz",
         "posterior_precision_nnz",
@@ -3741,6 +4821,16 @@ fn measurement_field_names() -> [&'static str; 63] {
         "factor_storage_nnz",
         "certificate_factor_storage_nnz",
         "fill_ratio",
+        "exact_gp_dense_factor_dimension",
+        "exact_gp_dense_factor_allocated_values",
+        "exact_gp_dense_factor_triangular_values",
+        "exact_gp_output_observation_covariance_values",
+        "exact_gp_posterior_output_covariance_values",
+        "exact_gp_persistent_storage_values",
+        "exact_gp_posterior_covariance_max_abs_skew",
+        "exact_gp_prior_covariance_raw_max_relative_skew",
+        "exact_gp_prior_covariance_projection_frobenius_correction",
+        "exact_gp_prior_covariance_audit_residual_aware",
         "spectral_rank",
         "spectral_basis_storage_values",
         "spectral_gp_storage_values",
@@ -3772,6 +4862,9 @@ fn measurement_field_names() -> [&'static str; 63] {
         "spectral_partial_residual_validation_ns",
         "feec_assembly_ns",
         "prior_build_ns",
+        "exact_gp_covariance_construction_ns",
+        "exact_gp_dense_conditioning_ns",
+        "exact_gp_end_to_end_setup_ns",
         "spectral_operator_recovery_ns",
         "spectral_eigensolve_ns",
         "spectral_gp_build_ns",
@@ -3790,6 +4883,7 @@ fn measurement_field_names() -> [&'static str; 63] {
         "posterior_mean_relative_error",
         "covariance_action_relative_error",
         "physical_covariance_action_relative_error",
+        "physical_output_covariance_action_relative_error",
         "physical_variance_relative_error",
         "physical_transformed_variance_relative_error",
         "physical_mean_relative_error",
@@ -3808,6 +4902,7 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         row.discrete_law_id.clone(),
         row.same_discrete_law_eligible.to_string(),
         row.matched_physical_qoi_eligible.to_string(),
+        row.common_physical_uq_workload_eligible.to_string(),
         row.full_uq_workload_eligible.to_string(),
         row.method_performance_timing_eligible.to_string(),
         row.method_performance_timing_ineligibility_reason.clone(),
@@ -3825,6 +4920,9 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         row.kappa.to_string(),
         row.tau.to_string(),
         row.observation_class.as_str().to_string(),
+        row.observation_design_id.clone(),
+        row.physical_qoi_design_id.clone(),
+        row.physical_qoi_output_count.to_string(),
         row.physical_qoi_selected_cell_count.to_string(),
         row.physical_qoi_selected_volume_fraction.to_string(),
         row.sensor_count.to_string(),
@@ -3838,7 +4936,15 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         row.observation_nnz.to_string(),
         row.solver.clone(),
         row.ordering.clone(),
+        row.exact_gp_prior_covariance_audit_policy.clone(),
+        row.exact_gp_prior_covariance_audit_status.clone(),
+        row.exact_gp_prior_covariance_audit_residual_status.clone(),
     ];
+    push_measurement(&mut fields, &row.observation_fixed_radius);
+    push_measurement(&mut fields, &row.observation_vector_center_count);
+    push_measurement(&mut fields, &row.observation_component_x_count);
+    push_measurement(&mut fields, &row.observation_component_y_count);
+    push_measurement(&mut fields, &row.observation_component_z_count);
     push_measurement(&mut fields, &row.prior_precision_nnz);
     push_measurement(&mut fields, &row.observation_update_nnz);
     push_measurement(&mut fields, &row.posterior_precision_nnz);
@@ -3848,6 +4954,31 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
     push_measurement(&mut fields, &row.factor_storage_nnz);
     push_measurement(&mut fields, &row.certificate_factor_storage_nnz);
     push_measurement(&mut fields, &row.fill_ratio);
+    push_measurement(&mut fields, &row.exact_gp_dense_factor_dimension);
+    push_measurement(&mut fields, &row.exact_gp_dense_factor_allocated_values);
+    push_measurement(&mut fields, &row.exact_gp_dense_factor_triangular_values);
+    push_measurement(
+        &mut fields,
+        &row.exact_gp_output_observation_covariance_values,
+    );
+    push_measurement(
+        &mut fields,
+        &row.exact_gp_posterior_output_covariance_values,
+    );
+    push_measurement(&mut fields, &row.exact_gp_persistent_storage_values);
+    push_measurement(&mut fields, &row.exact_gp_posterior_covariance_max_abs_skew);
+    push_measurement(
+        &mut fields,
+        &row.exact_gp_prior_covariance_raw_max_relative_skew,
+    );
+    push_measurement(
+        &mut fields,
+        &row.exact_gp_prior_covariance_projection_frobenius_correction,
+    );
+    push_measurement(
+        &mut fields,
+        &row.exact_gp_prior_covariance_audit_residual_aware,
+    );
     push_measurement(&mut fields, &row.spectral_rank);
     push_measurement(&mut fields, &row.spectral_basis_storage_values);
     push_measurement(&mut fields, &row.spectral_gp_storage_values);
@@ -3894,6 +5025,9 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
     push_measurement(&mut fields, &row.spectral_partial_residual_validation_ns);
     push_measurement(&mut fields, &row.feec_assembly_ns);
     push_measurement(&mut fields, &row.prior_build_ns);
+    push_measurement(&mut fields, &row.exact_gp_covariance_construction_ns);
+    push_measurement(&mut fields, &row.exact_gp_dense_conditioning_ns);
+    push_measurement(&mut fields, &row.exact_gp_end_to_end_setup_ns);
     push_measurement(&mut fields, &row.spectral_operator_recovery_ns);
     push_measurement(&mut fields, &row.spectral_eigensolve_ns);
     push_measurement(&mut fields, &row.spectral_gp_build_ns);
@@ -3912,6 +5046,10 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
     push_measurement(&mut fields, &row.posterior_mean_relative_error);
     push_measurement(&mut fields, &row.covariance_action_relative_error);
     push_measurement(&mut fields, &row.physical_covariance_action_relative_error);
+    push_measurement(
+        &mut fields,
+        &row.physical_output_covariance_action_relative_error,
+    );
     push_measurement(&mut fields, &row.physical_variance_relative_error);
     push_measurement(
         &mut fields,
@@ -4035,9 +5173,11 @@ mod tests {
         let designs = local_class_count * local_sensor_targets(&config, dimension).len()
             + usize::from(config.include_global_row);
         let method_count = 4 + spectral_low_ranks(&config, dimension).len();
+        let exact_gp_rows =
+            local_sensor_targets(&config, dimension).len() * config.repeated_data_counts.len();
         assert_eq!(
             archive.rows.len(),
-            designs * config.repeated_data_counts.len() * method_count
+            designs * config.repeated_data_counts.len() * method_count + exact_gp_rows
         );
         assert!(archive.rows.iter().any(|row| {
             row.observation_class == C51ObservationClass::LocalPhysicalB
@@ -4095,6 +5235,19 @@ mod tests {
                     assert!(row.full_uq_workload_eligible);
                     assert!(measured_f64(&row.physical_variance_relative_error).is_finite());
                 }
+                C51MethodId::ExactObservationSpaceGp => {
+                    assert!(row.same_discrete_law_eligible);
+                    assert!(!row.full_uq_workload_eligible);
+                    assert!(matches!(
+                        row.factor_storage_nnz,
+                        C51Measurement::Unavailable { .. }
+                    ));
+                    assert_eq!(
+                        row.exact_gp_dense_factor_dimension,
+                        C51Measurement::Measured(row.sensor_count)
+                    );
+                    assert!(exact_gp_maximum_physical_error(row) <= 1.0e-8);
+                }
                 C51MethodId::SpectralFullRank => {
                     assert!(row.available);
                     assert!(row.same_discrete_law_eligible);
@@ -4148,6 +5301,87 @@ mod tests {
         assert_eq!(config.local_sensor_density_targets, vec![0.02, 0.10]);
         assert!(!config.spectral_low_ranks.contains(&0));
         assert_eq!(spectral_low_ranks(&config, 16), vec![8]);
+    }
+
+    #[test]
+    fn juq_performance_profile_freezes_independent_m_and_rank_study_outputs() {
+        let config = C51BenchmarkConfig::juq_performance();
+        config.validate().unwrap();
+        assert_eq!(
+            config.local_sensor_counts,
+            vec![32, 128, 512, 1_024, 2_048, 4_096, 5_184]
+        );
+        assert!(config.local_sensor_density_targets.is_empty());
+        assert_eq!(
+            config.physical_observation_design,
+            C51PhysicalObservationDesign::JuqFixedFootprintPrefix
+        );
+        assert_eq!(
+            config.physical_output_design,
+            C51PhysicalOutputDesign::RankStudySelectionAndHeldOut
+        );
+    }
+
+    #[test]
+    fn perf_zero_exact_gp_and_compact_share_frozen_physical_designs() {
+        let mut config = C51BenchmarkConfig::juq_performance();
+        // n=2 is too coarse for every frozen radius-0.16 kernel to intersect
+        // the cell quadrature. n=4 is still bounded (N=316) and exercises both
+        // independent nine-output banks without changing their footprints.
+        config.refinements = vec![4];
+        config.local_sensor_counts = vec![4];
+        config.repeated_data_counts = vec![1];
+        config.posterior_sample_count = 1;
+        let archive = run_c51_juq_accuracy(&config, C51RunMetadata::smoke("perf-zero"))
+            .expect("bounded PERF-0 accuracy route should run");
+        assert_eq!(archive.rows.len(), 3);
+        for row in &archive.rows {
+            assert_eq!(
+                row.observation_design_id,
+                C51_JUQ_PERFORMANCE_SENSOR_DESIGN_ID
+            );
+            assert_eq!(row.physical_qoi_output_count, 18);
+            assert_eq!(
+                row.physical_qoi_design_id,
+                C51PhysicalOutputDesign::RankStudySelectionAndHeldOut.as_str()
+            );
+            assert_eq!(
+                row.observation_fixed_radius,
+                C51Measurement::Measured(C51_FIXED_OBSERVATION_RADIUS)
+            );
+        }
+        let exact_gp = archive
+            .rows
+            .iter()
+            .find(|row| row.method == C51MethodId::ExactObservationSpaceGp)
+            .unwrap();
+        assert!(exact_gp_maximum_physical_error(exact_gp) <= 1.0e-8);
+        assert_eq!(
+            exact_gp.exact_gp_dense_factor_allocated_values,
+            C51Measurement::Measured(16)
+        );
+        let compact = archive
+            .rows
+            .iter()
+            .find(|row| row.method == C51MethodId::WhitneyCompact)
+            .unwrap();
+        let compact_error = measured_f64(&compact.physical_output_covariance_action_relative_error)
+            .max(measured_f64(&compact.physical_variance_relative_error))
+            .max(measured_f64(
+                &compact.physical_transformed_variance_relative_error,
+            ));
+        assert_eq!(
+            compact.matched_physical_qoi_eligible,
+            compact_error <= C51_CLAIM_PHYSICAL_COVARIANCE_RELATIVE_ERROR_LIMIT
+        );
+        let directory =
+            std::env::temp_dir().join(format!("c51-perf0-archive-{}", std::process::id()));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).unwrap();
+        }
+        archive.write_directory(&directory).unwrap();
+        crate::c51_spectral_covariance_rank::validate_c51_perf0_archive(&directory).unwrap();
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -4278,11 +5512,57 @@ mod tests {
     }
 
     #[test]
+    fn common_physical_query_excludes_latent_work_for_compact_and_exact_gp() {
+        for method in [
+            C51MethodId::WhitneyCompact,
+            C51MethodId::ExactObservationSpaceGp,
+        ] {
+            let selection = C51ResourceSelection {
+                refinement: 4,
+                observation_class: C51ObservationClass::LocalPhysicalB,
+                sensor_target: C51ResourceSensorTarget::Count(4),
+                repeated_data_count: 2,
+                method,
+                spectral_rank: None,
+                phase: C51ResourcePhase::QueryPhysicalUq,
+            };
+            let archive = run_c51_resource(
+                &C51ResourceConfig::juq_performance(selection),
+                C51RunMetadata::smoke("common-physical-query-test"),
+            )
+            .unwrap_or_else(|error| panic!("common physical query {method:?} failed: {error}"));
+            assert!(archive.row.common_physical_uq_workload_eligible);
+            assert!(!archive.row.full_uq_workload_eligible);
+            assert!(matches!(
+                archive.row.repeated_data_ns,
+                C51Measurement::Measured(_)
+            ));
+            assert!(matches!(
+                archive.row.physical_qoi_ns,
+                C51Measurement::Measured(_)
+            ));
+            assert!(matches!(
+                archive.row.variance_estimation_ns,
+                C51Measurement::Measured(_)
+            ));
+            assert!(matches!(
+                archive.row.covariance_action_ns,
+                C51Measurement::Unavailable { .. }
+            ));
+            assert!(matches!(
+                archive.row.sampling_ns,
+                C51Measurement::Unavailable { .. }
+            ));
+        }
+    }
+
+    #[test]
     fn every_method_has_a_single_row_cold_setup_resource_route() {
         for (method, spectral_rank) in [
             (C51MethodId::FullMetricDirect, None),
             (C51MethodId::FullMetricAugmented, None),
             (C51MethodId::WhitneyCompact, None),
+            (C51MethodId::ExactObservationSpaceGp, None),
             (C51MethodId::SpectralFullRank, None),
         ] {
             let selection = C51ResourceSelection {

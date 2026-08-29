@@ -1043,6 +1043,22 @@ pub struct PreparedSpectralPosteriorDiagnostics {
     pub noise_variance: f64,
 }
 
+/// Persistent dimensions and floating-point storage for a cached spectral
+/// output map.
+///
+/// `additional_persistent_f64_entries` counts only the cached `q x r` output
+/// feature matrix. `combined_persistent_f64_entries` also includes the
+/// borrowed [`PreparedSpectralPosterior`]; the posterior factor is never
+/// cloned into the output object.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PreparedSpectralOutputDiagnostics {
+    pub output_count: usize,
+    pub latent_dimension: usize,
+    pub output_feature_entries: usize,
+    pub additional_persistent_f64_entries: usize,
+    pub combined_persistent_f64_entries: usize,
+}
+
 /// A fixed-operator spectral posterior that reuses one adaptive dense factor.
 ///
 /// The object stores an `N x r` feature matrix, its `m x r` observation
@@ -1057,6 +1073,87 @@ pub struct PreparedSpectralPosterior {
     strategy: LowRankConditioningStrategy,
     factor: Llt<f64>,
     observation_operator_nonzeros: usize,
+}
+
+/// A sparse physical/output map projected once into a prepared spectral
+/// posterior's latent feature space.
+///
+/// The adapter owns only `G F`. It borrows the posterior, including its dense
+/// conditioning factor, so repeated observation values can be mapped directly
+/// to output means without rebuilding `G F`, materializing an ambient state
+/// mean, or cloning the factor.
+#[derive(Debug)]
+pub struct PreparedSpectralOutput<'a> {
+    posterior: &'a PreparedSpectralPosterior,
+    output_features: Mat<f64>,
+}
+
+impl PreparedSpectralOutput<'_> {
+    pub fn output_count(&self) -> usize {
+        self.output_features.nrows()
+    }
+
+    pub fn diagnostics(&self) -> PreparedSpectralOutputDiagnostics {
+        let output_feature_entries = self.output_features.nrows() * self.output_features.ncols();
+        PreparedSpectralOutputDiagnostics {
+            output_count: self.output_count(),
+            latent_dimension: self.posterior.latent_dimension(),
+            output_feature_entries,
+            additional_persistent_f64_entries: output_feature_entries,
+            combined_persistent_f64_entries: self.posterior.diagnostics().persistent_f64_entries
+                + output_feature_entries,
+        }
+    }
+
+    /// Posterior output mean for replacement observation values.
+    pub fn output_mean(&self, observation_values: &[f64]) -> Result<Vec<f64>, GpError> {
+        let latent_mean = self.posterior.latent_mean(observation_values)?;
+        Ok(dense_matrix_times_vector(
+            &self.output_features,
+            &latent_mean,
+        ))
+    }
+
+    /// Apply the posterior covariance in the cached output space.
+    pub fn covariance_action(&self, input: &[f64]) -> Result<Vec<f64>, GpError> {
+        if input.len() != self.output_count() {
+            return Err(GpError::OutputVectorDimensionMismatch {
+                expected: self.output_count(),
+                got: input.len(),
+            });
+        }
+        let latent_input = dense_transpose_times_vector(&self.output_features, input);
+        let latent_output = self.posterior.latent_covariance_action(&latent_input)?;
+        Ok(dense_matrix_times_vector(
+            &self.output_features,
+            &latent_output,
+        ))
+    }
+
+    /// Materialize the full posterior covariance only in the cached output
+    /// space.
+    pub fn covariance(&self) -> Result<Mat<f64>, GpError> {
+        self.posterior.feature_covariance(&self.output_features)
+    }
+
+    /// Posterior output mean and diagonal covariance for replacement data.
+    pub fn moments(&self, observation_values: &[f64]) -> Result<ConditionedGp, GpError> {
+        Ok(ConditionedGp {
+            mean: self.output_mean(observation_values)?,
+            variance: self.posterior.feature_variances(&self.output_features)?,
+        })
+    }
+
+    /// Posterior output mean and full covariance for replacement data.
+    pub fn moments_with_covariance(
+        &self,
+        observation_values: &[f64],
+    ) -> Result<ConditionedFullGp, GpError> {
+        Ok(ConditionedFullGp {
+            mean: self.output_mean(observation_values)?,
+            covariance: self.covariance()?,
+        })
+    }
 }
 
 impl PreparedSpectralPosterior {
@@ -1142,6 +1239,21 @@ impl PreparedSpectralPosterior {
         }
     }
 
+    /// Project a sparse physical/output map into the latent feature space once.
+    ///
+    /// The returned object borrows this posterior and therefore reuses its
+    /// conditioning factor without cloning it.
+    pub fn prepare_output<'a>(
+        &'a self,
+        output_matrix: &CsrMatrix,
+    ) -> Result<PreparedSpectralOutput<'a>, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
+        Ok(PreparedSpectralOutput {
+            posterior: self,
+            output_features,
+        })
+    }
+
     /// Posterior latent mean for replacement observation values.
     pub fn latent_mean(&self, observation_values: &[f64]) -> Result<Vec<f64>, GpError> {
         self.validate_observation_values(observation_values)?;
@@ -1220,11 +1332,8 @@ impl PreparedSpectralPosterior {
         output_matrix: &CsrMatrix,
         observation_values: &[f64],
     ) -> Result<ConditionedGp, GpError> {
-        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
-        let latent_mean = self.latent_mean(observation_values)?;
-        let mean = dense_matrix_times_vector(&output_features, &latent_mean);
-        let variance = self.feature_variances(&output_features)?;
-        Ok(ConditionedGp { mean, variance })
+        self.prepare_output(output_matrix)?
+            .moments(observation_values)
     }
 
     /// Posterior moments and full output covariance after a sparse output map.
@@ -1236,11 +1345,8 @@ impl PreparedSpectralPosterior {
         output_matrix: &CsrMatrix,
         observation_values: &[f64],
     ) -> Result<ConditionedFullGp, GpError> {
-        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
-        let latent_mean = self.latent_mean(observation_values)?;
-        let mean = dense_matrix_times_vector(&output_features, &latent_mean);
-        let covariance = self.feature_covariance(&output_features)?;
-        Ok(ConditionedFullGp { mean, covariance })
+        self.prepare_output(output_matrix)?
+            .moments_with_covariance(observation_values)
     }
 
     /// Apply the posterior covariance in a requested sparse output space.
@@ -1249,16 +1355,7 @@ impl PreparedSpectralPosterior {
         output_matrix: &CsrMatrix,
         input: &[f64],
     ) -> Result<Vec<f64>, GpError> {
-        let output_features = sparse_dense_product(output_matrix, &self.state_features)?;
-        if input.len() != output_features.nrows() {
-            return Err(GpError::OutputVectorDimensionMismatch {
-                expected: output_features.nrows(),
-                got: input.len(),
-            });
-        }
-        let latent_input = dense_transpose_times_vector(&output_features, input);
-        let latent_output = self.latent_covariance_action(&latent_input)?;
-        Ok(dense_matrix_times_vector(&output_features, &latent_output))
+        self.prepare_output(output_matrix)?.covariance_action(input)
     }
 
     /// Draw a latent posterior sample from independent standard normals.
@@ -4236,6 +4333,8 @@ mod tests {
         let output_moments = prepared
             .output_moments_with_covariance(&output, &values)
             .unwrap();
+        let cached_output = prepared.prepare_output(&output).unwrap();
+        let cached_output_moments = cached_output.moments_with_covariance(&values).unwrap();
         let expected_output_mean = sparse_vector_product(&output, &dense.mean);
         for (actual, expected) in output_moments.mean.iter().zip(expected_output_mean) {
             assert_close(*actual, expected, 4.0e-13);
@@ -4246,11 +4345,25 @@ mod tests {
             &expected_output_covariance,
             5.0e-13,
         );
+        for (actual, expected) in cached_output_moments.mean.iter().zip(&output_moments.mean) {
+            assert_close(*actual, *expected, 4.0e-13);
+        }
+        assert_matrix_close(
+            &cached_output_moments.covariance,
+            &output_moments.covariance,
+            5.0e-13,
+        );
         let diagonal_only = prepared.output_moments(&output, &values).unwrap();
+        let cached_diagonal_only = cached_output.moments(&values).unwrap();
         for index in 0..2 {
             assert_close(
                 diagonal_only.variance[index],
                 expected_output_covariance[(idx(index), idx(index))],
+                5.0e-13,
+            );
+            assert_close(
+                cached_diagonal_only.variance[index],
+                diagonal_only.variance[index],
                 5.0e-13,
             );
         }
@@ -4258,11 +4371,13 @@ mod tests {
         let output_action = prepared
             .output_covariance_action(&output, &output_input)
             .unwrap();
+        let cached_output_action = cached_output.covariance_action(&output_input).unwrap();
         for row in 0..2 {
             let expected = (0..2)
                 .map(|col| expected_output_covariance[(idx(row), idx(col))] * output_input[col])
                 .sum::<f64>();
             assert_close(output_action[row], expected, 5.0e-13);
+            assert_close(cached_output_action[row], expected, 5.0e-13);
         }
 
         let replacement_values = values
@@ -4278,7 +4393,16 @@ mod tests {
         )
         .unwrap();
         let replacement_mean = prepared.state_mean(&replacement_values).unwrap();
-        for (actual, expected) in replacement_mean.iter().zip(replacement_dense.mean) {
+        for (actual, expected) in replacement_mean.iter().zip(&replacement_dense.mean) {
+            assert_close(*actual, *expected, 4.0e-13);
+        }
+        let cached_replacement_mean = cached_output.output_mean(&replacement_values).unwrap();
+        let expected_replacement_output_mean =
+            sparse_vector_product(&output, &replacement_dense.mean);
+        for (actual, expected) in cached_replacement_mean
+            .iter()
+            .zip(expected_replacement_output_mean)
+        {
             assert_close(*actual, expected, 4.0e-13);
         }
 
@@ -4296,6 +4420,22 @@ mod tests {
                 + diagnostics.observation_feature_entries
                 + diagnostics.dense_factor_allocated_entries
         );
+        let output_diagnostics = cached_output.diagnostics();
+        assert_eq!(output_diagnostics.output_count, 2);
+        assert_eq!(output_diagnostics.latent_dimension, 3);
+        assert_eq!(output_diagnostics.output_feature_entries, 6);
+        assert_eq!(output_diagnostics.additional_persistent_f64_entries, 6);
+        assert_eq!(
+            output_diagnostics.combined_persistent_f64_entries,
+            diagnostics.persistent_f64_entries + 6
+        );
+        assert!(matches!(
+            cached_output.covariance_action(&[1.0]),
+            Err(GpError::OutputVectorDimensionMismatch {
+                expected: 2,
+                got: 1
+            })
+        ));
         let zero_standard_normal = vec![0.0; diagnostics.sampling_standard_normal_dimension];
         let zero_sample = prepared
             .state_sample_from_standard_normal(&values, &zero_standard_normal)
