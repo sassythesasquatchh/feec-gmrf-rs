@@ -769,6 +769,17 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
     return selection
 
 
+def validate_publication_peak_rss_mode(profile: str, cgroup_mode: str) -> None:
+    if profile == "juq-performance-v1" and cgroup_mode != "required":
+        raise ValueError(
+            "juq-performance-v1 requires --cgroup-mode required for process-tree RSS"
+        )
+    if profile == "juq-exact-performance-v1" and cgroup_mode == "off":
+        raise ValueError(
+            "juq-exact-performance-v1 requires automatic external peak-RSS measurement"
+        )
+
+
 def validate_juq_performance_selection(
     selection: Mapping[str, Any], profile: str = "juq-performance-v1"
 ) -> None:
@@ -1098,11 +1109,10 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
-    if args.profile in PUBLICATION_PROFILES and args.cgroup_mode != "required":
-        print(
-            f"{args.profile} requires --cgroup-mode required for process-tree RSS",
-            file=sys.stderr,
-        )
+    try:
+        validate_publication_peak_rss_mode(args.profile, args.cgroup_mode)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
         return 2
     if args.replicate < 0:
         print("replicate must be non-negative", file=sys.stderr)

@@ -123,6 +123,14 @@ class FreshProcessRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.thread_environment(0)
 
+    def test_exact_publication_profile_accepts_macos_external_time(self):
+        runner.validate_publication_peak_rss_mode("juq-exact-performance-v1", "auto")
+        runner.validate_publication_peak_rss_mode("juq-exact-performance-v1", "required")
+        with self.assertRaisesRegex(ValueError, "automatic external peak-RSS"):
+            runner.validate_publication_peak_rss_mode("juq-exact-performance-v1", "off")
+        with self.assertRaisesRegex(ValueError, "cgroup-mode required"):
+            runner.validate_publication_peak_rss_mode("juq-performance-v1", "auto")
+
     def test_low_rank_resource_build_requires_external_solver_feature(self):
         spectral = self.resource_selection(method="spectral_low_rank")
         spectral["spectral_rank"] = 2048

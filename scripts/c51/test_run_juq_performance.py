@@ -136,6 +136,14 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
             {cell.evidence_tier for cell in cells}, {"claim_primary_exact"}
         )
         command = campaign.cell_command(
+            cells[0],
+            pathlib.Path("/repo"),
+            pathlib.Path("/out"),
+            campaign.DEFAULT_RUNNER,
+            profile,
+        )
+        self.assertEqual(command[command.index("--cgroup-mode") + 1], "auto")
+        command = campaign.cell_command(
             next(cell for cell in cells if cell.method == "fm_aug"),
             pathlib.Path("/repo"),
             pathlib.Path("/out"),

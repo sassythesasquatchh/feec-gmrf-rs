@@ -120,6 +120,7 @@ EXPECTED_EXECUTION = {
     "require_clean_recursive_source": True,
     "fresh_process_per_method_phase_cell": True,
 }
+EXACT_EXPECTED_EXECUTION = EXPECTED_EXECUTION | {"cgroup_mode": "auto"}
 PAIR_QUERY_MEASUREMENTS = {
     "repeated_data_ns",
     "physical_qoi_ns",
@@ -227,7 +228,12 @@ def validate_profile(profile: Mapping[str, Any]) -> None:
         raise ValueError(f"{profile_name} axes differ from the immutable contract")
     if profile.get("evidence_tiers") != expected_tiers:
         raise ValueError(f"{profile_name} evidence tiers differ from the immutable contract")
-    if profile.get("execution") != EXPECTED_EXECUTION:
+    expected_execution = (
+        EXACT_EXPECTED_EXECUTION
+        if profile_name == EXACT_PROFILE_NAME
+        else EXPECTED_EXECUTION
+    )
+    if profile.get("execution") != expected_execution:
         raise ValueError(f"{profile_name} execution policy differs from the immutable contract")
     law = profile.get("scientific_law")
     expected_law = {

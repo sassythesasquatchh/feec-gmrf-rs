@@ -45,7 +45,7 @@
   "execution": {
     "deterministic_randomization_seed": 849348622,
     "threads": 1,
-    "cgroup_mode": "required",
+    "cgroup_mode": "auto",
     "continue_after_cell_failure": true,
     "require_clean_recursive_source": true,
     "fresh_process_per_method_phase_cell": true
@@ -55,6 +55,7 @@
     "minimum_time_improvement_fraction": 0.25,
     "required_cells": "both_refinements_and_both_replacement_data_counts_against_each_comparator",
     "memory_role": "reported_tradeoff_not_noninferiority_gate",
+    "peak_rss_measurement": "fresh-process cgroup-v2 when available, otherwise macOS /usr/bin/time -l; an unavailable measurement fails adjudication",
     "rationale": "Exploratory same-law runs selected a cold-time/throughput claim after the original compact 5 percent gate failed; peak memory remains a co-primary reported outcome and may narrow the conclusion, but does not redefine a large reproducible time advantage as failure."
   },
   "spectral_rank_contract": {
