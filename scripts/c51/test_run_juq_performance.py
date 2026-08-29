@@ -94,6 +94,58 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "missing 5 percent rank"):
             campaign.generate_cells(self.profile, decisions)
 
+    def test_exact_profile_freezes_same_law_methods_and_time_campaign(self):
+        profile_path = SCRIPT_DIR / "juq-exact-performance-v1.json"
+        profile = campaign.read_json(profile_path)
+        campaign.validate_profile(profile)
+        decisions = []
+        for refinement in (8, 10):
+            decision = self.decision(refinement, 4096)
+            decision.pop("whitney_compact")
+            decision["spectral_low_rank"]["qualification_rule"] = (
+                "pre_registered_2pct_sensitivity"
+            )
+            decision["spectral_low_rank"]["rank_selection_tolerance"] = 0.02
+            decision["exact_constrained"] = {
+                "validation_status": "perf0_same_law_validated",
+                "fixture_id": "PERF-0",
+                "fixture_artifact_sha256": "d" * 64,
+            }
+            decisions.append(decision)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "exact-decisions.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": campaign.RANK_DECISION_SCHEMA_VERSION,
+                        "profile": campaign.EXACT_PROFILE_NAME,
+                        "status": "frozen_heldout_validated",
+                        "decisions": decisions,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            indexed, _ = campaign.load_rank_decisions(path, profile)
+        cells = campaign.generate_cells(profile, indexed)
+        self.assertEqual(len(cells), 96)
+        self.assertEqual(
+            {cell.method for cell in cells},
+            {"fm_aug", "exact_observation_gp", "spectral_low_rank"},
+        )
+        self.assertEqual(
+            {cell.evidence_tier for cell in cells}, {"claim_primary_exact"}
+        )
+        command = campaign.cell_command(
+            next(cell for cell in cells if cell.method == "fm_aug"),
+            pathlib.Path("/repo"),
+            pathlib.Path("/out"),
+            campaign.DEFAULT_RUNNER,
+            profile,
+        )
+        self.assertEqual(
+            command[command.index("--profile") + 1], campaign.EXACT_PROFILE_NAME
+        )
+
     def test_selected_primary_tier_requires_only_its_two_rank_decisions(self):
         decisions = {
             campaign.rank_key(refinement, 2048, self.profile): self.decision(

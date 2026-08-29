@@ -63,6 +63,45 @@ class AnalyzeJuqPerformanceTests(unittest.TestCase):
         comparisons = analysis.compare(self.points(compact_time=70.0, compact_rss=120.0))
         self.assertFalse(any(item.practical_advantage for item in comparisons))
 
+    def test_exact_same_law_rule_reports_memory_tradeoff_but_adjudicates_time(self):
+        points = []
+        for refinement in analysis.REFINEMENTS:
+            for data_count in analysis.DATA_COUNTS:
+                for replicate in range(3):
+                    points.extend(
+                        [
+                            analysis.ResourcePoint(
+                                refinement, data_count, replicate, "fm_aug", 50.0, 200.0, 80.0
+                            ),
+                            analysis.ResourcePoint(
+                                refinement,
+                                data_count,
+                                replicate,
+                                "exact_observation_gp",
+                                100.0,
+                                100.0,
+                                100.0,
+                            ),
+                            analysis.ResourcePoint(
+                                refinement,
+                                data_count,
+                                replicate,
+                                "spectral_low_rank",
+                                100.0,
+                                100.0,
+                                100.0,
+                            ),
+                        ]
+                    )
+        comparisons = analysis.compare(
+            points,
+            baseline="fm_aug",
+            comparators=analysis.COMPARATORS,
+            memory_noninferiority_required=False,
+        )
+        self.assertTrue(all(item.practical_advantage for item in comparisons))
+        self.assertTrue(all(item.peak_rss_ratio_median == 2.0 for item in comparisons))
+
     def test_three_replicates_are_required_for_paired_interval(self):
         with self.assertRaisesRegex(analysis.AnalysisError, "at least three"):
             analysis.exact_paired_bootstrap_median_ci([0.5, 0.6])

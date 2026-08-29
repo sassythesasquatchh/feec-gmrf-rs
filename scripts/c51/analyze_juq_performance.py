@@ -112,6 +112,8 @@ def query_time(row: Mapping[str, str]) -> float:
 
 def persistent_values(row: Mapping[str, str]) -> float:
     method = row["method"]
+    if method == "fm_aug":
+        return measured(row, "kkt_input_nnz")
     if method == "whitney_compact":
         return measured(row, "posterior_precision_nnz") + measured(
             row, "factor_storage_nnz"
@@ -134,9 +136,12 @@ def validate_row(
     row: Mapping[str, str],
     decisions: Mapping[tuple[int, int, int, float, str], Mapping[str, Any]],
     profile: Mapping[str, Any],
+    evidence_tier: str,
+    methods: Sequence[str],
+    observation_count: int,
 ) -> ResourcePoint:
-    if row.get("campaign_evidence_tier") != "claim_primary":
-        raise AnalysisError("combined row is not in the claim_primary tier")
+    if row.get("campaign_evidence_tier") != evidence_tier:
+        raise AnalysisError(f"combined row is not in the {evidence_tier} tier")
     if row.get("available") != "true" or row.get(
         "common_physical_uq_workload_eligible"
     ) != "true":
@@ -153,9 +158,9 @@ def validate_row(
     except (KeyError, ValueError) as error:
         raise AnalysisError(f"combined row has invalid axes: {error}") from error
     method = row.get("method", "")
-    if refinement not in REFINEMENTS or count != OBSERVATION_COUNT:
+    if refinement not in REFINEMENTS or count != observation_count:
         raise AnalysisError("combined row is outside the frozen primary mesh/count axes")
-    if data_count not in DATA_COUNTS or method not in METHODS:
+    if data_count not in DATA_COUNTS or method not in methods:
         raise AnalysisError("combined row is outside the frozen primary data/method axes")
     key = campaign.rank_key(refinement, count, profile)
     decision = decisions.get(key)
@@ -210,14 +215,19 @@ def exact_paired_bootstrap_median_ci(values: Sequence[float]) -> tuple[float, fl
     return percentile(bootstrapped, 0.025), percentile(bootstrapped, 0.975)
 
 
-def compare(points: Sequence[ResourcePoint]) -> list[PairedComparison]:
+def compare(
+    points: Sequence[ResourcePoint],
+    baseline: str = "whitney_compact",
+    comparators: Sequence[str] = COMPARATORS,
+    memory_noninferiority_required: bool = True,
+) -> list[PairedComparison]:
     indexed = {
         (point.refinement, point.replacement_data_count, point.replicate, point.method): point
         for point in points
     }
     comparisons: list[PairedComparison] = []
     for refinement, data_count, comparator in itertools.product(
-        REFINEMENTS, DATA_COUNTS, COMPARATORS
+        REFINEMENTS, DATA_COUNTS, comparators
     ):
         replicates = sorted(
             {
@@ -236,24 +246,37 @@ def compare(points: Sequence[ResourcePoint]) -> list[PairedComparison]:
         storage_ratios: list[float] = []
         for replicate in replicates:
             try:
-                compact = indexed[(refinement, data_count, replicate, "whitney_compact")]
+                candidate = indexed[(refinement, data_count, replicate, baseline)]
                 other = indexed[(refinement, data_count, replicate, comparator)]
             except KeyError as error:
                 raise AnalysisError(f"missing paired method row: {error}") from error
-            time_ratios.append(compact.end_to_end_time_ns / other.end_to_end_time_ns)
-            rss_ratios.append(compact.gross_peak_rss_bytes / other.gross_peak_rss_bytes)
-            storage_ratios.append(compact.persistent_values / other.persistent_values)
+            time_ratios.append(candidate.end_to_end_time_ns / other.end_to_end_time_ns)
+            rss_ratios.append(candidate.gross_peak_rss_bytes / other.gross_peak_rss_bytes)
+            storage_ratios.append(candidate.persistent_values / other.persistent_values)
         time_low, time_high = exact_paired_bootstrap_median_ci(time_ratios)
         rss_low, rss_high = exact_paired_bootstrap_median_ci(rss_ratios)
-        time_win = (
-            time_high <= PRACTICAL_IMPROVEMENT_RATIO
-            and rss_high <= MAXIMUM_OTHER_RESOURCE_REGRESSION_RATIO
-        )
-        rss_win = (
-            rss_high <= PRACTICAL_IMPROVEMENT_RATIO
-            and time_high <= MAXIMUM_OTHER_RESOURCE_REGRESSION_RATIO
-        )
-        practical = time_win or rss_win
+        if memory_noninferiority_required:
+            time_win = (
+                time_high <= PRACTICAL_IMPROVEMENT_RATIO
+                and rss_high <= MAXIMUM_OTHER_RESOURCE_REGRESSION_RATIO
+            )
+            rss_win = (
+                rss_high <= PRACTICAL_IMPROVEMENT_RATIO
+                and time_high <= MAXIMUM_OTHER_RESOURCE_REGRESSION_RATIO
+            )
+            practical = time_win or rss_win
+            reason = (
+                "paired upper bounds establish >=25% time or RSS improvement and <=10% regression in the other"
+                if practical
+                else "frozen paired upper-bound practical-advantage rule not met"
+            )
+        else:
+            practical = time_high <= PRACTICAL_IMPROVEMENT_RATIO
+            reason = (
+                "paired time-ratio upper bound establishes >=25% end-to-end time improvement; RSS is a reported tradeoff"
+                if practical
+                else "frozen paired upper-bound time-advantage rule not met"
+            )
         comparisons.append(
             PairedComparison(
                 refinement,
@@ -268,11 +291,7 @@ def compare(points: Sequence[ResourcePoint]) -> list[PairedComparison]:
                 rss_high,
                 median(storage_ratios),
                 practical,
-                (
-                    "paired upper bounds establish >=25% time or RSS improvement and <=10% regression in the other"
-                    if practical
-                    else "frozen paired upper-bound practical-advantage rule not met"
-                ),
+                reason,
             )
         )
     return comparisons
@@ -284,14 +303,25 @@ def analyze(
     manifest = read_json(campaign_directory / "campaign-manifest.json")
     if manifest.get("schema_version") != campaign.SCHEMA_VERSION:
         raise AnalysisError("campaign manifest has the wrong schema")
-    if manifest.get("profile") != campaign.PROFILE_NAME:
+    profile_name = str(manifest.get("profile"))
+    if profile_name not in campaign.PROFILE_CONTRACTS:
         raise AnalysisError("campaign manifest has the wrong profile")
+    exact_campaign = profile_name == campaign.EXACT_PROFILE_NAME
+    evidence_tier = "claim_primary_exact" if exact_campaign else "claim_primary"
+    methods = (
+        ("fm_aug", "exact_observation_gp", "spectral_low_rank")
+        if exact_campaign
+        else METHODS
+    )
+    baseline = "fm_aug" if exact_campaign else "whitney_compact"
+    comparators = COMPARATORS
+    observation_count = 4096 if exact_campaign else OBSERVATION_COUNT
     if manifest.get("status") != "completed":
         raise AnalysisError(
             f"campaign is not complete without censors: {manifest.get('status')}"
         )
-    if manifest.get("selected_evidence_tiers") != ["claim_primary"]:
-        raise AnalysisError("C51 adjudication requires exactly the claim_primary tier")
+    if manifest.get("selected_evidence_tiers") != [evidence_tier]:
+        raise AnalysisError(f"C51 adjudication requires exactly the {evidence_tier} tier")
     start_identity = manifest.get("source_identity_start")
     end_identity = manifest.get("source_identity_end")
     if not isinstance(start_identity, dict) or start_identity != end_identity:
@@ -312,8 +342,8 @@ def analyze(
     plan = read_json(campaign_directory / "campaign-plan.json")
     if plan.get("schema_version") != campaign.SCHEMA_VERSION or plan.get("status") != "ready":
         raise AnalysisError("campaign plan is missing or was not ready")
-    if plan.get("selected_evidence_tiers") != ["claim_primary"]:
-        raise AnalysisError("campaign plan does not freeze exactly claim_primary")
+    if plan.get("selected_evidence_tiers") != [evidence_tier]:
+        raise AnalysisError(f"campaign plan does not freeze exactly {evidence_tier}")
     if plan.get("plan_sha256") != manifest.get("plan_sha256"):
         raise AnalysisError("campaign plan hash does not match the manifest")
     cells = plan.get("cells")
@@ -330,13 +360,20 @@ def analyze(
         "rank_decision_sha256"
     ):
         raise AnalysisError("rank-decision artifact does not match the frozen campaign")
-    profile_hash = campaign.sha256_file(campaign.DEFAULT_PROFILE)
+    profile_path = pathlib.Path(str(plan.get("profile_file", "")))
+    if not profile_path.is_absolute():
+        profile_path = campaign_directory / profile_path
+    if not profile_path.is_file():
+        raise AnalysisError("frozen performance profile is missing")
+    profile_hash = campaign.sha256_file(profile_path)
     if profile_hash != manifest.get("profile_sha256") or profile_hash != plan.get(
         "profile_sha256"
     ):
         raise AnalysisError("performance profile does not match the frozen campaign")
-    profile = campaign.read_json(campaign.DEFAULT_PROFILE)
+    profile = campaign.read_json(profile_path)
     campaign.validate_profile(profile)
+    if profile.get("profile") != profile_name:
+        raise AnalysisError("campaign profile file does not match the manifest profile")
     decisions, decision_payload = campaign.load_rank_decisions(rank_decisions, profile)
     combined_path = campaign_directory / "combined-rows.csv"
     combined_record = manifest.get("combined_rows")
@@ -367,7 +404,17 @@ def analyze(
                 raise AnalysisError(f"invalid {prefix} source provenance: {error}") from error
             if identity != start_identity:
                 raise AnalysisError(f"{prefix} runner source differs from the campaign freeze")
-    points = [validate_row(row, decisions, profile) for row in rows]
+    points = [
+        validate_row(
+            row,
+            decisions,
+            profile,
+            evidence_tier,
+            methods,
+            observation_count,
+        )
+        for row in rows
+    ]
     if len(points) != 36:
         raise AnalysisError(f"primary campaign requires 36 measured combined rows, found {len(points)}")
     if len(
@@ -377,7 +424,12 @@ def analyze(
         }
     ) != len(points):
         raise AnalysisError("primary campaign contains duplicate measured method cells")
-    comparisons = compare(points)
+    comparisons = compare(
+        points,
+        baseline,
+        comparators,
+        memory_noninferiority_required=not exact_campaign,
+    )
     passed = all(comparison.practical_advantage for comparison in comparisons)
     return {
         "schema_version": SCHEMA_VERSION,
@@ -387,9 +439,15 @@ def analyze(
             "accuracy_tolerance": 0.05,
             "required_refinements": list(REFINEMENTS),
             "required_replacement_data_counts": list(DATA_COUNTS),
-            "comparators": list(COMPARATORS),
+            "candidate": baseline,
+            "comparators": list(comparators),
             "practical_improvement_ratio": PRACTICAL_IMPROVEMENT_RATIO,
-            "maximum_other_resource_regression_ratio": MAXIMUM_OTHER_RESOURCE_REGRESSION_RATIO,
+            "maximum_other_resource_regression_ratio": (
+                MAXIMUM_OTHER_RESOURCE_REGRESSION_RATIO if not exact_campaign else None
+            ),
+            "memory_role": (
+                "noninferiority gate" if not exact_campaign else "reported tradeoff"
+            ),
             "paired_interval": "exact finite paired bootstrap median 95% interval",
         },
         "campaign_manifest": str(campaign_directory / "campaign-manifest.json"),

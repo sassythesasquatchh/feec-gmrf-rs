@@ -31,13 +31,14 @@ import fresh_process_runner as fresh
 SCHEMA_VERSION = "c51-juq-performance-campaign-v1"
 PROFILE_SCHEMA_VERSION = "c51-juq-performance-profile-v1"
 RANK_DECISION_SCHEMA_VERSION = "c51-performance-rank-decisions-v2"
-PROFILE_NAME = "juq-performance-v1"
+COMPACT_PROFILE_NAME = "juq-performance-v1"
+EXACT_PROFILE_NAME = "juq-exact-performance-v1"
 DEFAULT_PROFILE = pathlib.Path(__file__).with_name("juq-performance-v1.json")
 DEFAULT_RANK_DECISIONS = pathlib.Path(__file__).with_name(
     "juq-performance-v1-rank-decisions.template.json"
 )
 DEFAULT_RUNNER = pathlib.Path(__file__).with_name("fresh_process_runner.py")
-EXPECTED_AXES = {
+COMPACT_EXPECTED_AXES = {
     "refinements": [8, 10],
     "scalar_observation_counts": [512, 2048, 4096, 5184],
     "replacement_data_counts": [1, 100],
@@ -45,7 +46,7 @@ EXPECTED_AXES = {
     "workload_phases": ["cold_setup", "query_physical_uq"],
     "observation_class": "fixed_footprint_magnetic_volume",
 }
-EXPECTED_EVIDENCE_TIERS = [
+COMPACT_EXPECTED_EVIDENCE_TIERS = [
     {
         "id": "claim_primary",
         "role": "claim_bearing_5pct_matched_accuracy",
@@ -83,6 +84,34 @@ EXPECTED_EVIDENCE_TIERS = [
         "measured_replicates": 1,
     },
 ]
+EXACT_EXPECTED_AXES = {
+    "refinements": [8, 10],
+    "scalar_observation_counts": [4096],
+    "replacement_data_counts": [1, 100],
+    "methods": ["fm_aug", "exact_observation_gp", "spectral_low_rank"],
+    "workload_phases": ["cold_setup", "query_physical_uq"],
+    "observation_class": "fixed_footprint_magnetic_volume",
+}
+EXACT_EXPECTED_EVIDENCE_TIERS = [
+    {
+        "id": "claim_primary_exact",
+        "role": "claim_bearing_same_law_time_throughput",
+        "refinements": [8, 10],
+        "scalar_observation_counts": [4096],
+        "replacement_data_counts": [1, 100],
+        "warmup_replicates": 1,
+        "measured_replicates": 3,
+    }
+]
+PROFILE_CONTRACTS = {
+    COMPACT_PROFILE_NAME: (COMPACT_EXPECTED_AXES, COMPACT_EXPECTED_EVIDENCE_TIERS),
+    EXACT_PROFILE_NAME: (EXACT_EXPECTED_AXES, EXACT_EXPECTED_EVIDENCE_TIERS),
+}
+# Backward-compatible names used by the compact-v1 tests and downstream
+# validation code. New code resolves its contract from the profile payload.
+PROFILE_NAME = COMPACT_PROFILE_NAME
+EXPECTED_AXES = COMPACT_EXPECTED_AXES
+EXPECTED_EVIDENCE_TIERS = COMPACT_EXPECTED_EVIDENCE_TIERS
 EXPECTED_EXECUTION = {
     "deterministic_randomization_seed": 849348622,
     "threads": 1,
@@ -190,14 +219,16 @@ def atomic_write_json(path: pathlib.Path, value: Mapping[str, Any]) -> None:
 def validate_profile(profile: Mapping[str, Any]) -> None:
     if profile.get("schema_version") != PROFILE_SCHEMA_VERSION:
         raise ValueError(f"profile schema must be {PROFILE_SCHEMA_VERSION}")
-    if profile.get("profile") != PROFILE_NAME:
-        raise ValueError(f"profile name must be {PROFILE_NAME}")
-    if profile.get("axes") != EXPECTED_AXES:
-        raise ValueError("juq-performance-v1 axes differ from the immutable v1 contract")
-    if profile.get("evidence_tiers") != EXPECTED_EVIDENCE_TIERS:
-        raise ValueError("juq-performance-v1 evidence tiers differ from the immutable v1 contract")
+    profile_name = str(profile.get("profile"))
+    if profile_name not in PROFILE_CONTRACTS:
+        raise ValueError(f"unsupported immutable C51 profile {profile_name!r}")
+    expected_axes, expected_tiers = PROFILE_CONTRACTS[profile_name]
+    if profile.get("axes") != expected_axes:
+        raise ValueError(f"{profile_name} axes differ from the immutable contract")
+    if profile.get("evidence_tiers") != expected_tiers:
+        raise ValueError(f"{profile_name} evidence tiers differ from the immutable contract")
     if profile.get("execution") != EXPECTED_EXECUTION:
-        raise ValueError("juq-performance-v1 execution policy differs from the immutable v1 contract")
+        raise ValueError(f"{profile_name} execution policy differs from the immutable contract")
     law = profile.get("scientific_law")
     expected_law = {
         "geometry": "unit_cube",
@@ -221,7 +252,7 @@ def validate_profile(profile: Mapping[str, Any]) -> None:
         },
     }
     if law != expected_law:
-        raise ValueError("juq-performance-v1 scientific law differs from the immutable v1 contract")
+        raise ValueError(f"{profile_name} scientific law differs from the immutable contract")
 
 
 def rank_key(
@@ -252,10 +283,11 @@ def load_rank_decisions(
     path: pathlib.Path, profile: Mapping[str, Any]
 ) -> tuple[dict[tuple[int, int, int, float, str], dict[str, Any]], dict[str, Any]]:
     payload = read_json(path)
+    profile_name = str(profile["profile"])
     if payload.get("schema_version") != RANK_DECISION_SCHEMA_VERSION:
         raise ValueError(f"rank decision schema must be {RANK_DECISION_SCHEMA_VERSION}")
-    if payload.get("profile") != PROFILE_NAME:
-        raise ValueError(f"rank decisions must target {PROFILE_NAME}")
+    if payload.get("profile") != profile_name:
+        raise ValueError(f"rank decisions must target {profile_name}")
     decisions = payload.get("decisions")
     if not isinstance(decisions, list):
         raise ValueError("rank decision file must contain a decisions list")
@@ -272,7 +304,6 @@ def load_rank_decisions(
                 str(decision["observation_design_id"]),
             )
             spectral = decision["spectral_low_rank"]
-            compact = decision["whitney_compact"]
             exact_gp = decision["exact_observation_gp"]
             rank = int(spectral["rank"])
         except (KeyError, TypeError, ValueError) as error:
@@ -283,7 +314,8 @@ def load_rank_decisions(
             raise ValueError(
                 f"rank decision {index} is not a primary 5 percent frozen-law decision"
             )
-        if key[0] not in EXPECTED_AXES["refinements"] or key[1] not in EXPECTED_AXES[
+        axes = profile["axes"]
+        if key[0] not in axes["refinements"] or key[1] not in axes[
             "scalar_observation_counts"
         ]:
             raise ValueError(f"rank decision {index} is outside the frozen axes")
@@ -308,50 +340,99 @@ def load_rank_decisions(
             spectral_selection_error = float(spectral["selection_relative_error"])
             lower_failing_error = float(spectral["lower_failing_selection_relative_error"])
             lower_failing_rank = int(spectral["lower_failing_rank"])
-            compact_error = float(compact["heldout_relative_error"])
-            compact_selection_error = float(compact["selection_relative_error"])
             state_dimension = int(decision["state_dimension"])
+            rank_selection_tolerance = float(
+                spectral.get("rank_selection_tolerance", key[3])
+            )
         except (KeyError, TypeError, ValueError) as error:
             raise ValueError(f"rank decision {index} has invalid qualification metrics") from error
-        if not 0.0 <= spectral_error <= key[3] or not 0.0 <= spectral_selection_error <= key[3]:
-            raise ValueError(f"rank decision {index} spectral error exceeds 5 percent")
-        if lower_failing_rank >= rank or lower_failing_error <= key[3]:
+        if profile_name == EXACT_PROFILE_NAME:
+            if spectral.get("qualification_rule") != "pre_registered_2pct_sensitivity":
+                raise ValueError(
+                    f"rank decision {index} exact campaign requires the preregistered 2 percent sensitivity rule"
+                )
+            if rank_selection_tolerance != 0.02:
+                raise ValueError(
+                    f"rank decision {index} exact campaign rank tolerance must be 2 percent"
+                )
+        elif rank_selection_tolerance != key[3]:
+            raise ValueError(f"rank decision {index} changes the compact-v1 rank tolerance")
+        if (
+            not 0.0 <= spectral_error <= rank_selection_tolerance
+            or not 0.0 <= spectral_selection_error <= rank_selection_tolerance
+        ):
+            raise ValueError(
+                f"rank decision {index} spectral error exceeds its rank-selection tolerance"
+            )
+        if lower_failing_rank >= rank or lower_failing_error <= rank_selection_tolerance:
             raise ValueError(f"rank decision {index} lacks a lower failing selection bracket")
         expected_rank_status = "full_rank_required" if rank == state_dimension else "low_rank"
         if rank > state_dimension or spectral.get("rank_status") != expected_rank_status:
             raise ValueError(f"rank decision {index} has inconsistent rank endpoint semantics")
         if spectral.get("shared_maximum_basis_timing_eligible") is not False:
             raise ValueError(f"rank decision {index} does not forbid shared-basis timing")
-        if compact.get("validation_status") != "heldout_validated":
-            raise ValueError(f"rank decision {index} compact model is not held-out validated")
-        if not 0.0 <= compact_error <= key[3] or not 0.0 <= compact_selection_error <= key[3]:
-            raise ValueError(f"rank decision {index} compact error exceeds 5 percent")
         spectral_hash = require_sha256(
             spectral.get("accuracy_artifact_sha256", ""),
             f"rank decision {index} spectral accuracy artifact",
-        )
-        compact_hash = require_sha256(
-            compact.get("accuracy_artifact_sha256", ""),
-            f"rank decision {index} compact accuracy artifact",
         )
         common_hash = require_sha256(
             decision.get("common_h_g_fixture_sha256", ""),
             f"rank decision {index} common H/G fixture",
         )
-        if spectral_hash != compact_hash or spectral_hash != common_hash:
-            raise ValueError(f"rank decision {index} does not bind both methods to one accuracy archive")
-        if compact.get("identical_observation_and_output_maps") is not True:
-            raise ValueError(f"rank decision {index} compact method lacks identical H/G maps")
-        if compact.get("method_performance_timing_eligible") is not False:
-            raise ValueError(f"rank decision {index} compact accuracy row is timing eligible")
+        if spectral_hash != common_hash:
+            raise ValueError(f"rank decision {index} does not bind spectral accuracy to common H/G")
+        if profile_name == COMPACT_PROFILE_NAME:
+            try:
+                compact = decision["whitney_compact"]
+                compact_error = float(compact["heldout_relative_error"])
+                compact_selection_error = float(compact["selection_relative_error"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(
+                    f"rank decision {index} lacks compact qualifications: {error}"
+                ) from error
+            if compact.get("validation_status") != "heldout_validated":
+                raise ValueError(f"rank decision {index} compact model is not held-out validated")
+            if not 0.0 <= compact_error <= key[3] or not 0.0 <= compact_selection_error <= key[3]:
+                raise ValueError(f"rank decision {index} compact error exceeds 5 percent")
+            compact_hash = require_sha256(
+                compact.get("accuracy_artifact_sha256", ""),
+                f"rank decision {index} compact accuracy artifact",
+            )
+            if compact_hash != common_hash:
+                raise ValueError(f"rank decision {index} does not bind compact and spectral accuracy")
+            if compact.get("identical_observation_and_output_maps") is not True:
+                raise ValueError(f"rank decision {index} compact method lacks identical H/G maps")
+            if compact.get("method_performance_timing_eligible") is not False:
+                raise ValueError(f"rank decision {index} compact accuracy row is timing eligible")
+        else:
+            try:
+                exact_constrained = decision["exact_constrained"]
+            except (KeyError, TypeError) as error:
+                raise ValueError(
+                    f"rank decision {index} lacks exact constrained qualification: {error}"
+                ) from error
+            if exact_constrained.get("validation_status") != "perf0_same_law_validated":
+                raise ValueError(
+                    f"rank decision {index} exact constrained model lacks PERF-0 qualification"
+                )
+            if exact_constrained.get("fixture_id") != "PERF-0":
+                raise ValueError(f"rank decision {index} exact constrained fixture is not PERF-0")
+            exact_constrained_hash = require_sha256(
+                exact_constrained.get("fixture_artifact_sha256", ""),
+                f"rank decision {index} exact constrained PERF-0 artifact",
+            )
         if exact_gp.get("validation_status") != "perf0_same_law_validated":
             raise ValueError(f"rank decision {index} exact GP lacks PERF-0 qualification")
         if exact_gp.get("fixture_id") != "PERF-0":
             raise ValueError(f"rank decision {index} exact GP fixture is not PERF-0")
-        require_sha256(
+        exact_gp_hash = require_sha256(
             exact_gp.get("fixture_artifact_sha256", ""),
             f"rank decision {index} PERF-0 fixture artifact",
         )
+        if profile_name == EXACT_PROFILE_NAME and exact_constrained_hash != exact_gp_hash:
+            raise ValueError(
+                f"rank decision {index} exact methods do not share one PERF-0 artifact"
+            )
         if key in indexed:
             raise ValueError(f"duplicate rank decision key {key}")
         normalized = dict(decision)
@@ -513,7 +594,7 @@ def cell_command(
         "--repository",
         str(repository),
         "--profile",
-        PROFILE_NAME,
+        str(profile["profile"]),
         "--replicate",
         str(cell.replicate),
         "--output",
@@ -565,7 +646,7 @@ def plan_document(
     return {
         "schema_version": SCHEMA_VERSION,
         "mode": "plan",
-        "profile": PROFILE_NAME,
+        "profile": str(profile["profile"]),
         "profile_file": str(profile_path),
         "profile_sha256": sha256_file(profile_path),
         "rank_decision_file": str(rank_path),
@@ -940,7 +1021,7 @@ def execute(
     atomic_write_json(output / "campaign-plan.json", plan)
     campaign: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
-        "profile": PROFILE_NAME,
+        "profile": str(profile["profile"]),
         "status": "running",
         "plan_sha256": plan["plan_sha256"],
         "profile_sha256": plan["profile_sha256"],
@@ -1021,7 +1102,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--evidence-tier",
         action="append",
-        choices=[str(tier["id"]) for tier in EXPECTED_EVIDENCE_TIERS],
+        choices=sorted(
+            {
+                str(tier["id"])
+                for _, tiers in PROFILE_CONTRACTS.values()
+                for tier in tiers
+            }
+        ),
         help=(
             "run one immutable evidence tier; repeat to select several. "
             "The default selects every frozen tier"
@@ -1081,7 +1168,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             args.evidence_tier,
         )
     except (OSError, ValueError) as error:
-        print(f"juq-performance-v1 orchestration failed: {error}", file=sys.stderr)
+        print(f"C51 JUQ performance orchestration failed: {error}", file=sys.stderr)
         return 2
 
 
