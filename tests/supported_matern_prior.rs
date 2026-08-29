@@ -292,6 +292,78 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
 }
 
 #[test]
+fn supported_weighted_physical_trace_matches_dense_reference_and_hutchinson() {
+    let supported = SupportedMaternPriorBuilder::from_operators(two_by_two_exact_operators())
+        .parameters(MaternParameters::new(MaternAlpha::Two, 1.3, 0.7).unwrap())
+        .build()
+        .unwrap();
+    let outputs =
+        LinearMap::weighted_rows(2, &[vec![(0, 1.25), (1, -0.75)], vec![(0, -0.4), (1, 0.9)]])
+            .unwrap();
+    let weights = [0.25, 0.75];
+    let covariance = supported.pushforward_covariance(&outputs).unwrap();
+    let expected = weights
+        .iter()
+        .enumerate()
+        .map(|(index, weight)| weight * covariance[index][index])
+        .sum::<f64>();
+
+    let exact = supported
+        .pushforward_weighted_variance_estimate(&outputs, &weights, VarianceMethod::Exact)
+        .unwrap();
+    assert_scalar_close(
+        exact.weighted_trace,
+        expected,
+        "exact weighted physical trace",
+    );
+
+    let hutchinson = supported
+        .pushforward_weighted_variance_estimate(
+            &outputs,
+            &weights,
+            VarianceMethod::Hutchinson(HutchinsonVarianceConfig::new(4_096, 16, 74).unwrap()),
+        )
+        .unwrap();
+    assert!(hutchinson.weighted_trace_relative_standard_error.is_some());
+    assert!(
+        (hutchinson.weighted_trace - expected).abs() <= 0.05 * expected,
+        "Hutchinson weighted trace {} differs from dense reference {}",
+        hutchinson.weighted_trace,
+        expected
+    );
+
+    let state_weight =
+        SparseMat::from_rows(2, &[vec![(0, 2.0), (1, 0.25)], vec![(0, 0.25), (1, 3.0)]]).unwrap();
+    let state_covariance = supported
+        .pushforward_covariance(&LinearMap::identity(2))
+        .unwrap();
+    let state_expected = state_weight
+        .triplet_iter()
+        .map(|(row, column, value)| value * state_covariance[column][row])
+        .sum::<f64>();
+    let state_exact = supported
+        .weighted_covariance_trace(&state_weight, VarianceMethod::Exact)
+        .unwrap();
+    assert_scalar_close(
+        state_exact.value,
+        state_expected,
+        "exact supported sparse weighted trace",
+    );
+    let state_hutchinson = supported
+        .weighted_covariance_trace(
+            &state_weight,
+            VarianceMethod::Hutchinson(HutchinsonVarianceConfig::new(16_384, 16, 91).unwrap()),
+        )
+        .unwrap();
+    assert!(
+        (state_hutchinson.value - state_expected).abs() <= 0.05 * state_expected,
+        "Hutchinson supported weighted trace {} differs from dense reference {}",
+        state_hutchinson.value,
+        state_expected
+    );
+}
+
+#[test]
 fn supported_feec_prior_preserves_full_relative_boundary_layout() {
     let mesh = CartesianMeshInfo::new_unit(2, 2);
     let (topology, coordinates) = mesh.compute_coord_complex();

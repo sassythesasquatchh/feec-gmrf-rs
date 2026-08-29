@@ -50,6 +50,10 @@ required-features = ["experimental"]
 name = "c51_spectral_covariance_rank"
 required-features = ["experimental", "external-solvers"]
 
+[[example]]
+name = "c51_thesis_normalized_compact"
+required-features = ["experimental"]
+
 [[test]]
 name = "heavy_planar_holes"
 path = "tests/heavy_planar_holes.rs"

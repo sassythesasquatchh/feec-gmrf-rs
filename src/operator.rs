@@ -177,6 +177,26 @@ pub fn sparse_mat_from_feec_csr(matrix: &FeecCsr) -> SparseMat {
     )
 }
 
+/// Pull an output-space quadratic form back through a linear map.
+///
+/// For `y = G x` and output metric `M`, this returns `G^T M G`, so
+/// `x^T (G^T M G) x = y^T M y`. This is the canonical construction for
+/// FEEC mass-norm calibration and other engineering energy quantities.
+pub fn pullback_quadratic_form(map: &LinearMap, output_metric: &SparseMat) -> Result<SparseMat> {
+    if output_metric.nrows() != output_metric.ncols()
+        || output_metric.nrows() != map.output_dimension()
+    {
+        return Err(FeecGmrfError::Dimension(format!(
+            "quadratic output metric shape {}x{} does not match map output dimension {}",
+            output_metric.nrows(),
+            output_metric.ncols(),
+            map.output_dimension()
+        )));
+    }
+    let weighted = multiply_sparse(output_metric, map.matrix())?;
+    multiply_sparse(&map.matrix().transpose(), &weighted)
+}
+
 /// A validated differential-form degree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct FormDegree(usize);
@@ -1056,6 +1076,30 @@ mod tests {
             stacked.apply(&[1.0, 3.0]).unwrap(),
             vec![2.0, 6.0, 2.0, 6.0]
         );
+    }
+
+    #[test]
+    fn quadratic_pullback_matches_direct_output_energy() {
+        let map =
+            LinearMap::weighted_rows(2, &[vec![(0, 1.0), (1, 2.0)], vec![(0, -1.0), (1, 0.5)]])
+                .unwrap();
+        let metric =
+            SparseMat::from_rows(2, &[vec![(0, 3.0), (1, 0.25)], vec![(0, 0.25), (1, 2.0)]])
+                .unwrap();
+        let pullback = pullback_quadratic_form(&map, &metric).unwrap();
+        let state = [0.3, -0.8];
+        let output = map.apply(&state).unwrap();
+        let direct = output
+            .iter()
+            .zip(metric.apply_checked(&output).unwrap())
+            .map(|(left, right)| left * right)
+            .sum::<f64>();
+        let pulled = state
+            .iter()
+            .zip(pullback.apply_checked(&state).unwrap())
+            .map(|(left, right)| left * right)
+            .sum::<f64>();
+        assert!((direct - pulled).abs() < 1.0e-12);
     }
 
     #[test]

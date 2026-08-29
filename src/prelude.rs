@@ -37,9 +37,9 @@ pub use crate::model::{
     LinearObservation, LinearObservationRow,
 };
 pub use crate::operator::{
-    sparse_mat_from_feec_csr, BoundaryLayout, ExactBoundaryDomain, ExactFormOperators, FormDegree,
-    FormOperatorProvenance, FormOperators, FormSpaceMetric, IncomingFormOperator, LinearMap,
-    OutgoingFormOperator, SparseMat,
+    pullback_quadratic_form, sparse_mat_from_feec_csr, BoundaryLayout, ExactBoundaryDomain,
+    ExactFormOperators, FormDegree, FormOperatorProvenance, FormOperators, FormSpaceMetric,
+    IncomingFormOperator, LinearMap, OutgoingFormOperator, SparseMat,
 };
 pub use crate::physical::{
     calibrate_prior_to_physical_rms, calibrate_prior_to_physical_rms_with_method,

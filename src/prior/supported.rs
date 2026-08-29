@@ -8,6 +8,10 @@ use super::{
     MassInverseKind, MaternParameters, MaternPriorMetadata, MaternRepresentation,
 };
 use crate::boundary::{EliminatedLinearMap, EssentialBoundaryElimination};
+use crate::infer::{
+    exact_estimate, public_estimate, public_weighted_trace, VarianceMethod,
+    WeightedCovarianceTraceEstimate, WeightedVarianceEstimate,
+};
 use crate::model::{GaussianNoise, LinearConstraint, LinearObservation};
 use crate::operator::{BoundaryLayout, ExactFormOperators, FormDegree, LinearMap, SparseMat};
 use crate::{FeecGmrfError, Result};
@@ -16,7 +20,7 @@ use gmrf_core::{
     ht_precision_weighted_observations, ht_weighted_observations, linear_observation_update,
     LinearObservationTerm, SelectedCoordinates, SparseCholeskyDiagnostics, SparseMatrix,
     SparseRowOperator, SupportedGaussianCertificateResiduals, SupportedGaussianFactor,
-    SupportedGaussianSystem, Vector,
+    SupportedGaussianSystem, TransformedVarianceMode, Vector,
 };
 use manifold::{geometry::metric::mesh::MeshLengths, topology::complex::Complex};
 use std::ops::Range;
@@ -239,6 +243,31 @@ impl SupportedMaternPrior {
     /// should retain the factored posterior instead.
     pub fn pushforward_covariance(&self, map: &LinearMap) -> Result<Vec<Vec<f64>>> {
         self.factor()?.pushforward_covariance(map)
+    }
+
+    /// Estimate mapped variances and their weighted covariance trace.
+    ///
+    /// This is the support-aware counterpart of
+    /// [`crate::prior::GaussianPrior::pushforward_weighted_variance_estimate`].
+    /// It uses the constrained covariance action directly and never
+    /// materializes an ambient covariance matrix.
+    pub fn pushforward_weighted_variance_estimate(
+        &self,
+        map: &LinearMap,
+        output_weights: &[f64],
+        method: VarianceMethod,
+    ) -> Result<WeightedVarianceEstimate> {
+        self.factor()?
+            .pushforward_weighted_variance_estimate(map, output_weights, method)
+    }
+
+    /// Estimate `trace(W Cov(x))` for a sparse active-state weight matrix.
+    pub fn weighted_covariance_trace(
+        &self,
+        weight: &SparseMat,
+        method: VarianceMethod,
+    ) -> Result<WeightedCovarianceTraceEstimate> {
+        self.factor()?.weighted_covariance_trace(weight, method)
     }
 
     /// Audited exact covariance of a small active- or full-cochain prior output.
@@ -583,6 +612,141 @@ impl SupportedMaternPosterior {
         Ok(variances.iter().copied().collect())
     }
 
+    /// Estimate mapped variances and their weighted covariance trace through
+    /// the certified supported covariance action.
+    pub fn pushforward_weighted_variance_estimate(
+        &self,
+        map: &LinearMap,
+        output_weights: &[f64],
+        method: VarianceMethod,
+    ) -> Result<WeightedVarianceEstimate> {
+        if output_weights.len() != map.output_dimension() {
+            return Err(FeecGmrfError::Dimension(format!(
+                "physical RMS weight count {} does not match output dimension {}",
+                output_weights.len(),
+                map.output_dimension()
+            )));
+        }
+        if output_weights
+            .iter()
+            .any(|weight| !weight.is_finite() || *weight < 0.0)
+            || output_weights.iter().sum::<f64>() <= 0.0
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "physical RMS weights must be finite, non-negative, and have positive sum"
+                    .to_string(),
+            ));
+        }
+        let eliminated = resolve_state_map(
+            &self.state_layout,
+            self.mean.len(),
+            map,
+            &vec![0.0; map.output_dimension()],
+        )?;
+        let ambient_map = embed_state_map(eliminated.reduced(), self.factor.ambient_dim())?;
+        let operator = SparseRowOperator::from_sparse_matrix(
+            &feg_infer::sparse::core_triplet_to_gmrf(&ambient_map),
+        )?;
+        let weights = Vector::from_vec(output_weights.to_vec());
+        let mode = method.transformed_mode().ok_or_else(|| {
+            FeecGmrfError::Unsupported(
+                "supported weighted physical traces require exact or Hutchinson estimation"
+                    .to_string(),
+            )
+        })?;
+        let estimate = match mode {
+            TransformedVarianceMode::Exact => {
+                return exact_supported_weighted_variance(&self.factor, &operator, output_weights)
+            }
+            TransformedVarianceMode::Auto { exact_max_dofs, .. }
+                if self.mean.len() <= exact_max_dofs =>
+            {
+                return exact_supported_weighted_variance(&self.factor, &operator, output_weights);
+            }
+            TransformedVarianceMode::Hutchinson {
+                config,
+                floor,
+                distribution,
+            }
+            | TransformedVarianceMode::Auto {
+                config,
+                floor,
+                distribution,
+                ..
+            } => gmrf_core::estimate_hutchinson_transformed_variance_weighted_trace_with_solve(
+                &operator,
+                &weights,
+                config,
+                floor,
+                distribution,
+                |rhs| self.factor.covariance_action(rhs),
+            )?,
+        };
+        Ok(WeightedVarianceEstimate {
+            variances: public_estimate(estimate.variances),
+            weighted_trace: estimate.weighted_trace.value,
+            weighted_trace_standard_error: estimate.weighted_trace.batch_standard_error,
+            weighted_trace_relative_standard_error: estimate.weighted_trace.relative_standard_error,
+        })
+    }
+
+    /// Estimate `trace(W Cov(x))` on the selected FEEC state without
+    /// materializing the supported ambient covariance.
+    pub fn weighted_covariance_trace(
+        &self,
+        weight: &SparseMat,
+        method: VarianceMethod,
+    ) -> Result<WeightedCovarianceTraceEstimate> {
+        if weight.nrows() != self.mean.len() || weight.ncols() != self.mean.len() {
+            return Err(FeecGmrfError::Dimension(format!(
+                "supported weighted trace shape {}x{} does not match state dimension {}",
+                weight.nrows(),
+                weight.ncols(),
+                self.mean.len()
+            )));
+        }
+        let weight = feg_infer::sparse::core_triplet_to_gmrf(weight);
+        let estimate = match method {
+            VarianceMethod::Exact => {
+                gmrf_core::exact_weighted_covariance_trace_with_solve(&weight, |rhs| {
+                    self.factor.selected_covariance_action(&self.selection, rhs)
+                })?
+            }
+            VarianceMethod::Hutchinson(config) => {
+                gmrf_core::estimate_hutchinson_weighted_covariance_trace_with_solve(
+                    &weight,
+                    config.probe_config(),
+                    config.distribution,
+                    |rhs| self.factor.selected_covariance_action(&self.selection, rhs),
+                )?
+            }
+            VarianceMethod::Auto {
+                exact_max_dofs,
+                hutchinson,
+            } => {
+                if self.mean.len() <= exact_max_dofs {
+                    gmrf_core::exact_weighted_covariance_trace_with_solve(&weight, |rhs| {
+                        self.factor.selected_covariance_action(&self.selection, rhs)
+                    })?
+                } else {
+                    gmrf_core::estimate_hutchinson_weighted_covariance_trace_with_solve(
+                        &weight,
+                        hutchinson.probe_config(),
+                        hutchinson.distribution,
+                        |rhs| self.factor.selected_covariance_action(&self.selection, rhs),
+                    )?
+                }
+            }
+            VarianceMethod::MonteCarlo(_) => {
+                return Err(FeecGmrfError::Unsupported(
+                    "supported sparse weighted traces require exact or Hutchinson estimation"
+                        .to_string(),
+                ))
+            }
+        };
+        Ok(public_weighted_trace(estimate))
+    }
+
     /// Exact covariance matrix of a small active- or full-cochain output map.
     ///
     /// Only the requested output covariance is materialized. Each column uses
@@ -650,6 +814,27 @@ impl SupportedMaternPosterior {
             })
             .map_err(Into::into)
     }
+}
+
+fn exact_supported_weighted_variance(
+    factor: &SupportedGaussianFactor,
+    operator: &SparseRowOperator,
+    output_weights: &[f64],
+) -> Result<WeightedVarianceEstimate> {
+    let values = factor.exact_transformed_variances(operator)?;
+    let variances = exact_estimate(values.iter().copied().collect());
+    let weighted_trace = variances
+        .values
+        .iter()
+        .zip(output_weights)
+        .map(|(variance, weight)| variance * weight)
+        .sum::<f64>();
+    Ok(WeightedVarianceEstimate {
+        variances,
+        weighted_trace,
+        weighted_trace_standard_error: None,
+        weighted_trace_relative_standard_error: None,
+    })
 }
 
 fn exact_supported_metadata(

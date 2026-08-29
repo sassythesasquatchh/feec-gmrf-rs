@@ -127,7 +127,7 @@ impl HutchinsonVarianceConfig {
         Ok(())
     }
 
-    fn probe_config(self) -> ProbeBatchConfig {
+    pub(crate) fn probe_config(self) -> ProbeBatchConfig {
         ProbeBatchConfig {
             num_probes: self.probes,
             batch_count: self.batches,
@@ -167,7 +167,7 @@ impl VarianceMethod {
         })
     }
 
-    fn transformed_mode(self) -> Option<TransformedVarianceMode> {
+    pub(crate) fn transformed_mode(self) -> Option<TransformedVarianceMode> {
         match self {
             Self::Exact => Some(TransformedVarianceMode::Exact),
             Self::MonteCarlo(_) => None,
@@ -1134,7 +1134,7 @@ impl Posterior {
     }
 }
 
-fn exact_estimate(values: Vec<f64>) -> VarianceEstimate {
+pub(crate) fn exact_estimate(values: Vec<f64>) -> VarianceEstimate {
     let minimum_value = values.iter().copied().fold(f64::INFINITY, f64::min);
     let negative_count = values.iter().filter(|value| **value < 0.0).count();
     VarianceEstimate {
@@ -1153,7 +1153,7 @@ fn exact_estimate(values: Vec<f64>) -> VarianceEstimate {
     }
 }
 
-fn public_estimate(estimate: gmrf_core::VarianceEstimate) -> VarianceEstimate {
+pub(crate) fn public_estimate(estimate: gmrf_core::VarianceEstimate) -> VarianceEstimate {
     VarianceEstimate {
         values: estimate.values.iter().copied().collect(),
         estimator: match estimate.estimator {
@@ -1174,7 +1174,7 @@ fn public_estimate(estimate: gmrf_core::VarianceEstimate) -> VarianceEstimate {
     }
 }
 
-fn public_weighted_trace(
+pub(crate) fn public_weighted_trace(
     estimate: gmrf_core::WeightedTraceEstimate,
 ) -> WeightedCovarianceTraceEstimate {
     WeightedCovarianceTraceEstimate {

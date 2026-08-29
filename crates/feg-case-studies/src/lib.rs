@@ -16,6 +16,8 @@ pub mod c51_exact_supported_pilot;
 pub mod c51_magnetic_sensor_design;
 #[cfg(feature = "experimental")]
 pub mod c51_spectral_covariance_rank;
+#[cfg(feature = "experimental")]
+pub mod c51_thesis_normalized_compact;
 pub mod cube_mass_inverse_variance;
 #[cfg(feature = "experimental")]
 pub mod cube_voids_coexact_transform;
@@ -117,6 +119,7 @@ pub mod experimental {
     pub use crate::c51_exact_supported_pilot;
     pub use crate::c51_magnetic_sensor_design;
     pub use crate::c51_spectral_covariance_rank;
+    pub use crate::c51_thesis_normalized_compact;
     pub use crate::cube_voids_coexact_transform;
     pub use crate::cube_zero_form_kernel_validation;
     pub use crate::derham_ladder;
