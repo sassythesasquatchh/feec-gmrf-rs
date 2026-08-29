@@ -814,7 +814,13 @@ pub fn calibrate_prior_to_posterior_physical_rms(
     )))
 }
 
-fn covariance_mean_marginal_rms(covariance: &[Vec<f64>]) -> Result<f64> {
+/// Root-mean-square marginal standard deviation represented by a covariance
+/// matrix.
+///
+/// This is `sqrt(trace(C) / n)`. It is useful when a collection of physical
+/// integral quantities, rather than point samples, defines an amplitude
+/// calibration target.
+pub fn covariance_mean_marginal_rms(covariance: &[Vec<f64>]) -> Result<f64> {
     if covariance.is_empty()
         || covariance
             .iter()
@@ -1190,6 +1196,15 @@ mod tests {
         assert!((calibrated_action[0] - 15.0).abs() < 2.0e-5);
         let covariance = posterior.pushforward_covariance(&identity).unwrap();
         assert!((covariance[0][0] - 1.0 / 16.0).abs() < 2.0e-7);
+    }
+
+    #[test]
+    fn covariance_mean_marginal_rms_uses_covariance_trace() {
+        let covariance = vec![vec![4.0, 1.0], vec![1.0, 12.0]];
+        assert!(
+            (covariance_mean_marginal_rms(&covariance).unwrap() - 8.0_f64.sqrt()).abs() < 1.0e-12
+        );
+        assert!(covariance_mean_marginal_rms(&[]).is_err());
     }
 
     #[test]

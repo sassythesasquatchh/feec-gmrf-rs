@@ -4,7 +4,9 @@
 //! independently scaled to the same domain-wide RMS of `B = D1 A` in the
 //! degree-2 FEEC mass norm. Training rows, local diagnostics, and fixed surface
 //! flux QoIs pair directly with the integral 2-cochain; none uses pointwise or
-//! cell-barycentre reconstruction, and none defines the amplitude.
+//! cell-barycentre reconstruction. A secondary, explicitly labelled benchmark
+//! calibration uses only the designated surface-flux selection bank to set one
+//! coherent posterior amplitude, then evaluates the disjoint held-out bank.
 
 use crate::c51_benchmark::C51RunMetadata;
 use crate::c51_magnetic_sensor_design::{
@@ -12,11 +14,12 @@ use crate::c51_magnetic_sensor_design::{
 };
 use crate::c51_spectral_covariance_rank::{covariance_error_metrics, C51CovarianceErrorMetrics};
 use feec_gmrf::prelude::{
-    axis_aligned_flux_patch_cochain_map_3d, pullback_quadratic_form, AdjacentMaternPriorBuilder,
+    axis_aligned_flux_patch_cochain_map_3d, calibrate_prior_to_posterior_physical_rms,
+    covariance_mean_marginal_rms, pullback_quadratic_form, AdjacentMaternPriorBuilder,
     AxisAlignedFluxPatch3d, EssentialBoundaryElimination, ExactFormOperators, GaussianNoise,
     HutchinsonVarianceConfig, LinearGaussianModelBuilder, LinearMap, LinearObservation,
-    MaternAlpha, MaternParameters, OutgoingFormOperator, Result, SupportedMaternPriorBuilder,
-    VarianceMethod,
+    MaternAlpha, MaternParameters, OutgoingFormOperator, PosteriorPhysicalRmsCalibration,
+    PosteriorPhysicalRmsCalibrationOptions, Result, SupportedMaternPriorBuilder, VarianceMethod,
 };
 use manifold::{
     gen::cartesian::CartesianMeshInfo,
@@ -28,13 +31,13 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str =
-    "c51-thesis-normalized-flux-cochain-v6";
+    "c51-thesis-normalized-flux-cochain-v7";
 pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str =
     "c51/thesis-normalized-flux-cochain-accuracy";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v6-n8";
+    "thesis-magnetic-trace-normalized-flux-cochain-v7-n8";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v6-n10";
+    "thesis-magnetic-trace-normalized-flux-cochain-v7-n10";
 pub const C51_SURFACE_FLUX_QOI_DESIGN_ID: &str = "c51-midplane-quadrant-fluxes-v1";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
 pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
@@ -123,6 +126,12 @@ pub struct C51ThesisNormalizedCompactReport {
     pub surface_prior_held_out: C51CovarianceErrorMetrics,
     pub surface_posterior_selection: C51CovarianceErrorMetrics,
     pub surface_posterior_held_out: C51CovarianceErrorMetrics,
+    pub surface_posterior_calibration: PosteriorPhysicalRmsCalibration,
+    pub calibrated_prior_b_rms_tesla: f64,
+    pub calibrated_local_posterior_selection: C51CovarianceErrorMetrics,
+    pub calibrated_local_posterior_held_out: C51CovarianceErrorMetrics,
+    pub calibrated_surface_posterior_selection: C51CovarianceErrorMetrics,
+    pub calibrated_surface_posterior_held_out: C51CovarianceErrorMetrics,
 }
 
 pub fn run_c51_thesis_normalized_compact(
@@ -228,8 +237,8 @@ pub fn run_c51_thesis_normalized_compact(
     let compact_surface_prior_held_out = compact_prior.pushforward_covariance(&surface_held_out)?;
 
     let exact_posterior = exact.condition(std::slice::from_ref(&observation), &[])?;
-    let mut compact_posterior = LinearGaussianModelBuilder::new(compact)
-        .observe(observation)?
+    let mut compact_posterior = LinearGaussianModelBuilder::new(compact.clone())
+        .observe(observation.clone())?
         .condition()?;
     let exact_selection = exact_posterior.pushforward_covariance(flux_split.selection())?;
     let exact_held_out = exact_posterior.pushforward_covariance(flux_split.held_out())?;
@@ -239,6 +248,32 @@ pub fn run_c51_thesis_normalized_compact(
     let exact_surface_held_out = exact_posterior.pushforward_covariance(&surface_held_out)?;
     let compact_surface_selection = compact_posterior.pushforward_covariance(&surface_selection)?;
     let compact_surface_held_out = compact_posterior.pushforward_covariance(&surface_held_out)?;
+
+    let target_surface_posterior_rms = covariance_mean_marginal_rms(&exact_surface_selection)?;
+    let (_, mut calibrated_compact_posterior, surface_posterior_calibration) =
+        calibrate_prior_to_posterior_physical_rms(
+            &compact,
+            std::slice::from_ref(&observation),
+            &[],
+            &surface_selection,
+            target_surface_posterior_rms,
+            PosteriorPhysicalRmsCalibrationOptions {
+                relative_tolerance: 1.0e-5,
+                maximum_iterations: 24,
+                maximum_bracket_expansions: 12,
+                bracket_expansion_factor: 4.0,
+            },
+        )?;
+    let calibrated_selection =
+        calibrated_compact_posterior.pushforward_covariance(flux_split.selection())?;
+    let calibrated_held_out =
+        calibrated_compact_posterior.pushforward_covariance(flux_split.held_out())?;
+    let calibrated_surface_selection =
+        calibrated_compact_posterior.pushforward_covariance(&surface_selection)?;
+    let calibrated_surface_held_out =
+        calibrated_compact_posterior.pushforward_covariance(&surface_held_out)?;
+    let calibrated_prior_b_rms_tesla =
+        compact_calibration.normalized_b_rms / surface_posterior_calibration.tau_multiplier();
 
     Ok(C51ThesisNormalizedCompactReport {
         metadata,
@@ -275,6 +310,24 @@ pub fn run_c51_thesis_normalized_compact(
             &compact_surface_held_out,
             &exact_surface_held_out,
         )?,
+        surface_posterior_calibration,
+        calibrated_prior_b_rms_tesla,
+        calibrated_local_posterior_selection: covariance_error_metrics(
+            &calibrated_selection,
+            &exact_selection,
+        )?,
+        calibrated_local_posterior_held_out: covariance_error_metrics(
+            &calibrated_held_out,
+            &exact_held_out,
+        )?,
+        calibrated_surface_posterior_selection: covariance_error_metrics(
+            &calibrated_surface_selection,
+            &exact_surface_selection,
+        )?,
+        calibrated_surface_posterior_held_out: covariance_error_metrics(
+            &calibrated_surface_held_out,
+            &exact_surface_held_out,
+        )?,
     })
 }
 
@@ -285,21 +338,41 @@ impl C51ThesisNormalizedCompactReport {
         self.write_error_csv(
             &directory.join("local_flux_cochain_errors.csv"),
             "local_face_flux_cochains",
-            [
+            &[
                 ("prior", "selection", &self.local_prior_selection),
                 ("prior", "heldout", &self.local_prior_held_out),
                 ("posterior", "selection", &self.local_posterior_selection),
                 ("posterior", "heldout", &self.local_posterior_held_out),
+                (
+                    "posterior_amplitude_calibrated",
+                    "selection",
+                    &self.calibrated_local_posterior_selection,
+                ),
+                (
+                    "posterior_amplitude_calibrated",
+                    "heldout",
+                    &self.calibrated_local_posterior_held_out,
+                ),
             ],
         )?;
         self.write_error_csv(
             &directory.join("surface_flux_errors.csv"),
             "midplane_quadrant_surface_fluxes",
-            [
+            &[
                 ("prior", "selection", &self.surface_prior_selection),
                 ("prior", "heldout", &self.surface_prior_held_out),
                 ("posterior", "selection", &self.surface_posterior_selection),
                 ("posterior", "heldout", &self.surface_posterior_held_out),
+                (
+                    "posterior_amplitude_calibrated",
+                    "selection",
+                    &self.calibrated_surface_posterior_selection,
+                ),
+                (
+                    "posterior_amplitude_calibrated",
+                    "heldout",
+                    &self.calibrated_surface_posterior_held_out,
+                ),
             ],
         )?;
         self.write_manifest(&directory.join("manifest.yaml"))
@@ -307,8 +380,8 @@ impl C51ThesisNormalizedCompactReport {
 
     fn write_summary_csv(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,observation_to_state_ratio,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,local_prior_heldout_primary,local_posterior_heldout_primary,surface_prior_heldout_primary,surface_posterior_heldout_primary")?;
-        writeln!(writer, "{},{},{},{},{},{:.17e},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e}",
+        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,observation_to_state_ratio,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,local_prior_heldout_primary,local_posterior_heldout_primary,surface_prior_heldout_primary,surface_posterior_heldout_primary,posterior_calibration_precision_scale,posterior_calibration_tau_multiplier,calibrated_prior_b_rms_tesla,calibrated_local_posterior_heldout_primary,calibrated_surface_posterior_heldout_primary")?;
+        writeln!(writer, "{},{},{},{},{},{:.17e},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
             C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
             self.config.profile,
             self.config.refinement,
@@ -331,6 +404,11 @@ impl C51ThesisNormalizedCompactReport {
             self.local_posterior_held_out.primary_envelope(),
             self.surface_prior_held_out.primary_envelope(),
             self.surface_posterior_held_out.primary_envelope(),
+            self.surface_posterior_calibration.precision_scale,
+            self.surface_posterior_calibration.tau_multiplier(),
+            self.calibrated_prior_b_rms_tesla,
+            self.calibrated_local_posterior_held_out.primary_envelope(),
+            self.calibrated_surface_posterior_held_out.primary_envelope(),
         )?;
         writer.flush()?;
         Ok(())
@@ -340,7 +418,7 @@ impl C51ThesisNormalizedCompactReport {
         &self,
         path: &Path,
         qoi_family: &str,
-        rows: [(&str, &str, &C51CovarianceErrorMetrics); 4],
+        rows: &[(&str, &str, &C51CovarianceErrorMetrics)],
     ) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
         writeln!(
@@ -439,6 +517,64 @@ impl C51ThesisNormalizedCompactReport {
             "observation_noise_variance_weber_squared: {:.17e}",
             self.config.observation_noise_variance_weber_squared
         )?;
+        writeln!(writer, "posterior_amplitude_calibration:")?;
+        writeln!(
+            writer,
+            "  policy: exact_reference_mean_marginal_surface_flux_rms_by_prior_precision"
+        )?;
+        writeln!(writer, "  bank: selection")?;
+        writeln!(writer, "  heldout_rows_used: false")?;
+        writeln!(writer, "  likelihood_reconditioned: true")?;
+        writeln!(writer, "  posthoc_covariance_scaling: false")?;
+        writeln!(
+            writer,
+            "  production_target_source: external_physical_calibration_required"
+        )?;
+        writeln!(
+            writer,
+            "  target_posterior_rms_weber: {:.17e}",
+            self.surface_posterior_calibration.target_rms
+        )?;
+        writeln!(
+            writer,
+            "  uncalibrated_posterior_rms_weber: {:.17e}",
+            self.surface_posterior_calibration.uncalibrated_rms
+        )?;
+        writeln!(
+            writer,
+            "  achieved_posterior_rms_weber: {:.17e}",
+            self.surface_posterior_calibration.achieved_rms
+        )?;
+        writeln!(
+            writer,
+            "  precision_scale: {:.17e}",
+            self.surface_posterior_calibration.precision_scale
+        )?;
+        writeln!(
+            writer,
+            "  tau_multiplier: {:.17e}",
+            self.surface_posterior_calibration.tau_multiplier()
+        )?;
+        writeln!(
+            writer,
+            "  relative_error: {:.17e}",
+            self.surface_posterior_calibration.relative_error
+        )?;
+        writeln!(
+            writer,
+            "  bracket_expansions: {}",
+            self.surface_posterior_calibration.bracket_expansions
+        )?;
+        writeln!(
+            writer,
+            "  iterations: {}",
+            self.surface_posterior_calibration.iterations
+        )?;
+        writeln!(
+            writer,
+            "  prior_b_rms_after_calibration_tesla: {:.17e}",
+            self.calibrated_prior_b_rms_tesla
+        )?;
         writeln!(writer, "errors:")?;
         writeln!(
             writer,
@@ -479,6 +615,28 @@ impl C51ThesisNormalizedCompactReport {
             writer,
             "  surface_posterior_heldout_primary: {:.17e}",
             self.surface_posterior_held_out.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  calibrated_local_posterior_selection_primary: {:.17e}",
+            self.calibrated_local_posterior_selection.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  calibrated_local_posterior_heldout_primary: {:.17e}",
+            self.calibrated_local_posterior_held_out.primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  calibrated_surface_posterior_selection_primary: {:.17e}",
+            self.calibrated_surface_posterior_selection
+                .primary_envelope()
+        )?;
+        writeln!(
+            writer,
+            "  calibrated_surface_posterior_heldout_primary: {:.17e}",
+            self.calibrated_surface_posterior_held_out
+                .primary_envelope()
         )?;
         writeln!(
             writer,
