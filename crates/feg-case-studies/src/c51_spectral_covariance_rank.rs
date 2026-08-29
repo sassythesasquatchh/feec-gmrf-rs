@@ -5,9 +5,11 @@
 //! row is permanently ineligible for a performance comparison.
 
 #[cfg(any(feature = "external-solvers", test))]
+use crate::c51_magnetic_sensor_design::primary_observation_kernels;
+#[cfg(feature = "external-solvers")]
 use crate::c51_magnetic_sensor_design::{
     assemble_juq_performance_observation_prefix, held_out_kernels,
-    juq_performance_observation_kernel_prefix, primary_observation_kernels, selection_kernels,
+    juq_performance_observation_kernel_prefix, selection_kernels,
 };
 use crate::c51_magnetic_sensor_design::{
     C51ScalarObservationPrefixMetadata, C51_FIXED_OBSERVATION_RADIUS,
@@ -21,9 +23,10 @@ use common::linalg::nalgebra::Matrix;
 use common::linalg::petsc::{petsc_read_eigenvals, petsc_read_eigenvecs};
 #[cfg(feature = "external-solvers")]
 use feec_gmrf::prelude::{
-    AuditedSupportedCovariance, EssentialBoundaryConditions, ExactFormOperators,
-    ExactMaternPriorBuilder, LinearGaussianModelBuilder, LinearObservation, MagneticFieldMaps3d,
-    MaternPriorBuilder, SupportedCovarianceSymmetryAudit, SupportedMaternPriorBuilder,
+    calibrate_prior_to_physical_rms, AuditedSupportedCovariance, EssentialBoundaryConditions,
+    ExactFormOperators, ExactMaternPriorBuilder, LinearGaussianModelBuilder, LinearObservation,
+    MagneticFieldMaps3d, MaternPriorBuilder, SupportedCovarianceSymmetryAudit,
+    SupportedMaternPriorBuilder,
 };
 #[cfg(any(feature = "external-solvers", test))]
 use feec_gmrf::prelude::{
@@ -54,7 +57,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::Command;
 
-pub const C51_SPECTRAL_COVARIANCE_SCHEMA_VERSION: &str = "c51-spectral-covariance-rank-v2";
+pub const C51_SPECTRAL_COVARIANCE_SCHEMA_VERSION: &str = "c51-spectral-covariance-rank-v3";
 pub const C51_SPECTRAL_COVARIANCE_STUDY_ID: &str = "c51/spectral-covariance-rank";
 pub const C51_SPECTRAL_RANK_GRID: [usize; 12] = [
     32, 64, 128, 256, 512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048,
@@ -956,6 +959,20 @@ pub struct C51CompactAccuracyRow {
     pub unavailable_reason: String,
     pub selection: Option<C51CovarianceErrorMetrics>,
     pub held_out: Option<C51CovarianceErrorMetrics>,
+    /// Exact-FEEC prior RMS on the frozen selection bank. This is fixed before
+    /// conditioning and is never estimated from held-out outputs.
+    pub calibration_target_prior_rms: Option<f64>,
+    /// Projected-Whitney prior RMS on the same selection bank before scaling.
+    pub calibration_uncalibrated_prior_rms: Option<f64>,
+    /// Scalar multiplying the raw projected precision.
+    pub calibration_precision_scale: Option<f64>,
+    /// Equivalent scalar multiplying the Matérn amplitude `tau`.
+    pub calibration_tau_multiplier: Option<f64>,
+    /// Posterior covariance error after applying the frozen prior calibration.
+    pub calibrated_selection: Option<C51CovarianceErrorMetrics>,
+    /// Independent posterior covariance error after applying the frozen prior
+    /// calibration; this bank is not used to choose the scalar.
+    pub calibrated_held_out: Option<C51CovarianceErrorMetrics>,
     pub latent_mass_action_relative_errors: Option<[f64; 2]>,
     pub latent_mass_action_maximum_relative_error: Option<f64>,
     pub method_performance_timing_eligible: bool,
@@ -979,7 +996,14 @@ pub struct C51PerformanceRankDecision {
     pub rank_status: &'static str,
     pub compact_whitney_selection_primary_error: f64,
     pub compact_whitney_held_out_primary_error: f64,
+    pub calibrated_compact_whitney_selection_primary_error: f64,
+    pub calibrated_compact_whitney_held_out_primary_error: f64,
+    pub compact_whitney_calibration_target_prior_rms: f64,
+    pub compact_whitney_calibration_uncalibrated_prior_rms: f64,
+    pub compact_whitney_calibration_precision_scale: f64,
+    pub compact_whitney_calibration_tau_multiplier: f64,
     pub compact_whitney_validation_status: &'static str,
+    pub calibrated_compact_whitney_validation_status: &'static str,
     pub accuracy_archive_sha256: String,
     pub timing_basis_source: &'static str,
     pub shared_basis_timing_eligible: bool,
@@ -1089,13 +1113,43 @@ impl C51SpectralCovarianceRankArchive {
             }
             for row in &self.compact_accuracy_rows {
                 let measured = row.status == "measured";
+                let calibration_complete = row.calibration_target_prior_rms.is_some()
+                    && row.calibration_uncalibrated_prior_rms.is_some()
+                    && row.calibration_precision_scale.is_some()
+                    && row.calibration_tau_multiplier.is_some()
+                    && row.calibrated_selection.is_some()
+                    && row.calibrated_held_out.is_some();
+                let calibration_valid = if !measured {
+                    true
+                } else if let (Some(target), Some(raw), Some(scale), Some(tau_multiplier)) = (
+                    row.calibration_target_prior_rms,
+                    row.calibration_uncalibrated_prior_rms,
+                    row.calibration_precision_scale,
+                    row.calibration_tau_multiplier,
+                ) {
+                    [target, raw, scale, tau_multiplier]
+                        .into_iter()
+                        .all(|value| value.is_finite() && value > 0.0)
+                        && (tau_multiplier.powi(2) - scale).abs() <= 1.0e-12 * scale
+                } else {
+                    false
+                };
                 if row.method_performance_timing_eligible
                     || !C51_HIGH_OBSERVATION_COUNTS.contains(&row.observation_count)
                     || measured
                         != (row.selection.is_some()
                             && row.held_out.is_some()
+                            && calibration_complete
                             && row.latent_mass_action_relative_errors.is_some()
                             && row.latent_mass_action_maximum_relative_error.is_some())
+                    || (!measured
+                        && (row.calibration_target_prior_rms.is_some()
+                            || row.calibration_uncalibrated_prior_rms.is_some()
+                            || row.calibration_precision_scale.is_some()
+                            || row.calibration_tau_multiplier.is_some()
+                            || row.calibrated_selection.is_some()
+                            || row.calibrated_held_out.is_some()))
+                    || !calibration_valid
                     || (measured && !row.unavailable_reason.is_empty())
                     || (!measured && row.unavailable_reason.is_empty())
                 {
@@ -1312,6 +1366,26 @@ impl C51SpectralCovarianceRankArchive {
                     "selection_relative_error": decision.compact_whitney_selection_primary_error,
                     "heldout_relative_error": decision.compact_whitney_held_out_primary_error,
                     "validation_status": decision.compact_whitney_validation_status,
+                    "accuracy_artifact_sha256": decision.accuracy_archive_sha256,
+                    "identical_observation_and_output_maps": true,
+                    "method_performance_timing_eligible": false
+                },
+                "whitney_compact_calibrated": {
+                    "selection_relative_error": decision.calibrated_compact_whitney_selection_primary_error,
+                    "heldout_relative_error": decision.calibrated_compact_whitney_held_out_primary_error,
+                    "validation_status": decision.calibrated_compact_whitney_validation_status,
+                    "amplitude_calibration": {
+                        "stage": "prior_before_conditioning",
+                        "parameter_changed": "tau_only",
+                        "target": "exact_feec_prior_selection_bank_physical_rms",
+                        "calibration_bank": "selection",
+                        "evaluation_bank": "held_out",
+                        "target_prior_rms": decision.compact_whitney_calibration_target_prior_rms,
+                        "uncalibrated_prior_rms": decision.compact_whitney_calibration_uncalibrated_prior_rms,
+                        "precision_scale": decision.compact_whitney_calibration_precision_scale,
+                        "tau_multiplier": decision.compact_whitney_calibration_tau_multiplier,
+                        "heldout_used_for_calibration": false
+                    },
                     "accuracy_artifact_sha256": decision.accuracy_archive_sha256,
                     "identical_observation_and_output_maps": true,
                     "method_performance_timing_eligible": false
@@ -1744,6 +1818,24 @@ impl C51SpectralCovarianceRankArchive {
                 "heldout_e_dir",
                 "heldout_e_corr",
                 "heldout_e_primary",
+                "calibration_policy",
+                "calibration_bank",
+                "calibration_target_prior_rms",
+                "calibration_uncalibrated_prior_rms",
+                "calibration_precision_scale",
+                "calibration_tau_multiplier",
+                "calibrated_selection_e_f",
+                "calibrated_selection_e_2",
+                "calibrated_selection_e_diag",
+                "calibrated_selection_e_dir",
+                "calibrated_selection_e_corr",
+                "calibrated_selection_e_primary",
+                "calibrated_heldout_e_f",
+                "calibrated_heldout_e_2",
+                "calibrated_heldout_e_diag",
+                "calibrated_heldout_e_dir",
+                "calibrated_heldout_e_corr",
+                "calibrated_heldout_e_primary",
                 "latent_mass_action_probe_0_relative_error",
                 "latent_mass_action_probe_1_relative_error",
                 "latent_mass_action_maximum_relative_error",
@@ -1764,6 +1856,39 @@ impl C51SpectralCovarianceRankArchive {
             ];
             append_metrics(&mut record, row.selection);
             append_metrics(&mut record, row.held_out);
+            if row.status == "measured" {
+                record.extend([
+                    "exact_feec_prior_selection_bank_physical_rms".to_string(),
+                    "selection".to_string(),
+                    format_float(
+                        row.calibration_target_prior_rms
+                            .expect("validated measured calibration target"),
+                    ),
+                    format_float(
+                        row.calibration_uncalibrated_prior_rms
+                            .expect("validated measured uncalibrated RMS"),
+                    ),
+                    format_float(
+                        row.calibration_precision_scale
+                            .expect("validated measured calibration precision scale"),
+                    ),
+                    format_float(
+                        row.calibration_tau_multiplier
+                            .expect("validated measured calibration tau multiplier"),
+                    ),
+                ]);
+            } else {
+                record.extend([
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                ]);
+            }
+            append_metrics(&mut record, row.calibrated_selection);
+            append_metrics(&mut record, row.calibrated_held_out);
             match row.latent_mass_action_relative_errors {
                 Some(errors) => record.extend([
                     format_float(errors[0]),
@@ -1891,6 +2016,17 @@ impl C51SpectralCovarianceRankArchive {
         )?;
         writeln!(writer, "kappa: {:.17e}", self.config.kappa)?;
         writeln!(writer, "tau: {:.17e}", self.config.tau)?;
+        writeln!(writer, "projected_amplitude_calibration:")?;
+        writeln!(writer, "  stage: prior_before_conditioning")?;
+        writeln!(writer, "  parameter_changed: tau_only")?;
+        writeln!(
+            writer,
+            "  target: exact_feec_prior_selection_bank_physical_rms"
+        )?;
+        writeln!(writer, "  calibration_bank: selection")?;
+        writeln!(writer, "  evaluation_bank: held_out")?;
+        writeln!(writer, "  held_out_used_for_calibration: false")?;
+        writeln!(writer, "  raw_projected_result_retained: true")?;
         writeln!(
             writer,
             "observation_noise_variance: {:.17e}",
@@ -2693,6 +2829,15 @@ fn run_alpha(
         .parameters(parameters)
         .build()?;
     let prior_factor = exact_prior.factor()?;
+    let compact_calibration_reference = if config.is_any_high_observation() {
+        Some(
+            prior_factor
+                .pushforward_covariance_audited(selection_full)?
+                .symmetric,
+        )
+    } else {
+        None
+    };
     let mut exact_designs = Vec::new();
     if config
         .covariance_designs()
@@ -2762,6 +2907,11 @@ fn run_alpha(
             operators,
             selection_full,
             held_out_full,
+            compact_calibration_reference.as_deref().ok_or_else(|| {
+                FeecGmrfError::Inference(
+                    "C51 compact calibration reference was not constructed".to_string(),
+                )
+            })?,
             designs,
             &exact_designs,
             &latent_probe_rhs,
@@ -2983,6 +3133,7 @@ fn evaluate_compact_accuracy(
     operators: &ExactFormOperators,
     selection_full: &LinearMap,
     held_out_full: &LinearMap,
+    exact_prior_selection_covariance: &[Vec<f64>],
     designs: &[ObservationDesign],
     exact_designs: &[ExactDesignCovariance],
     latent_probe_rhs: &[Vec<f64>],
@@ -3001,6 +3152,9 @@ fn evaluate_compact_accuracy(
             compact_prior.dimension()
         )));
     }
+    let target_prior_rms = covariance_rms(exact_prior_selection_covariance)?;
+    let (calibrated_prior, calibration) =
+        calibrate_prior_to_physical_rms(&compact_prior, selection_full, target_prior_rms)?;
     for design in designs {
         let exact = exact_designs
             .iter()
@@ -3019,8 +3173,20 @@ fn evaluate_compact_accuracy(
         let mut posterior = LinearGaussianModelBuilder::new(compact_prior.clone())
             .observe(observation)?
             .condition()?;
+        let calibrated_observation = LinearObservation::new(
+            design.full.clone(),
+            vec![0.0; design.count],
+            GaussianNoise::variance(config.observation_noise_variance)?,
+        )?;
+        let mut calibrated_posterior = LinearGaussianModelBuilder::new(calibrated_prior.clone())
+            .observe(calibrated_observation)?
+            .condition()?;
         let selection_covariance = posterior.pushforward_covariance(selection_full)?;
         let held_out_covariance = posterior.pushforward_covariance(held_out_full)?;
+        let calibrated_selection_covariance =
+            calibrated_posterior.pushforward_covariance(selection_full)?;
+        let calibrated_held_out_covariance =
+            calibrated_posterior.pushforward_covariance(held_out_full)?;
         let approximate_latent_actions = latent_probe_rhs
             .iter()
             .map(|rhs| posterior.covariance_action(rhs))
@@ -3028,6 +3194,10 @@ fn evaluate_compact_accuracy(
         let selection =
             covariance_error_metrics(&selection_covariance, &exact.selection.symmetric)?;
         let held_out = covariance_error_metrics(&held_out_covariance, &exact.held_out.symmetric)?;
+        let calibrated_selection =
+            covariance_error_metrics(&calibrated_selection_covariance, &exact.selection.symmetric)?;
+        let calibrated_held_out =
+            covariance_error_metrics(&calibrated_held_out_covariance, &exact.held_out.symmetric)?;
         let latent_errors = latent_action_errors(
             operators.state().mass(),
             &approximate_latent_actions,
@@ -3053,6 +3223,26 @@ fn evaluate_compact_accuracy(
             "whitney_compact_projected",
             &held_out_covariance,
         );
+        archive_covariance(
+            &mut archive.covariances,
+            refinement,
+            alpha,
+            design.kind,
+            None,
+            "selection",
+            "whitney_compact_projected_physical_rms_calibrated",
+            &calibrated_selection_covariance,
+        );
+        archive_covariance(
+            &mut archive.covariances,
+            refinement,
+            alpha,
+            design.kind,
+            None,
+            "held_out",
+            "whitney_compact_projected_physical_rms_calibrated",
+            &calibrated_held_out_covariance,
+        );
         archive.compact_accuracy_rows.push(C51CompactAccuracyRow {
             refinement,
             state_dimension,
@@ -3063,6 +3253,12 @@ fn evaluate_compact_accuracy(
             unavailable_reason: String::new(),
             selection: Some(selection),
             held_out: Some(held_out),
+            calibration_target_prior_rms: Some(calibration.target_rms),
+            calibration_uncalibrated_prior_rms: Some(calibration.uncalibrated_rms),
+            calibration_precision_scale: Some(calibration.precision_scale),
+            calibration_tau_multiplier: Some(calibration.tau_multiplier()),
+            calibrated_selection: Some(calibrated_selection),
+            calibrated_held_out: Some(calibrated_held_out),
             latent_mass_action_relative_errors: Some(latent_errors),
             latent_mass_action_maximum_relative_error: Some(
                 latent_errors.into_iter().fold(0.0, f64::max),
@@ -3097,6 +3293,12 @@ fn append_unavailable_compact_rows(
             unavailable_reason: reason.to_string(),
             selection: None,
             held_out: None,
+            calibration_target_prior_rms: None,
+            calibration_uncalibrated_prior_rms: None,
+            calibration_precision_scale: None,
+            calibration_tau_multiplier: None,
+            calibrated_selection: None,
+            calibrated_held_out: None,
             latent_mass_action_relative_errors: None,
             latent_mass_action_maximum_relative_error: None,
             method_performance_timing_eligible: false,
@@ -3505,6 +3707,23 @@ pub fn covariance_error_metrics(
         ));
     }
     Ok(metrics)
+}
+
+#[cfg(feature = "external-solvers")]
+fn covariance_rms(covariance: &[Vec<f64>]) -> Result<f64> {
+    validate_square_covariance(covariance)?;
+    let mean_variance = covariance
+        .iter()
+        .enumerate()
+        .map(|(index, row)| row[index])
+        .sum::<f64>()
+        / covariance.len() as f64;
+    if !mean_variance.is_finite() || mean_variance <= 0.0 {
+        return Err(FeecGmrfError::Inference(
+            "C51 calibration covariance has non-positive mean marginal variance".to_string(),
+        ));
+    }
+    Ok(mean_variance.sqrt())
 }
 
 fn validate_square_covariance(covariance: &[Vec<f64>]) -> Result<()> {
@@ -4048,10 +4267,20 @@ fn derive_performance_rank_decision(
         .held_out
         .ok_or_else(|| invalid("C51 compact row lacks held-out metrics"))?
         .primary_envelope();
+    let calibrated_compact_selection = compact
+        .calibrated_selection
+        .ok_or_else(|| invalid("C51 calibrated compact row lacks selection metrics"))?
+        .primary_envelope();
+    let calibrated_compact_held_out = compact
+        .calibrated_held_out
+        .ok_or_else(|| invalid("C51 calibrated compact row lacks held-out metrics"))?
+        .primary_envelope();
     if !compact_selection.is_finite()
         || !compact_held_out.is_finite()
         || compact_selection > C51_PERFORMANCE_PRIMARY_TOLERANCE
         || compact_held_out > C51_PERFORMANCE_PRIMARY_TOLERANCE
+        || !calibrated_compact_selection.is_finite()
+        || !calibrated_compact_held_out.is_finite()
     {
         return Err(invalid(
             "C51 projected Whitney-compact method does not satisfy the frozen 5% selection and held-out envelope",
@@ -4084,7 +4313,29 @@ fn derive_performance_rank_decision(
         },
         compact_whitney_selection_primary_error: compact_selection,
         compact_whitney_held_out_primary_error: compact_held_out,
+        calibrated_compact_whitney_selection_primary_error: calibrated_compact_selection,
+        calibrated_compact_whitney_held_out_primary_error: calibrated_compact_held_out,
+        compact_whitney_calibration_target_prior_rms: compact
+            .calibration_target_prior_rms
+            .ok_or_else(|| invalid("C51 compact row lacks its calibration target RMS"))?,
+        compact_whitney_calibration_uncalibrated_prior_rms: compact
+            .calibration_uncalibrated_prior_rms
+            .ok_or_else(|| invalid("C51 compact row lacks its raw calibration RMS"))?,
+        compact_whitney_calibration_precision_scale: compact
+            .calibration_precision_scale
+            .ok_or_else(|| invalid("C51 compact row lacks its calibration precision scale"))?,
+        compact_whitney_calibration_tau_multiplier: compact
+            .calibration_tau_multiplier
+            .ok_or_else(|| invalid("C51 compact row lacks its calibration tau multiplier"))?,
         compact_whitney_validation_status: "heldout_validated",
+        calibrated_compact_whitney_validation_status: if calibrated_compact_selection
+            <= C51_PERFORMANCE_PRIMARY_TOLERANCE
+            && calibrated_compact_held_out <= C51_PERFORMANCE_PRIMARY_TOLERANCE
+        {
+            "physical_rms_calibrated_heldout_validated"
+        } else {
+            "physical_rms_calibrated_measured_accuracy_context"
+        },
         accuracy_archive_sha256,
         timing_basis_source: "partial_exact_requested_mixed_shell",
         shared_basis_timing_eligible: false,
@@ -4522,6 +4773,12 @@ mod tests {
                 unavailable_reason: String::new(),
                 selection: Some(decision_test_metrics(0.03)),
                 held_out: Some(decision_test_metrics(0.04)),
+                calibration_target_prior_rms: Some(1.0),
+                calibration_uncalibrated_prior_rms: Some(0.8),
+                calibration_precision_scale: Some(0.64),
+                calibration_tau_multiplier: Some(0.8),
+                calibrated_selection: Some(decision_test_metrics(0.02)),
+                calibrated_held_out: Some(decision_test_metrics(0.03)),
                 latent_mass_action_relative_errors: Some([0.01, 0.01]),
                 latent_mass_action_maximum_relative_error: Some(0.01),
                 method_performance_timing_eligible: false,
@@ -4545,6 +4802,10 @@ mod tests {
         assert_eq!(
             decision.compact_whitney_validation_status,
             "heldout_validated"
+        );
+        assert_eq!(
+            decision.calibrated_compact_whitney_validation_status,
+            "physical_rms_calibrated_heldout_validated"
         );
         assert!(!decision.shared_basis_timing_eligible);
 

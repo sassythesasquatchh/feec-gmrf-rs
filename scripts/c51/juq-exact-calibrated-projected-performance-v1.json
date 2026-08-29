@@ -1,0 +1,96 @@
+{
+  "schema_version": "c51-juq-performance-profile-v1",
+  "profile": "juq-exact-calibrated-projected-performance-v1",
+  "status": "preregistered_after_raw_projected_shape_audit_before_calibrated_heldout_results",
+  "scientific_law": {
+    "geometry": "unit_cube",
+    "spatial_dimension": 3,
+    "form_degree": 1,
+    "alpha": 2,
+    "kappa": 4.0,
+    "tau": 1.0,
+    "observation_noise_variance": 0.05,
+    "boundary_treatment": "homogeneous_full_relative",
+    "physical_chain": "A_to_D1_to_B",
+    "sensor_design_id": "c51-magnetic-fixed-footprint-maximin-12-v1",
+    "physical_qoi_design_id": "rank_study_selection_and_held_out_wendland_c2_18",
+    "sensor_radius": 0.16,
+    "sensor_capacity_scalar_rows": 5184,
+    "accuracy_target": {
+      "metric": "held_out_physical_covariance_primary_envelope",
+      "primary_relative_tolerance": 0.05,
+      "context_relative_tolerance": 0.1,
+      "sensitivity_relative_tolerance": 0.02
+    }
+  },
+  "axes": {
+    "refinements": [8, 10],
+    "scalar_observation_counts": [4096],
+    "replacement_data_counts": [1, 100],
+    "methods": [
+      "fm_aug",
+      "whitney_compact",
+      "whitney_compact_calibrated",
+      "exact_observation_gp",
+      "spectral_low_rank"
+    ],
+    "workload_phases": ["cold_setup", "query_physical_uq"],
+    "observation_class": "fixed_footprint_magnetic_volume"
+  },
+  "evidence_tiers": [
+    {
+      "id": "claim_primary_exact",
+      "role": "claim_bearing_exact_time_throughput_with_raw_and_physically_calibrated_projected_context",
+      "refinements": [8, 10],
+      "scalar_observation_counts": [4096],
+      "replacement_data_counts": [1, 100],
+      "warmup_replicates": 1,
+      "measured_replicates": 3
+    }
+  ],
+  "execution": {
+    "deterministic_randomization_seed": 849348622,
+    "threads": 1,
+    "cgroup_mode": "auto",
+    "continue_after_cell_failure": false,
+    "require_clean_recursive_source": true,
+    "fresh_process_per_method_phase_cell": true
+  },
+  "decision_rule": {
+    "primary_resource": "end_to_end_time",
+    "minimum_time_improvement_fraction": 0.25,
+    "required_exact_cells": "both_refinements_and_both_replacement_data_counts_against_exact_observation_gp_and_accuracy_matched_spectral_low_rank",
+    "memory_role": "reported_tradeoff_not_noninferiority_gate",
+    "raw_projected_role": "fixed_tau_shape_and_amplitude_bias_context",
+    "calibrated_projected_role": "practical_matched_physical_qoi_method_if_frozen_prior_calibration_clears_selection_and_heldout_5pct",
+    "calibration_stage": "prior_before_conditioning",
+    "calibration_target": "exact_feec_prior_selection_bank_physical_rms",
+    "calibration_parameter": "tau_only",
+    "heldout_used_for_calibration": false,
+    "calibration_cost": "included_in_prior_build_and_fresh_process_peak_rss",
+    "peak_rss_measurement": "fresh-process cgroup-v2 when available, otherwise macOS /usr/bin/time -l; an unavailable measurement fails adjudication"
+  },
+  "spectral_rank_contract": {
+    "decision_schema_version": "c51-performance-rank-decisions-v2",
+    "required_key_fields": [
+      "refinement",
+      "scalar_observation_count",
+      "alpha",
+      "relative_tolerance",
+      "observation_design_id",
+      "physical_qoi_design_id"
+    ],
+    "required_qualifications": [
+      "spectral_low_rank.pre_registered_2pct_sensitivity",
+      "spectral_low_rank.heldout_validated",
+      "exact_constrained.perf0_same_law_validated",
+      "exact_observation_gp.perf0_same_law_validated",
+      "whitney_compact.measured_accuracy_context",
+      "whitney_compact_calibrated.physical_rms_calibrated_heldout_validated",
+      "common_h_g_fixture_sha256"
+    ],
+    "timing_basis_source": "partial_exact_requested_mixed_shell",
+    "shared_maximum_basis_timing_eligible": false,
+    "note": "The raw and calibrated projected models use identical H/G maps. The calibration fits one prior amplitude scalar on the selection bank before conditioning; the independent held-out bank is used only for validation."
+  }
+}

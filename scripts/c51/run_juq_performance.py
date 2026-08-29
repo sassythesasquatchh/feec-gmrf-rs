@@ -34,6 +34,9 @@ RANK_DECISION_SCHEMA_VERSION = "c51-performance-rank-decisions-v2"
 COMPACT_PROFILE_NAME = "juq-performance-v1"
 EXACT_PROFILE_NAME = "juq-exact-performance-v1"
 EXACT_PROJECTED_PROFILE_NAME = "juq-exact-projected-performance-v1"
+EXACT_CALIBRATED_PROJECTED_PROFILE_NAME = (
+    "juq-exact-calibrated-projected-performance-v1"
+)
 DEFAULT_PROFILE = pathlib.Path(__file__).with_name("juq-performance-v1.json")
 DEFAULT_RANK_DECISIONS = pathlib.Path(__file__).with_name(
     "juq-performance-v1-rank-decisions.template.json"
@@ -101,6 +104,15 @@ EXACT_PROJECTED_EXPECTED_AXES = EXACT_EXPECTED_AXES | {
         "spectral_low_rank",
     ],
 }
+EXACT_CALIBRATED_PROJECTED_EXPECTED_AXES = EXACT_EXPECTED_AXES | {
+    "methods": [
+        "fm_aug",
+        "whitney_compact",
+        "whitney_compact_calibrated",
+        "exact_observation_gp",
+        "spectral_low_rank",
+    ],
+}
 EXACT_EXPECTED_EVIDENCE_TIERS = [
     {
         "id": "claim_primary_exact",
@@ -118,6 +130,12 @@ EXACT_PROJECTED_EXPECTED_EVIDENCE_TIERS = [
         "role": "claim_bearing_exact_time_throughput_with_projected_accuracy_resource_context"
     }
 ]
+EXACT_CALIBRATED_PROJECTED_EXPECTED_EVIDENCE_TIERS = [
+    EXACT_EXPECTED_EVIDENCE_TIERS[0]
+    | {
+        "role": "claim_bearing_exact_time_throughput_with_raw_and_physically_calibrated_projected_context"
+    }
+]
 PROFILE_CONTRACTS = {
     COMPACT_PROFILE_NAME: (COMPACT_EXPECTED_AXES, COMPACT_EXPECTED_EVIDENCE_TIERS),
     EXACT_PROFILE_NAME: (EXACT_EXPECTED_AXES, EXACT_EXPECTED_EVIDENCE_TIERS),
@@ -125,8 +143,16 @@ PROFILE_CONTRACTS = {
         EXACT_PROJECTED_EXPECTED_AXES,
         EXACT_PROJECTED_EXPECTED_EVIDENCE_TIERS,
     ),
+    EXACT_CALIBRATED_PROJECTED_PROFILE_NAME: (
+        EXACT_CALIBRATED_PROJECTED_EXPECTED_AXES,
+        EXACT_CALIBRATED_PROJECTED_EXPECTED_EVIDENCE_TIERS,
+    ),
 }
-EXACT_LIKE_PROFILE_NAMES = {EXACT_PROFILE_NAME, EXACT_PROJECTED_PROFILE_NAME}
+EXACT_LIKE_PROFILE_NAMES = {
+    EXACT_PROFILE_NAME,
+    EXACT_PROJECTED_PROFILE_NAME,
+    EXACT_CALIBRATED_PROJECTED_PROFILE_NAME,
+}
 # Backward-compatible names used by the compact-v1 tests and downstream
 # validation code. New code resolves its contract from the profile payload.
 PROFILE_NAME = COMPACT_PROFILE_NAME
@@ -172,6 +198,7 @@ PAIR_KEY_FIELDS = (
     "alpha",
     "kappa",
     "tau",
+    "amplitude_calibration_policy",
     "observation_class",
     "sensor_count",
     "sensor_density",
@@ -201,6 +228,7 @@ class CampaignCell:
     method: str
     workload_phase: str
     spectral_rank: int | None
+    projected_calibration_target_prior_rms: float | None
     rank_decision_id: str | None
     cell_id: str
 
@@ -433,7 +461,10 @@ def load_rank_decisions(
                 raise ValueError(f"rank decision {index} compact method lacks identical H/G maps")
             if compact.get("method_performance_timing_eligible") is not False:
                 raise ValueError(f"rank decision {index} compact accuracy row is timing eligible")
-        elif profile_name == EXACT_PROJECTED_PROFILE_NAME:
+        elif profile_name in (
+            EXACT_PROJECTED_PROFILE_NAME,
+            EXACT_CALIBRATED_PROJECTED_PROFILE_NAME,
+        ):
             try:
                 compact = decision["whitney_compact"]
                 compact_error = float(compact["heldout_relative_error"])
@@ -470,6 +501,64 @@ def load_rank_decisions(
                 raise ValueError(
                     f"rank decision {index} projected-Whitney accuracy row is timing eligible"
                 )
+            if profile_name == EXACT_CALIBRATED_PROJECTED_PROFILE_NAME:
+                try:
+                    calibrated = decision["whitney_compact_calibrated"]
+                    calibrated_error = float(calibrated["heldout_relative_error"])
+                    calibrated_selection_error = float(
+                        calibrated["selection_relative_error"]
+                    )
+                    calibration = calibrated["amplitude_calibration"]
+                    target_prior_rms = float(calibration["target_prior_rms"])
+                    uncalibrated_prior_rms = float(
+                        calibration["uncalibrated_prior_rms"]
+                    )
+                    precision_scale = float(calibration["precision_scale"])
+                    tau_multiplier = float(calibration["tau_multiplier"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise ValueError(
+                        f"rank decision {index} lacks calibrated projected qualifications: {error}"
+                    ) from error
+                if calibrated.get("validation_status") != (
+                    "physical_rms_calibrated_heldout_validated"
+                ):
+                    raise ValueError(
+                        f"rank decision {index} calibrated projected method is not held-out validated"
+                    )
+                if (
+                    not 0.0 <= calibrated_error <= key[3]
+                    or not 0.0 <= calibrated_selection_error <= key[3]
+                    or target_prior_rms <= 0.0
+                    or uncalibrated_prior_rms <= 0.0
+                    or precision_scale <= 0.0
+                    or tau_multiplier <= 0.0
+                    or abs(tau_multiplier * tau_multiplier - precision_scale)
+                    > 1.0e-12 * precision_scale
+                    or calibration.get("stage") != "prior_before_conditioning"
+                    or calibration.get("parameter_changed") != "tau_only"
+                    or calibration.get("calibration_bank") != "selection"
+                    or calibration.get("evaluation_bank") != "held_out"
+                    or calibration.get("heldout_used_for_calibration") is not False
+                ):
+                    raise ValueError(
+                        f"rank decision {index} has an invalid or leaking projected calibration"
+                    )
+                calibrated_hash = require_sha256(
+                    calibrated.get("accuracy_artifact_sha256", ""),
+                    f"rank decision {index} calibrated projected accuracy artifact",
+                )
+                if calibrated_hash != common_hash:
+                    raise ValueError(
+                        f"rank decision {index} does not bind calibrated projected and spectral accuracy"
+                    )
+                if calibrated.get("identical_observation_and_output_maps") is not True:
+                    raise ValueError(
+                        f"rank decision {index} calibrated projected method lacks identical H/G maps"
+                    )
+                if calibrated.get("method_performance_timing_eligible") is not False:
+                    raise ValueError(
+                        f"rank decision {index} calibrated projected accuracy row is timing eligible"
+                    )
         if profile_name in EXACT_LIKE_PROFILE_NAMES:
             try:
                 exact_constrained = decision["exact_constrained"]
@@ -617,6 +706,13 @@ def generate_cells(
                         if method == "spectral_low_rank"
                         else None
                     )
+                    projected_calibration_target_prior_rms = None
+                    if method == "whitney_compact_calibrated":
+                        projected_calibration_target_prior_rms = float(
+                            decision["whitney_compact_calibrated"][
+                                "amplitude_calibration"
+                            ]["target_prior_rms"]
+                        )
                     decision_id = str(decision["decision_id"])
                     phase_label = "setup" if phase == "cold_setup" else "physicaluq"
                     cell_id = (
@@ -638,6 +734,7 @@ def generate_cells(
                             method,
                             phase,
                             spectral_rank,
+                            projected_calibration_target_prior_rms,
                             decision_id,
                             cell_id,
                         )
@@ -686,6 +783,17 @@ def cell_command(
         if cell.spectral_rank is None:
             raise ValueError(f"spectral cell {cell.cell_id} has no frozen 5 percent rank")
         command.extend(["--spectral-rank", str(cell.spectral_rank)])
+    if cell.method == "whitney_compact_calibrated":
+        if cell.projected_calibration_target_prior_rms is None:
+            raise ValueError(
+                f"calibrated projected cell {cell.cell_id} has no frozen target prior RMS"
+            )
+        command.extend(
+            [
+                "--projected-calibration-target-prior-rms",
+                str(cell.projected_calibration_target_prior_rms),
+            ]
+        )
     return command
 
 

@@ -223,6 +223,85 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
             "fixed_tau_accuracy_unmatched_pareto_context_not_a_claim_clearing_comparator",
         )
 
+    def test_calibrated_projected_profile_freezes_nonleaking_prior_scale(self):
+        profile = campaign.read_json(
+            SCRIPT_DIR / "juq-exact-calibrated-projected-performance-v1.json"
+        )
+        campaign.validate_profile(profile)
+        decisions = []
+        for refinement in (8, 10):
+            one = self.decision(refinement, 4096)
+            one["spectral_low_rank"].update(
+                {
+                    "qualification_rule": "pre_registered_2pct_sensitivity",
+                    "rank_selection_tolerance": 0.02,
+                }
+            )
+            one["exact_constrained"] = {
+                "validation_status": "perf0_same_law_validated",
+                "fixture_id": "PERF-0",
+                "fixture_artifact_sha256": "d" * 64,
+            }
+            one["whitney_compact"].update(
+                {
+                    "validation_status": "measured_accuracy_context",
+                    "selection_relative_error": 0.13,
+                    "heldout_relative_error": 0.19,
+                    "fixed_tau_unnormalized": True,
+                }
+            )
+            one["whitney_compact_calibrated"] = {
+                "validation_status": "physical_rms_calibrated_heldout_validated",
+                "selection_relative_error": 0.03,
+                "heldout_relative_error": 0.04,
+                "amplitude_calibration": {
+                    "stage": "prior_before_conditioning",
+                    "parameter_changed": "tau_only",
+                    "calibration_bank": "selection",
+                    "evaluation_bank": "held_out",
+                    "heldout_used_for_calibration": False,
+                    "target_prior_rms": 0.5,
+                    "uncalibrated_prior_rms": 0.4,
+                    "precision_scale": 0.64,
+                    "tau_multiplier": 0.8,
+                },
+                "accuracy_artifact_sha256": "a" * 64,
+                "identical_observation_and_output_maps": True,
+                "method_performance_timing_eligible": False,
+            }
+            decisions.append(one)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary) / "calibrated-decisions.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": campaign.RANK_DECISION_SCHEMA_VERSION,
+                        "profile": campaign.EXACT_CALIBRATED_PROJECTED_PROFILE_NAME,
+                        "status": "frozen_heldout_validated",
+                        "decisions": decisions,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            indexed, _ = campaign.load_rank_decisions(path, profile)
+        cells = campaign.generate_cells(profile, indexed)
+        self.assertEqual(len(cells), 160)
+        calibrated = next(
+            cell for cell in cells if cell.method == "whitney_compact_calibrated"
+        )
+        self.assertEqual(calibrated.projected_calibration_target_prior_rms, 0.5)
+        command = campaign.cell_command(
+            calibrated,
+            pathlib.Path("/repo"),
+            pathlib.Path("/out"),
+            campaign.DEFAULT_RUNNER,
+            profile,
+        )
+        self.assertEqual(
+            command[command.index("--projected-calibration-target-prior-rms") + 1],
+            "0.5",
+        )
+
     def test_selected_primary_tier_requires_only_its_two_rank_decisions(self):
         decisions = {
             campaign.rank_key(refinement, 2048, self.profile): self.decision(
@@ -432,6 +511,7 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
             "replacement_data_count": 100,
             "method": "spectral_low_rank",
             "spectral_rank": 256,
+            "projected_calibration_target_prior_rms": None,
             "rank_decision_id": "test",
         }
         setup = campaign.CampaignCell(

@@ -15,6 +15,7 @@ import csv
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 import pathlib
 import platform
@@ -44,21 +45,25 @@ THREAD_ENV_NAMES = (
 )
 EXACT_PROFILE = "juq-exact-performance-v1"
 EXACT_PROJECTED_PROFILE = "juq-exact-projected-performance-v1"
+EXACT_CALIBRATED_PROJECTED_PROFILE = "juq-exact-calibrated-projected-performance-v1"
 SUPPORTED_PROFILES = (
     "smoke",
     "juq-performance-v1",
     EXACT_PROFILE,
     EXACT_PROJECTED_PROFILE,
+    EXACT_CALIBRATED_PROJECTED_PROFILE,
 )
 PUBLICATION_PROFILES = (
     "juq-performance-v1",
     EXACT_PROFILE,
     EXACT_PROJECTED_PROFILE,
+    EXACT_CALIBRATED_PROJECTED_PROFILE,
 )
 RESOURCE_METHODS = (
     "fm_direct",
     "fm_aug",
     "whitney_compact",
+    "whitney_compact_calibrated",
     "exact_observation_gp",
     "spectral_full_rank",
     "spectral_low_rank",
@@ -86,6 +91,13 @@ JUQ_EXACT_PERFORMANCE_METHODS = (
 JUQ_EXACT_PROJECTED_PERFORMANCE_METHODS = (
     "fm_aug",
     "whitney_compact",
+    "exact_observation_gp",
+    "spectral_low_rank",
+)
+JUQ_EXACT_CALIBRATED_PROJECTED_PERFORMANCE_METHODS = (
+    "fm_aug",
+    "whitney_compact",
+    "whitney_compact_calibrated",
     "exact_observation_gp",
     "spectral_low_rank",
 )
@@ -736,6 +748,7 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
             args.sensor_density,
             args.repeated_data,
             args.spectral_rank,
+            args.projected_calibration_target_prior_rms,
             args.workload_phase,
         )
         if any(value is not None for value in resource_values):
@@ -769,6 +782,21 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
             raise ValueError("spectral_low_rank requires a positive --spectral-rank")
     elif args.spectral_rank is not None:
         raise ValueError("only spectral_low_rank accepts --spectral-rank")
+    if args.resource_method == "whitney_compact_calibrated":
+        if (
+            args.projected_calibration_target_prior_rms is None
+            or not math.isfinite(args.projected_calibration_target_prior_rms)
+            or args.projected_calibration_target_prior_rms <= 0.0
+        ):
+            raise ValueError(
+                "whitney_compact_calibrated requires a positive "
+                "--projected-calibration-target-prior-rms"
+            )
+    elif args.projected_calibration_target_prior_rms is not None:
+        raise ValueError(
+            "only whitney_compact_calibrated accepts "
+            "--projected-calibration-target-prior-rms"
+        )
     selection = {
         "method": args.resource_method,
         "refinement": args.refinement,
@@ -779,6 +807,9 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
         ),
         "repeated_data_count": args.repeated_data,
         "spectral_rank": args.spectral_rank,
+        "projected_calibration_target_prior_rms": (
+            args.projected_calibration_target_prior_rms
+        ),
         "workload_phase": args.workload_phase,
     }
     if args.profile in PUBLICATION_PROFILES:
@@ -791,7 +822,11 @@ def validate_publication_peak_rss_mode(profile: str, cgroup_mode: str) -> None:
         raise ValueError(
             "juq-performance-v1 requires --cgroup-mode required for process-tree RSS"
         )
-    if profile in (EXACT_PROFILE, EXACT_PROJECTED_PROFILE) and cgroup_mode == "off":
+    if profile in (
+        EXACT_PROFILE,
+        EXACT_PROJECTED_PROFILE,
+        EXACT_CALIBRATED_PROJECTED_PROFILE,
+    ) and cgroup_mode == "off":
         raise ValueError(
             f"{profile} requires automatic external peak-RSS measurement"
         )
@@ -825,6 +860,8 @@ def validate_juq_performance_selection(
         methods = JUQ_EXACT_PERFORMANCE_METHODS
     elif profile == EXACT_PROJECTED_PROFILE:
         methods = JUQ_EXACT_PROJECTED_PERFORMANCE_METHODS
+    elif profile == EXACT_CALIBRATED_PROJECTED_PROFILE:
+        methods = JUQ_EXACT_CALIBRATED_PROJECTED_PERFORMANCE_METHODS
     else:
         methods = JUQ_PERFORMANCE_METHODS
     if selection["method"] not in methods:
@@ -845,7 +882,7 @@ def scientific_command(
 ) -> list[str]:
     if selection is None:
         return [str(binary), profile, str(study_output)]
-    return [
+    command = [
         str(binary),
         "resource",
         profile,
@@ -859,6 +896,9 @@ def scientific_command(
         "none" if selection["spectral_rank"] is None else str(selection["spectral_rank"]),
         str(selection["workload_phase"]),
     ]
+    if selection["projected_calibration_target_prior_rms"] is not None:
+        command.append(str(selection["projected_calibration_target_prior_rms"]))
+    return command
 
 
 def resource_scope(
@@ -1061,6 +1101,33 @@ def performance_ineligibility_reasons(
         reasons.append("row does not use the frozen 18-output physical-QoI design")
     if row.get("physical_qoi_output_count") != "18":
         reasons.append("row does not certify all 18 physical-QoI outputs")
+    if selection["method"] == "whitney_compact_calibrated":
+        if row.get("amplitude_calibration_policy") != (
+            "exact_feec_prior_selection_bank_physical_rms_before_conditioning"
+        ):
+            reasons.append("projected method lacks the frozen prior calibration policy")
+        expected_target = selection["projected_calibration_target_prior_rms"]
+        try:
+            actual_target = float(
+                row.get("amplitude_calibration_target_prior_rms_value", "")
+            )
+        except ValueError:
+            actual_target = float("nan")
+        if (
+            row.get("amplitude_calibration_target_prior_rms_status") != "measured"
+            or not math.isfinite(actual_target)
+            or abs(actual_target - expected_target)
+            > 1.0e-12 * expected_target
+        ):
+            reasons.append("projected calibration target does not match the frozen decision")
+        for prefix in (
+            "amplitude_calibration_uncalibrated_prior_rms",
+            "amplitude_calibration_precision_scale",
+            "amplitude_calibration_tau_multiplier",
+            "amplitude_calibration_ns",
+        ):
+            if row.get(f"{prefix}_status") != "measured":
+                reasons.append(f"{prefix} is not measured")
     if selection["method"] == "spectral_low_rank":
         selected_rank = str(selection["spectral_rank"])
         if row.get("spectral_basis_source") != "partial_exact_requested_mixed_shell":
@@ -1431,6 +1498,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     sensor_group.add_argument("--sensor-density", type=float)
     parser.add_argument("--repeated-data", type=int)
     parser.add_argument("--spectral-rank", type=int)
+    parser.add_argument("--projected-calibration-target-prior-rms", type=float)
     parser.add_argument("--workload-phase", choices=WORKLOAD_PHASES)
     parser.add_argument(
         "--cgroup-mode",

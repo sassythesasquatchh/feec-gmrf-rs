@@ -431,6 +431,17 @@ pub struct PhysicalRmsCalibration {
     pub precision_scale: f64,
 }
 
+impl PhysicalRmsCalibration {
+    /// Scalar multiplying the Matérn amplitude parameter `tau`.
+    ///
+    /// Matérn precision is proportional to `tau^2`, so this is the positive
+    /// square root of [`Self::precision_scale`]. The correlation structure is
+    /// unchanged by this calibration.
+    pub fn tau_multiplier(self) -> f64 {
+        self.precision_scale.sqrt()
+    }
+}
+
 /// Scale a prior so the mean marginal variance of `physical_map * x` is
 /// `target_rms^2`.
 ///
@@ -695,6 +706,7 @@ mod tests {
         let (calibrated, report) = calibrate_prior_to_physical_rms(&prior, &map, 0.5).unwrap();
         assert!((report.uncalibrated_rms - 2.0).abs() < 1e-12);
         assert!((report.precision_scale - 16.0).abs() < 1e-12);
+        assert!((report.tau_multiplier() - 4.0).abs() < 1e-12);
         assert_eq!(calibrated.precision(), &SparseMat::diagonal(2, 16.0));
     }
 

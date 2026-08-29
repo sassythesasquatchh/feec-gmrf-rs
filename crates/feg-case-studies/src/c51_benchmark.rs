@@ -21,11 +21,12 @@ use crate::c51_magnetic_sensor_design::{
 };
 use common::linalg::nalgebra::CsrMatrix as FeecCsrMatrix;
 use feec_gmrf::prelude::{
-    CholeskyOrderingKind, EssentialBoundaryConditions, EssentialBoundaryElimination,
-    ExactFormOperators, ExactMaternPriorBuilder, ExactObservationCovarianceBlocks,
-    ExactObservationCovarianceProvenance, ExactObservationPosterior, FeecGmrfError, GaussianNoise,
-    GaussianPrior, LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d,
-    MaternAlpha, MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
+    calibrate_prior_to_physical_rms, CholeskyOrderingKind, EssentialBoundaryConditions,
+    EssentialBoundaryElimination, ExactFormOperators, ExactMaternPriorBuilder,
+    ExactObservationCovarianceBlocks, ExactObservationCovarianceProvenance,
+    ExactObservationPosterior, FeecGmrfError, GaussianNoise, GaussianPrior,
+    LinearGaussianModelBuilder, LinearMap, LinearObservation, MagneticFieldMaps3d, MaternAlpha,
+    MaternParameters, MaternPriorBuilder, ResourceMeasurement, Result, SparseMat,
     SupportedMaternPrior, SupportedMaternPriorBuilder, VarianceMethod,
 };
 #[cfg(feature = "external-solvers")]
@@ -52,7 +53,9 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v6";
+const C51_CALIBRATION_SELECTION_OUTPUT_COUNT: usize = 9;
+
+pub const C51_SCHEMA_VERSION: &str = "c51-accuracy-resource-v7";
 pub const C51_RESOURCE_SCHEMA_VERSION: &str = "c51-method-resource-v4";
 pub const C51_STUDY_ID: &str = "c51/accuracy-resource";
 
@@ -140,6 +143,7 @@ pub enum C51MethodId {
     FullMetricDirect,
     FullMetricAugmented,
     WhitneyCompact,
+    WhitneyCompactCalibrated,
     ExactObservationSpaceGp,
     SpectralFullRank,
     SpectralLowRank,
@@ -151,6 +155,7 @@ impl C51MethodId {
             Self::FullMetricDirect => "fm_direct",
             Self::FullMetricAugmented => "fm_aug",
             Self::WhitneyCompact => "whitney_compact",
+            Self::WhitneyCompactCalibrated => "whitney_compact_calibrated",
             Self::ExactObservationSpaceGp => "exact_observation_gp",
             Self::SpectralFullRank => "spectral_full_rank",
             Self::SpectralLowRank => "spectral_low_rank",
@@ -346,6 +351,9 @@ pub struct C51ResourceConfig {
     pub spectral_operator_materialization_maximum_dimension: usize,
     pub posterior_sample_count: usize,
     pub seed: u64,
+    /// Frozen exact-FEEC prior RMS on the nine-output selection bank. Required
+    /// only by the physically calibrated projected-Whitney resource method.
+    pub projected_calibration_target_prior_rms: Option<f64>,
 }
 
 impl C51ResourceConfig {
@@ -369,6 +377,7 @@ impl C51ResourceConfig {
                 .spectral_operator_materialization_maximum_dimension,
             posterior_sample_count: smoke.posterior_sample_count,
             seed: smoke.seed,
+            projected_calibration_target_prior_rms: None,
         }
     }
 
@@ -396,6 +405,7 @@ impl C51ResourceConfig {
                 .spectral_operator_materialization_maximum_dimension,
             posterior_sample_count: performance.posterior_sample_count,
             seed: performance.seed,
+            projected_calibration_target_prior_rms: None,
         }
     }
 
@@ -435,6 +445,26 @@ impl C51ResourceConfig {
 
     fn validate(&self) -> Result<()> {
         self.selection.validate()?;
+        match (
+            self.selection.method,
+            self.projected_calibration_target_prior_rms,
+        ) {
+            (C51MethodId::WhitneyCompactCalibrated, Some(value))
+                if value.is_finite() && value > 0.0 => {}
+            (C51MethodId::WhitneyCompactCalibrated, _) => {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "the calibrated projected-Whitney method requires a positive finite frozen target prior RMS"
+                        .to_string(),
+                ));
+            }
+            (_, None) => {}
+            (_, Some(_)) => {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "a projected calibration target is valid only for the calibrated projected-Whitney method"
+                        .to_string(),
+                ));
+            }
+        }
         if self.selection.method == C51MethodId::ExactObservationSpaceGp
             && self.selection.observation_class != C51ObservationClass::LocalPhysicalB
         {
@@ -868,6 +898,12 @@ pub struct C51BenchmarkRow {
     pub alpha: u32,
     pub kappa: f64,
     pub tau: f64,
+    pub amplitude_calibration_policy: String,
+    pub amplitude_calibration_target_prior_rms: C51Measurement<f64>,
+    pub amplitude_calibration_uncalibrated_prior_rms: C51Measurement<f64>,
+    pub amplitude_calibration_precision_scale: C51Measurement<f64>,
+    pub amplitude_calibration_tau_multiplier: C51Measurement<f64>,
+    pub amplitude_calibration_ns: C51Measurement<u128>,
     pub observation_class: C51ObservationClass,
     /// Immutable geometry/design identifier for the observation rows.
     pub observation_design_id: String,
@@ -1502,6 +1538,43 @@ impl C51ResourceArchive {
                     .to_string(),
             ));
         }
+        if selection.method == C51MethodId::WhitneyCompactCalibrated {
+            let measured = |measurement: &C51Measurement<f64>| matches!(measurement, C51Measurement::Measured(value) if value.is_finite() && *value > 0.0);
+            if self.row.amplitude_calibration_policy
+                != "exact_feec_prior_selection_bank_physical_rms_before_conditioning"
+                || !measured(&self.row.amplitude_calibration_target_prior_rms)
+                || !measured(&self.row.amplitude_calibration_uncalibrated_prior_rms)
+                || !measured(&self.row.amplitude_calibration_precision_scale)
+                || !measured(&self.row.amplitude_calibration_tau_multiplier)
+                || !matches!(&self.row.amplitude_calibration_ns, C51Measurement::Measured(value) if *value > 0)
+            {
+                return Err(FeecGmrfError::InvalidParameter(
+                    "C51 calibrated projected resource row is missing prior calibration provenance"
+                        .to_string(),
+                ));
+            }
+            if let (C51Measurement::Measured(scale), C51Measurement::Measured(tau_multiplier)) = (
+                &self.row.amplitude_calibration_precision_scale,
+                &self.row.amplitude_calibration_tau_multiplier,
+            ) {
+                if (tau_multiplier.powi(2) - *scale).abs() > 1.0e-12 * *scale {
+                    return Err(FeecGmrfError::InvalidParameter(
+                        "C51 calibrated projected precision and tau scales disagree".to_string(),
+                    ));
+                }
+            }
+        } else if self.row.amplitude_calibration_policy != "none"
+            || self.row.amplitude_calibration_target_prior_rms != C51Measurement::NotRecorded
+            || self.row.amplitude_calibration_uncalibrated_prior_rms != C51Measurement::NotRecorded
+            || self.row.amplitude_calibration_precision_scale != C51Measurement::NotRecorded
+            || self.row.amplitude_calibration_tau_multiplier != C51Measurement::NotRecorded
+            || self.row.amplitude_calibration_ns != C51Measurement::NotRecorded
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "an uncalibrated C51 resource row contains amplitude calibration metadata"
+                    .to_string(),
+            ));
+        }
         if selection.method == C51MethodId::ExactObservationSpaceGp
             && (!matches!(
                 self.row.exact_gp_dense_factor_dimension,
@@ -1656,6 +1729,20 @@ impl C51ResourceArchive {
             Some(rank) => writeln!(writer, "  spectral_rank: {rank}")?,
             None => writeln!(writer, "  spectral_rank: null")?,
         }
+        writeln!(writer, "amplitude_calibration:")?;
+        writeln!(
+            writer,
+            "  policy: {}",
+            yaml_scalar(&self.row.amplitude_calibration_policy)
+        )?;
+        match self.config.projected_calibration_target_prior_rms {
+            Some(value) => writeln!(writer, "  frozen_target_prior_rms: {value:.17e}")?,
+            None => writeln!(writer, "  frozen_target_prior_rms: null")?,
+        }
+        writeln!(writer, "  stage: prior_before_conditioning")?;
+        writeln!(writer, "  calibration_bank: selection")?;
+        writeln!(writer, "  held_out_used_for_calibration: false")?;
+        writeln!(writer, "  cost_included_in_prior_build_ns: true")?;
         writeln!(
             writer,
             "accuracy_status: {}",
@@ -1837,8 +1924,15 @@ pub fn run_c51_resource(
     config.validate()?;
     let benchmark = config.benchmark_config();
     let selection = &config.selection;
-    if selection.method == C51MethodId::WhitneyCompact {
-        let mut row = run_isolated_compact_resource(&benchmark, selection)?;
+    if matches!(
+        selection.method,
+        C51MethodId::WhitneyCompact | C51MethodId::WhitneyCompactCalibrated
+    ) {
+        let mut row = run_isolated_compact_resource(
+            &benchmark,
+            selection,
+            config.projected_calibration_target_prior_rms,
+        )?;
         mark_resource_accuracy_unavailable(&mut row);
         let archive = C51ResourceArchive {
             metadata,
@@ -1875,7 +1969,9 @@ pub fn run_c51_resource(
                 selection,
             )?
         }
-        C51MethodId::WhitneyCompact => unreachable!("handled by isolated compact route"),
+        C51MethodId::WhitneyCompact | C51MethodId::WhitneyCompactCalibrated => {
+            unreachable!("handled by isolated compact route")
+        }
         C51MethodId::FullMetricAugmented => {
             let (prior, prior_build) = build_supported_prior(&assembled.operators, parameters)?;
             run_selected_supported_resource(
@@ -2885,6 +2981,7 @@ fn spectral_low_ranks(config: &C51BenchmarkConfig, full_rank: usize) -> Vec<usiz
 fn run_isolated_compact_resource(
     config: &C51BenchmarkConfig,
     selection: &C51ResourceSelection,
+    calibration_target_prior_rms: Option<f64>,
 ) -> Result<C51BenchmarkRow> {
     let mesh_start = Instant::now();
     let mesh = CartesianMeshInfo::new_unit_scaled(3, selection.refinement, 1.0);
@@ -2892,8 +2989,8 @@ fn run_isolated_compact_resource(
     let metric = coordinates.to_edge_lengths(&topology);
     let mesh_assembly = mesh_start.elapsed();
     let parameters = MaternParameters::new(config.alpha, config.kappa, config.tau)?;
-    let (prior, prior_build) = build_compact_prior(config, &topology, &metric, parameters)?;
-    let elimination = prior.boundary_elimination().ok_or_else(|| {
+    let (raw_prior, raw_prior_build) = build_compact_prior(config, &topology, &metric, parameters)?;
+    let elimination = raw_prior.boundary_elimination().ok_or_else(|| {
         FeecGmrfError::Inference(
             "C51 compact resource prior is missing its boundary elimination".to_string(),
         )
@@ -2904,7 +3001,7 @@ fn run_isolated_compact_resource(
         &topology,
         &coordinates,
         elimination,
-        prior.dimension(),
+        raw_prior.dimension(),
     )?;
     let feec_assembly = mesh_assembly + maps_start.elapsed();
     let matching = designs
@@ -2917,8 +3014,35 @@ fn run_isolated_compact_resource(
             matching.len()
         )));
     };
-    run_selected_spd_resource(
-        C51MethodId::WhitneyCompact,
+    let (prior, prior_build, calibration) = match selection.method {
+        C51MethodId::WhitneyCompact => (raw_prior, raw_prior_build, None),
+        C51MethodId::WhitneyCompactCalibrated => {
+            let target_rms = calibration_target_prior_rms.ok_or_else(|| {
+                FeecGmrfError::InvalidParameter(
+                    "C51 calibrated projected prior is missing its frozen target RMS".to_string(),
+                )
+            })?;
+            if problem.physical_qoi.output_dimension() != 2 * C51_CALIBRATION_SELECTION_OUTPUT_COUNT
+            {
+                return Err(FeecGmrfError::Dimension(format!(
+                    "C51 calibrated output bank has {} rows instead of {}",
+                    problem.physical_qoi.output_dimension(),
+                    2 * C51_CALIBRATION_SELECTION_OUTPUT_COUNT
+                )));
+            }
+            let calibration_map = problem
+                .physical_qoi
+                .select_outputs(&(0..C51_CALIBRATION_SELECTION_OUTPUT_COUNT).collect::<Vec<_>>())?;
+            let start = Instant::now();
+            let (prior, report) =
+                calibrate_prior_to_physical_rms(&raw_prior, &calibration_map, target_rms)?;
+            let elapsed = start.elapsed();
+            (prior, raw_prior_build + elapsed, Some((report, elapsed)))
+        }
+        _ => unreachable!("isolated compact route accepts only projected methods"),
+    };
+    let mut row = run_selected_spd_resource(
+        selection.method,
         &prior,
         prior_build,
         feec_assembly,
@@ -2926,7 +3050,20 @@ fn run_isolated_compact_resource(
         design,
         &problem,
         selection,
-    )
+    )?;
+    if let Some((report, elapsed)) = calibration {
+        row.amplitude_calibration_policy =
+            "exact_feec_prior_selection_bank_physical_rms_before_conditioning".to_string();
+        row.amplitude_calibration_target_prior_rms = C51Measurement::Measured(report.target_rms);
+        row.amplitude_calibration_uncalibrated_prior_rms =
+            C51Measurement::Measured(report.uncalibrated_rms);
+        row.amplitude_calibration_precision_scale =
+            C51Measurement::Measured(report.precision_scale);
+        row.amplitude_calibration_tau_multiplier =
+            C51Measurement::Measured(report.tau_multiplier());
+        row.amplitude_calibration_ns = duration_measurement(elapsed);
+    }
+    Ok(row)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2951,6 +3088,9 @@ fn base_resource_row(
             | C51MethodId::ExactObservationSpaceGp
             | C51MethodId::SpectralFullRank => "exact_full_metric_whitney",
             C51MethodId::WhitneyCompact => "projected_inverse_whitney",
+            C51MethodId::WhitneyCompactCalibrated => {
+                "projected_inverse_whitney_physical_rms_calibrated"
+            }
             C51MethodId::SpectralLowRank => "truncated_exact_full_metric_whitney_spectral",
         }
         .to_string(),
@@ -2961,7 +3101,7 @@ fn base_resource_row(
                 | C51MethodId::ExactObservationSpaceGp
                 | C51MethodId::SpectralFullRank
         ),
-        matched_physical_qoi_eligible: false,
+        matched_physical_qoi_eligible: method == C51MethodId::WhitneyCompactCalibrated,
         common_physical_uq_workload_eligible: matches!(
             selection.phase,
             C51ResourcePhase::ColdSetup | C51ResourcePhase::QueryPhysicalUq
@@ -2989,6 +3129,12 @@ fn base_resource_row(
         alpha: config.alpha.as_u32(),
         kappa: config.kappa,
         tau: config.tau,
+        amplitude_calibration_policy: "none".to_string(),
+        amplitude_calibration_target_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_uncalibrated_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_precision_scale: C51Measurement::NotRecorded,
+        amplitude_calibration_tau_multiplier: C51Measurement::NotRecorded,
+        amplitude_calibration_ns: C51Measurement::NotRecorded,
         observation_class: design.class,
         observation_design_id: design.design_id.clone(),
         observation_fixed_radius: design.fixed_radius.clone(),
@@ -3621,6 +3767,12 @@ fn run_spd_method(
         alpha: config.alpha.as_u32(),
         kappa: config.kappa,
         tau: config.tau,
+        amplitude_calibration_policy: "none".to_string(),
+        amplitude_calibration_target_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_uncalibrated_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_precision_scale: C51Measurement::NotRecorded,
+        amplitude_calibration_tau_multiplier: C51Measurement::NotRecorded,
+        amplitude_calibration_ns: C51Measurement::NotRecorded,
         observation_class: design.class,
         observation_design_id: design.design_id.clone(),
         observation_fixed_radius: design.fixed_radius.clone(),
@@ -3827,6 +3979,12 @@ fn run_supported_method(
         alpha: config.alpha.as_u32(),
         kappa: config.kappa,
         tau: config.tau,
+        amplitude_calibration_policy: "none".to_string(),
+        amplitude_calibration_target_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_uncalibrated_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_precision_scale: C51Measurement::NotRecorded,
+        amplitude_calibration_tau_multiplier: C51Measurement::NotRecorded,
+        amplitude_calibration_ns: C51Measurement::NotRecorded,
         observation_class: design.class,
         observation_design_id: design.design_id.clone(),
         observation_fixed_radius: design.fixed_radius.clone(),
@@ -4315,6 +4473,12 @@ fn run_spectral_method(
         alpha: config.alpha.as_u32(),
         kappa: config.kappa,
         tau: config.tau,
+        amplitude_calibration_policy: "none".to_string(),
+        amplitude_calibration_target_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_uncalibrated_prior_rms: C51Measurement::NotRecorded,
+        amplitude_calibration_precision_scale: C51Measurement::NotRecorded,
+        amplitude_calibration_tau_multiplier: C51Measurement::NotRecorded,
+        amplitude_calibration_ns: C51Measurement::NotRecorded,
         observation_class: design.class,
         observation_design_id: design.design_id.clone(),
         observation_fixed_radius: design.fixed_radius.clone(),
@@ -4800,6 +4964,7 @@ fn method_seed(method: C51MethodId) -> u64 {
         C51MethodId::FullMetricDirect => 0xD1CE_C700,
         C51MethodId::FullMetricAugmented => 0xA090_0000,
         C51MethodId::WhitneyCompact => 0xC0A0_AC70,
+        C51MethodId::WhitneyCompactCalibrated => 0xCA1B_AA7E,
         C51MethodId::ExactObservationSpaceGp => 0xEAC7_600D,
         C51MethodId::SpectralFullRank => 0x5EEC_F011,
         C51MethodId::SpectralLowRank => 0x5EEC_10A0,
@@ -4893,6 +5058,7 @@ fn csv_header() -> String {
         "alpha",
         "kappa",
         "tau",
+        "amplitude_calibration_policy",
         "observation_class",
         "observation_design_id",
         "physical_qoi_design_id",
@@ -4929,13 +5095,18 @@ fn csv_header() -> String {
         .join(",")
 }
 
-fn measurement_field_names() -> [&'static str; 82] {
+fn measurement_field_names() -> [&'static str; 87] {
     [
         "observation_fixed_radius",
         "observation_vector_center_count",
         "observation_component_x_count",
         "observation_component_y_count",
         "observation_component_z_count",
+        "amplitude_calibration_target_prior_rms",
+        "amplitude_calibration_uncalibrated_prior_rms",
+        "amplitude_calibration_precision_scale",
+        "amplitude_calibration_tau_multiplier",
+        "amplitude_calibration_ns",
         "prior_precision_nnz",
         "observation_update_nnz",
         "posterior_precision_nnz",
@@ -5043,6 +5214,7 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
         row.alpha.to_string(),
         row.kappa.to_string(),
         row.tau.to_string(),
+        row.amplitude_calibration_policy.clone(),
         row.observation_class.as_str().to_string(),
         row.observation_design_id.clone(),
         row.physical_qoi_design_id.clone(),
@@ -5069,6 +5241,14 @@ fn row_to_csv(row: &C51BenchmarkRow) -> String {
     push_measurement(&mut fields, &row.observation_component_x_count);
     push_measurement(&mut fields, &row.observation_component_y_count);
     push_measurement(&mut fields, &row.observation_component_z_count);
+    push_measurement(&mut fields, &row.amplitude_calibration_target_prior_rms);
+    push_measurement(
+        &mut fields,
+        &row.amplitude_calibration_uncalibrated_prior_rms,
+    );
+    push_measurement(&mut fields, &row.amplitude_calibration_precision_scale);
+    push_measurement(&mut fields, &row.amplitude_calibration_tau_multiplier);
+    push_measurement(&mut fields, &row.amplitude_calibration_ns);
     push_measurement(&mut fields, &row.prior_precision_nnz);
     push_measurement(&mut fields, &row.observation_update_nnz);
     push_measurement(&mut fields, &row.posterior_precision_nnz);
@@ -5354,7 +5534,7 @@ mod tests {
                     assert!(measured_f64(&row.covariance_action_relative_error) <= 1.0e-9);
                     assert!(measured_f64(&row.physical_variance_relative_error) <= 1.0e-9);
                 }
-                C51MethodId::WhitneyCompact => {
+                C51MethodId::WhitneyCompact | C51MethodId::WhitneyCompactCalibrated => {
                     assert!(!row.same_discrete_law_eligible);
                     assert!(row.full_uq_workload_eligible);
                     assert!(measured_f64(&row.physical_variance_relative_error).is_finite());
@@ -5604,6 +5784,36 @@ mod tests {
             archive.row.query_external_peak_rss_bytes,
             C51Measurement::NotRecorded
         );
+    }
+
+    #[test]
+    fn calibrated_compact_resource_uses_root_physical_rms_pipeline_before_conditioning() {
+        let selection = C51ResourceSelection {
+            refinement: 4,
+            observation_class: C51ObservationClass::LocalPhysicalB,
+            sensor_target: C51ResourceSensorTarget::Count(4),
+            repeated_data_count: 1,
+            method: C51MethodId::WhitneyCompactCalibrated,
+            spectral_rank: None,
+            phase: C51ResourcePhase::ColdSetup,
+        };
+        let mut config = C51ResourceConfig::juq_performance(selection);
+        config.projected_calibration_target_prior_rms = Some(0.5);
+        let archive = run_c51_resource(&config, C51RunMetadata::smoke("calibrated-resource"))
+            .expect("calibrated projected setup should use the canonical root pipeline");
+        assert_eq!(archive.row.method, C51MethodId::WhitneyCompactCalibrated);
+        assert!(!archive.row.matched_physical_qoi_eligible);
+        assert_eq!(
+            archive.row.amplitude_calibration_target_prior_rms,
+            C51Measurement::Measured(0.5)
+        );
+        let scale = measured_f64(&archive.row.amplitude_calibration_precision_scale);
+        let tau_multiplier = measured_f64(&archive.row.amplitude_calibration_tau_multiplier);
+        assert!((tau_multiplier.powi(2) - scale).abs() <= 1.0e-12 * scale);
+        assert!(matches!(
+            archive.row.amplitude_calibration_ns,
+            C51Measurement::Measured(value) if value > 0
+        ));
     }
 
     #[test]

@@ -111,6 +111,16 @@ class DeriveExactRankDecisionTests(unittest.TestCase):
             "heldout_e_primary",
             "selection_e_corr",
             "heldout_e_corr",
+            "calibration_policy",
+            "calibration_bank",
+            "calibration_target_prior_rms",
+            "calibration_uncalibrated_prior_rms",
+            "calibration_precision_scale",
+            "calibration_tau_multiplier",
+            "calibrated_selection_e_primary",
+            "calibrated_heldout_e_primary",
+            "calibrated_selection_e_corr",
+            "calibrated_heldout_e_corr",
         ]
         with (study / "compact_accuracy.csv").open(
             "w", encoding="utf-8", newline=""
@@ -130,6 +140,16 @@ class DeriveExactRankDecisionTests(unittest.TestCase):
                     "heldout_e_primary": 0.19,
                     "selection_e_corr": 0.02,
                     "heldout_e_corr": 0.01,
+                    "calibration_policy": "exact_feec_prior_selection_bank_physical_rms",
+                    "calibration_bank": "selection",
+                    "calibration_target_prior_rms": 0.5,
+                    "calibration_uncalibrated_prior_rms": 0.4,
+                    "calibration_precision_scale": 0.64,
+                    "calibration_tau_multiplier": 0.8,
+                    "calibrated_selection_e_primary": 0.03,
+                    "calibrated_heldout_e_primary": 0.04,
+                    "calibrated_selection_e_corr": 0.02,
+                    "calibrated_heldout_e_corr": 0.01,
                 }
             )
         manifest = {
@@ -200,6 +220,30 @@ class DeriveExactRankDecisionTests(unittest.TestCase):
         self.assertFalse(compact["passes_primary_5pct_envelope"])
         self.assertEqual(compact["selection_relative_error"], 0.13)
         self.assertEqual(compact["heldout_relative_error"], 0.19)
+
+    def test_calibrated_profile_freezes_prior_scale_and_heldout_result(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = pathlib.Path(temporary)
+            perf0 = root / "perf0"
+            attempt = root / "attempt"
+            perf0.mkdir()
+            self.write_perf0(perf0)
+            self.write_attempt(attempt)
+            payload = decision.derive(
+                [attempt], perf0, decision.CALIBRATED_PROJECTED_PROFILE
+            )
+        calibrated = payload["decisions"][0]["whitney_compact_calibrated"]
+        self.assertEqual(
+            calibrated["validation_status"],
+            "physical_rms_calibrated_heldout_validated",
+        )
+        self.assertEqual(calibrated["heldout_relative_error"], 0.04)
+        self.assertFalse(
+            calibrated["amplitude_calibration"]["heldout_used_for_calibration"]
+        )
+        self.assertEqual(
+            calibrated["amplitude_calibration"]["tau_multiplier"], 0.8
+        )
 
 
 if __name__ == "__main__":

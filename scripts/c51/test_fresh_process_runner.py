@@ -369,6 +369,31 @@ class FreshProcessRunnerTests(unittest.TestCase):
         selection = runner.requested_resource_selection(args)
         self.assertEqual(selection["method"], "whitney_compact")
 
+    def test_calibrated_projected_profile_requires_frozen_target(self):
+        common = [
+            "--profile",
+            runner.EXACT_CALIBRATED_PROJECTED_PROFILE,
+            "--refinement",
+            "8",
+            "--observation-class",
+            "fixed_footprint_magnetic_volume",
+            "--sensor-count",
+            "4096",
+            "--repeated-data",
+            "100",
+            "--workload-phase",
+            "cold_setup",
+            "--resource-method",
+            "whitney_compact_calibrated",
+        ]
+        with self.assertRaisesRegex(ValueError, "requires a positive"):
+            runner.requested_resource_selection(runner.parse_args(common))
+        args = runner.parse_args(
+            [*common, "--projected-calibration-target-prior-rms", "0.5"]
+        )
+        selection = runner.requested_resource_selection(args)
+        self.assertEqual(selection["projected_calibration_target_prior_rms"], 0.5)
+
     def test_frozen_juq_sensor_and_qoi_metadata_pass_the_performance_gate(self):
         selection = {
             "method": "whitney_compact",

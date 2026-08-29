@@ -129,7 +129,7 @@ def persistent_values(row: Mapping[str, str]) -> float:
     method = row["method"]
     if method == "fm_aug":
         return measured(row, "kkt_input_nnz")
-    if method == "whitney_compact":
+    if method in ("whitney_compact", "whitney_compact_calibrated"):
         return measured(row, "posterior_precision_nnz") + measured(
             row, "factor_storage_nnz"
         )
@@ -379,8 +379,12 @@ def analyze(
     if profile_name not in campaign.PROFILE_CONTRACTS:
         raise AnalysisError("campaign manifest has the wrong profile")
     exact_campaign = profile_name in campaign.EXACT_LIKE_PROFILE_NAMES
-    projected_context_campaign = (
-        profile_name == campaign.EXACT_PROJECTED_PROFILE_NAME
+    projected_context_campaign = profile_name in (
+        campaign.EXACT_PROJECTED_PROFILE_NAME,
+        campaign.EXACT_CALIBRATED_PROJECTED_PROFILE_NAME,
+    )
+    calibrated_projected_campaign = (
+        profile_name == campaign.EXACT_CALIBRATED_PROJECTED_PROFILE_NAME
     )
     evidence_tier = "claim_primary_exact" if exact_campaign else "claim_primary"
     methods = tuple(campaign.PROFILE_CONTRACTS[profile_name][0]["methods"])
@@ -513,6 +517,15 @@ def analyze(
         if projected_context_campaign
         else []
     )
+    calibrated_projected_ratios = (
+        context_resource_ratios(
+            points,
+            "whitney_compact_calibrated",
+            ("fm_aug", "exact_observation_gp", "spectral_low_rank"),
+        )
+        if calibrated_projected_campaign
+        else []
+    )
     projected_accuracy = (
         [
             {
@@ -526,6 +539,19 @@ def analyze(
         if projected_context_campaign
         else []
     )
+    calibrated_projected_accuracy = (
+        [
+            {
+                "refinement": refinement,
+                **decisions[campaign.rank_key(refinement, observation_count, profile)][
+                    "whitney_compact_calibrated"
+                ],
+            }
+            for refinement in REFINEMENTS
+        ]
+        if calibrated_projected_campaign
+        else []
+    )
     passed = all(comparison.practical_advantage for comparison in comparisons)
     limitations = [
         "This is a bounded n=8,10 regime result, not an asymptotic complexity proof.",
@@ -535,6 +561,10 @@ def analyze(
     if projected_context_campaign:
         limitations.append(
             "Projected-Whitney resource ratios do not clear the exact-law claim because its separately archived fixed-tau posterior covariance error is material."
+        )
+    if calibrated_projected_campaign:
+        limitations.append(
+            "The calibrated projected method matches one exact-FEEC prior RMS scalar on the selection bank; it remains an approximate discrete law and is judged on the independent held-out bank."
         )
     return {
         "schema_version": SCHEMA_VERSION,
@@ -566,6 +596,18 @@ def analyze(
             "accuracy": projected_accuracy,
             "resource_ratios": [
                 asdict(summary) for summary in projected_context_ratios
+            ],
+        },
+        "calibrated_projected_whitney_context": {
+            "claim_bearing": calibrated_projected_campaign,
+            "reason": (
+                "one prior amplitude scalar was frozen on the selection bank before conditioning and independently held-out validated"
+                if calibrated_projected_campaign
+                else "profile does not include the preregistered calibrated projected method"
+            ),
+            "accuracy": calibrated_projected_accuracy,
+            "resource_ratios": [
+                asdict(summary) for summary in calibrated_projected_ratios
             ],
         },
         "limitations": limitations,

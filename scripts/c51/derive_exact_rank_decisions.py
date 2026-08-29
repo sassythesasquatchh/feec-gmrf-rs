@@ -17,6 +17,7 @@ from typing import Any, Mapping, Sequence
 SCHEMA_VERSION = "c51-performance-rank-decisions-v2"
 PROFILE = "juq-exact-performance-v1"
 PROJECTED_PROFILE = "juq-exact-projected-performance-v1"
+CALIBRATED_PROJECTED_PROFILE = "juq-exact-calibrated-projected-performance-v1"
 SENSOR_DESIGN = "c51-magnetic-fixed-footprint-maximin-12-v1"
 OUTPUT_DESIGN = "rank_study_selection_and_held_out_wendland_c2_18"
 CAMPAIGN_TOLERANCE = 0.05
@@ -227,7 +228,7 @@ def derive_one(
         },
         "accuracy_artifact_hash_scope": "canonical_c51_accuracy_archive_files_v1",
     }
-    if profile_name == PROJECTED_PROFILE:
+    if profile_name in (PROJECTED_PROFILE, CALIBRATED_PROJECTED_PROFILE):
         compact_rows = load_csv(study / "compact_accuracy.csv")
         matching_compact = [
             row
@@ -276,6 +277,69 @@ def derive_one(
             "method_performance_timing_eligible": False,
             "accuracy_artifact_sha256": archive_hash,
         }
+        if profile_name == CALIBRATED_PROJECTED_PROFILE:
+            try:
+                calibrated_selection = float(compact["calibrated_selection_e_primary"])
+                calibrated_heldout = float(compact["calibrated_heldout_e_primary"])
+                calibrated_selection_correlation = float(
+                    compact["calibrated_selection_e_corr"]
+                )
+                calibrated_heldout_correlation = float(
+                    compact["calibrated_heldout_e_corr"]
+                )
+                target_prior_rms = float(compact["calibration_target_prior_rms"])
+                uncalibrated_prior_rms = float(
+                    compact["calibration_uncalibrated_prior_rms"]
+                )
+                precision_scale = float(compact["calibration_precision_scale"])
+                tau_multiplier = float(compact["calibration_tau_multiplier"])
+            except (KeyError, ValueError) as error:
+                raise ValueError(
+                    f"{attempt} lacks projected prior calibration evidence: {error}"
+                ) from error
+            positive = (
+                target_prior_rms,
+                uncalibrated_prior_rms,
+                precision_scale,
+                tau_multiplier,
+            )
+            if (
+                compact.get("calibration_policy")
+                != "exact_feec_prior_selection_bank_physical_rms"
+                or compact.get("calibration_bank") != "selection"
+                or any(value <= 0.0 for value in positive)
+                or abs(tau_multiplier * tau_multiplier - precision_scale)
+                > 1.0e-12 * precision_scale
+                or not 0.0 <= calibrated_selection <= CAMPAIGN_TOLERANCE
+                or not 0.0 <= calibrated_heldout <= CAMPAIGN_TOLERANCE
+            ):
+                raise ValueError(
+                    f"{attempt} projected prior calibration does not clear the frozen 5 percent gate"
+                )
+            result["whitney_compact_calibrated"] = {
+                "validation_status": "physical_rms_calibrated_heldout_validated",
+                "selection_relative_error": calibrated_selection,
+                "heldout_relative_error": calibrated_heldout,
+                "selection_correlation_relative_error": (
+                    calibrated_selection_correlation
+                ),
+                "heldout_correlation_relative_error": calibrated_heldout_correlation,
+                "amplitude_calibration": {
+                    "stage": "prior_before_conditioning",
+                    "parameter_changed": "tau_only",
+                    "target": "exact_feec_prior_selection_bank_physical_rms",
+                    "calibration_bank": "selection",
+                    "evaluation_bank": "held_out",
+                    "heldout_used_for_calibration": False,
+                    "target_prior_rms": target_prior_rms,
+                    "uncalibrated_prior_rms": uncalibrated_prior_rms,
+                    "precision_scale": precision_scale,
+                    "tau_multiplier": tau_multiplier,
+                },
+                "identical_observation_and_output_maps": True,
+                "method_performance_timing_eligible": False,
+                "accuracy_artifact_sha256": archive_hash,
+            }
     return result
 
 
@@ -284,7 +348,7 @@ def derive(
     perf0: pathlib.Path,
     profile_name: str = PROFILE,
 ) -> dict[str, Any]:
-    if profile_name not in (PROFILE, PROJECTED_PROFILE):
+    if profile_name not in (PROFILE, PROJECTED_PROFILE, CALIBRATED_PROJECTED_PROFILE):
         raise ValueError(f"unsupported exact rank-decision profile {profile_name!r}")
     if not attempts:
         raise ValueError("at least one replay attempt is required")
@@ -320,7 +384,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--perf0-archive", type=pathlib.Path, required=True)
     parser.add_argument(
         "--profile",
-        choices=(PROFILE, PROJECTED_PROFILE),
+        choices=(PROFILE, PROJECTED_PROFILE, CALIBRATED_PROJECTED_PROFILE),
         default=PROFILE,
     )
     parser.add_argument("--output", type=pathlib.Path, required=True)

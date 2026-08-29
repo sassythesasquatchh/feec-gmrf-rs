@@ -254,6 +254,51 @@ analyzer adjudicates only the two fair exact/spectral comparators and emits a
 separate projected-Whitney table containing fixed-`tau` accuracy and paired
 time, RSS, and persistent-storage ratios.
 
+## Physically calibrated projected-Whitney campaign
+
+`juq-exact-calibrated-projected-performance-v1.json` retains the raw projected
+row and adds `whitney_compact_calibrated`. The latter uses the package-level
+physical-RMS calibration pipeline before conditioning:
+
+```text
+sigma_exact^2 = tr(G_sel C_exact G_sel^T) / 9
+sigma_raw^2   = tr(G_sel C_projected G_sel^T) / 9
+s_Q           = sigma_raw^2 / sigma_exact^2
+tau_cal       = tau * sqrt(s_Q)
+Q_cal         = s_Q * Q_projected
+```
+
+`G_sel` is the frozen nine-output selection bank. The second nine-output bank
+is held out from calibration and is used only for posterior validation. The
+raw projected posterior is still archived, and the calibrated posterior is
+reconditioned from `Q_cal`; an already-conditioned covariance is never scaled.
+The fresh-process resource row recomputes the raw projected RMS through
+`calibrate_prior_to_physical_rms`, charges that factorization and its nine
+covariance solves to `prior_build_ns`, and includes their memory in peak RSS.
+
+After producing new accuracy attempts with schema
+`c51-spectral-covariance-rank-v3`, freeze the calibration and spectral rank:
+
+```text
+python3 scripts/c51/derive_exact_rank_decisions.py \
+  --profile juq-exact-calibrated-projected-performance-v1 \
+  --perf0-archive <perf0-archive> \
+  --output out/c51/exact-calibrated-projected-rank-decisions.json \
+  <n8-m4096-attempt> <n10-m4096-attempt>
+
+python3 scripts/c51/run_juq_performance.py \
+  --profile-file scripts/c51/juq-exact-calibrated-projected-performance-v1.json \
+  --rank-decisions out/c51/exact-calibrated-projected-rank-decisions.json \
+  --evidence-tier claim_primary_exact \
+  --output out/c51/juq-exact-calibrated-projected-performance-v1-macos
+```
+
+The exact augmented, exact observation-space GP, and spectral comparison
+remain the same-law C51 gate. The calibrated projected method is a separate
+practical approximation claim: one physically meaningful amplitude parameter
+is fitted, while covariance shape and independent held-out posterior accuracy
+remain empirical tests.
+
 ## Spectral covariance-rank discovery guard
 
 The dedicated rank-discovery study has a separate capped runner:

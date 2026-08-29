@@ -24,11 +24,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 
-SCHEMA_VERSION = "c51-accuracy-resource-v6"
+SCHEMA_VERSION = "c51-accuracy-resource-v7"
 TIMING_SCHEMA_VERSIONS = {
     "c51-accuracy-resource-v3",
     "c51-accuracy-resource-v4",
     "c51-accuracy-resource-v5",
+    "c51-accuracy-resource-v6",
     SCHEMA_VERSION,
 }
 SUPPORTED_SCHEMA_VERSIONS = {
@@ -66,6 +67,11 @@ MEASUREMENT_FIELDS = (
     "spectral_state_feature_values",
     "spectral_observation_feature_values",
     "spectral_sampling_normal_dimension",
+    "amplitude_calibration_target_prior_rms",
+    "amplitude_calibration_uncalibrated_prior_rms",
+    "amplitude_calibration_precision_scale",
+    "amplitude_calibration_tau_multiplier",
+    "amplitude_calibration_ns",
     "feec_assembly_ns",
     "prior_build_ns",
     "exact_gp_covariance_construction_ns",
@@ -131,6 +137,7 @@ REQUIRED_BASE_FIELDS = (
     "alpha",
     "kappa",
     "tau",
+    "amplitude_calibration_policy",
     "observation_class",
     "sensor_count",
     "sensor_density",

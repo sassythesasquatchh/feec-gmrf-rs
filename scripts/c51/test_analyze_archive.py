@@ -47,6 +47,7 @@ def base_row(
         "alpha": "2",
         "kappa": "4",
         "tau": "1",
+        "amplitude_calibration_policy": "none",
         "observation_class": observation_class,
         "sensor_count": "20",
         "sensor_density": "0.02",

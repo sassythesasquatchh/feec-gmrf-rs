@@ -67,9 +67,9 @@ fn run_accuracy(arguments: &[String]) -> Result<(), Box<dyn Error>> {
 }
 
 fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
-    if arguments.len() != 10 {
+    if !matches!(arguments.len(), 10 | 11) {
         return Err(
-            "resource usage: c51_benchmark resource <profile> <output> <refinement> <observation-class> <count|density> <target> <D> <method> <rank|none> <cold_setup|query_physical_uq|query_full_uq>"
+            "resource usage: c51_benchmark resource <profile> <output> <refinement> <observation-class> <count|density> <target> <D> <method> <rank|none> <cold_setup|query_physical_uq|query_full_uq> [projected-calibration-target-prior-rms]"
                 .into(),
         );
     }
@@ -80,9 +80,10 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
             | "juq-performance-v1"
             | "juq-exact-performance-v1"
             | "juq-exact-projected-performance-v1"
+            | "juq-exact-calibrated-projected-performance-v1"
     ) {
         return Err(format!(
-            "resource profile {profile:?} is unavailable; use smoke, juq-performance-v1, juq-exact-performance-v1, or juq-exact-projected-performance-v1"
+            "resource profile {profile:?} is unavailable; use smoke, juq-performance-v1, juq-exact-performance-v1, juq-exact-projected-performance-v1, or juq-exact-calibrated-projected-performance-v1"
         )
         .into());
     }
@@ -106,6 +107,7 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         "fm_direct" => C51MethodId::FullMetricDirect,
         "fm_aug" => C51MethodId::FullMetricAugmented,
         "whitney_compact" => C51MethodId::WhitneyCompact,
+        "whitney_compact_calibrated" => C51MethodId::WhitneyCompactCalibrated,
         "exact_observation_gp" => C51MethodId::ExactObservationSpaceGp,
         "spectral_full_rank" => C51MethodId::SpectralFullRank,
         "spectral_low_rank" => C51MethodId::SpectralLowRank,
@@ -130,12 +132,21 @@ fn run_resource(arguments: &[String]) -> Result<(), Box<dyn Error>> {
         spectral_rank,
         phase,
     };
-    let config = match profile.as_str() {
+    let mut config = match profile.as_str() {
         "smoke" => C51ResourceConfig::smoke(selection),
         "juq-performance-v1"
         | "juq-exact-performance-v1"
-        | "juq-exact-projected-performance-v1" => C51ResourceConfig::juq_performance(selection),
+        | "juq-exact-projected-performance-v1"
+        | "juq-exact-calibrated-projected-performance-v1" => {
+            C51ResourceConfig::juq_performance(selection)
+        }
         _ => unreachable!("validated resource profile"),
+    };
+    config.projected_calibration_target_prior_rms = match arguments.get(10) {
+        Some(value) => Some(value.parse::<f64>().map_err(|error| {
+            format!("invalid projected calibration target prior RMS {value:?}: {error}")
+        })?),
+        None => None,
     };
     let repository_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut metadata = C51RunMetadata::from_repository(
