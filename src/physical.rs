@@ -44,6 +44,165 @@ pub struct WendlandC2Kernel3d {
     radius: f64,
 }
 
+/// A positively oriented axis-aligned surface patch for integrating a magnetic
+/// flux 2-cochain.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxisAlignedFluxPatch3d {
+    normal_axis: usize,
+    coordinate: f64,
+    tangential_ranges: [[f64; 2]; 2],
+}
+
+impl AxisAlignedFluxPatch3d {
+    /// Define a patch with positive normal along `normal_axis`.
+    ///
+    /// The two ranges follow the cyclic tangential axes: `(y,z)` for an
+    /// x-normal patch, `(z,x)` for a y-normal patch, and `(x,y)` for a z-normal
+    /// patch. Patch boundaries must conform to mesh faces when assembled.
+    pub fn new(
+        normal_axis: usize,
+        coordinate: f64,
+        tangential_ranges: [[f64; 2]; 2],
+    ) -> Result<Self> {
+        if normal_axis >= 3 {
+            return Err(FeecGmrfError::Dimension(
+                "axis-aligned flux patch normal axis must be 0, 1, or 2".to_string(),
+            ));
+        }
+        if !coordinate.is_finite()
+            || tangential_ranges
+                .iter()
+                .flatten()
+                .any(|bound| !bound.is_finite())
+        {
+            return Err(FeecGmrfError::InvalidParameter(
+                "axis-aligned flux patch coordinates must be finite".to_string(),
+            ));
+        }
+        if tangential_ranges.iter().any(|range| range[0] >= range[1]) {
+            return Err(FeecGmrfError::InvalidParameter(
+                "axis-aligned flux patch ranges must have positive width".to_string(),
+            ));
+        }
+        Ok(Self {
+            normal_axis,
+            coordinate,
+            tangential_ranges,
+        })
+    }
+
+    pub fn normal_axis(self) -> usize {
+        self.normal_axis
+    }
+
+    pub fn coordinate(self) -> f64 {
+        self.coordinate
+    }
+
+    pub fn tangential_ranges(self) -> [[f64; 2]; 2] {
+        self.tangential_ranges
+    }
+
+    pub fn area(self) -> f64 {
+        self.tangential_ranges
+            .iter()
+            .map(|range| range[1] - range[0])
+            .product()
+    }
+}
+
+/// Pair full-space FEEC 2-cochains with oriented, mesh-conforming surface
+/// patches in three dimensions.
+///
+/// Every coefficient is `+1` or `-1`: the map sums the already-integrated face
+/// degrees of freedom with the orientation induced by the patch normal. It
+/// performs no point evaluation, Whitney reconstruction, or barycentre
+/// quadrature.
+pub fn axis_aligned_flux_patch_cochain_map_3d(
+    topology: &Complex,
+    coords: &MeshCoords,
+    patches: &[AxisAlignedFluxPatch3d],
+) -> Result<LinearMap> {
+    const COORDINATE_TOLERANCE: f64 = 1.0e-10;
+    if topology.dim() != 3 || coords.dim() != 3 {
+        return Err(FeecGmrfError::Dimension(
+            "axis-aligned flux patches require a 3D topology and coordinates".to_string(),
+        ));
+    }
+    if patches.is_empty() {
+        return Err(FeecGmrfError::InvalidParameter(
+            "at least one axis-aligned flux patch is required".to_string(),
+        ));
+    }
+
+    let mut rows = Vec::with_capacity(patches.len());
+    for (patch_index, patch) in patches.iter().copied().enumerate() {
+        let tangential_axes = cyclic_tangential_axes(patch.normal_axis);
+        let mut row = Vec::new();
+        let mut selected_area = 0.0;
+        for (face_index, face) in topology.skeleton(2).handle_iter().enumerate() {
+            let points = face
+                .vertices
+                .iter()
+                .map(|&vertex| {
+                    let point = coords.coord(vertex);
+                    [point[0], point[1], point[2]]
+                })
+                .collect::<Vec<_>>();
+            if points.iter().any(|point| {
+                (point[patch.normal_axis] - patch.coordinate).abs() > COORDINATE_TOLERANCE
+                    || tangential_axes.iter().enumerate().any(|(range, &axis)| {
+                        point[axis] < patch.tangential_ranges[range][0] - COORDINATE_TOLERANCE
+                            || point[axis]
+                                > patch.tangential_ranges[range][1] + COORDINATE_TOLERANCE
+                    })
+            }) {
+                continue;
+            }
+            let projected_area =
+                signed_projected_triangle_area(points[0], points[1], points[2], tangential_axes);
+            if projected_area.abs() <= COORDINATE_TOLERANCE {
+                continue;
+            }
+            row.push((face_index, projected_area.signum()));
+            selected_area += projected_area.abs();
+        }
+        if row.is_empty() {
+            return Err(FeecGmrfError::Assembly(format!(
+                "axis-aligned flux patch {patch_index} selects no mesh faces"
+            )));
+        }
+        let expected_area = patch.area();
+        let area_tolerance = (1.0e-10 * expected_area).max(1.0e-12);
+        if (selected_area - expected_area).abs() > area_tolerance {
+            return Err(FeecGmrfError::Assembly(format!(
+                "axis-aligned flux patch {patch_index} selects area {selected_area:.16e}, expected {expected_area:.16e}; patch boundaries must conform to mesh faces"
+            )));
+        }
+        rows.push(row);
+    }
+    LinearMap::weighted_rows(topology.nsimplices(2), &rows)
+}
+
+fn cyclic_tangential_axes(normal_axis: usize) -> [usize; 2] {
+    match normal_axis {
+        0 => [1, 2],
+        1 => [2, 0],
+        2 => [0, 1],
+        _ => unreachable!("validated three-dimensional axis"),
+    }
+}
+
+fn signed_projected_triangle_area(
+    first: [f64; 3],
+    second: [f64; 3],
+    third: [f64; 3],
+    axes: [usize; 2],
+) -> f64 {
+    0.5 * ((second[axes[0]] - first[axes[0]]) * (third[axes[1]] - first[axes[1]])
+        - (second[axes[1]] - first[axes[1]]) * (third[axes[0]] - first[axes[0]]))
+}
+
 impl WendlandC2Kernel3d {
     /// Construct a fixed physical kernel.
     pub fn new(center: [f64; 3], radius: f64) -> Result<Self> {
@@ -855,6 +1014,34 @@ mod tests {
             assert!(values[3 * kernel + 1].abs() < 1.0e-10);
             assert!(values[3 * kernel + 2].abs() < 1.0e-10);
         }
+    }
+
+    #[test]
+    fn axis_aligned_flux_patch_pairs_integral_cochains_without_reconstruction() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 4, 1.0);
+        let (topology, coords) = mesh.compute_coord_complex();
+        let patch = AxisAlignedFluxPatch3d::new(0, 0.5, [[0.0, 0.5], [0.0, 0.5]]).unwrap();
+        let patch_map =
+            axis_aligned_flux_patch_cochain_map_3d(&topology, &coords, &[patch]).unwrap();
+        let magnetic = MagneticFieldMaps3d::from_feec(&topology, &coords).unwrap();
+        let vector_potential = exterior::field::DiffFormClosure::one_form(
+            |point| common::linalg::nalgebra::Vector::from_column_slice(&[0.0, 0.0, point[1]]),
+            3,
+        );
+        let a_cochain =
+            ddf::cochain::cochain_projection(&vector_potential, &topology, &coords, None);
+        let b_cochain = magnetic
+            .flux_cochain
+            .apply(a_cochain.coeffs.as_slice())
+            .unwrap();
+        let flux = patch_map.apply(&b_cochain).unwrap();
+
+        assert!((flux[0] - patch.area()).abs() < 1.0e-12);
+        assert!(AxisAlignedFluxPatch3d::new(3, 0.5, [[0.0, 0.5], [0.0, 0.5]]).is_err());
+        let nonconforming = AxisAlignedFluxPatch3d::new(0, 0.3, [[0.0, 0.5], [0.0, 0.5]]).unwrap();
+        assert!(
+            axis_aligned_flux_patch_cochain_map_3d(&topology, &coords, &[nonconforming]).is_err()
+        );
     }
 
     #[test]
