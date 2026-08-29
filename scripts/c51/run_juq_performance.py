@@ -305,23 +305,45 @@ def load_rank_decisions(
             raise ValueError(f"rank decision {index} does not require exact-request timing")
         try:
             spectral_error = float(spectral["heldout_relative_error"])
+            spectral_selection_error = float(spectral["selection_relative_error"])
+            lower_failing_error = float(spectral["lower_failing_selection_relative_error"])
+            lower_failing_rank = int(spectral["lower_failing_rank"])
             compact_error = float(compact["heldout_relative_error"])
+            compact_selection_error = float(compact["selection_relative_error"])
+            state_dimension = int(decision["state_dimension"])
         except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f"rank decision {index} has invalid held-out errors") from error
-        if not 0.0 <= spectral_error <= key[3]:
+            raise ValueError(f"rank decision {index} has invalid qualification metrics") from error
+        if not 0.0 <= spectral_error <= key[3] or not 0.0 <= spectral_selection_error <= key[3]:
             raise ValueError(f"rank decision {index} spectral error exceeds 5 percent")
+        if lower_failing_rank >= rank or lower_failing_error <= key[3]:
+            raise ValueError(f"rank decision {index} lacks a lower failing selection bracket")
+        expected_rank_status = "full_rank_required" if rank == state_dimension else "low_rank"
+        if rank > state_dimension or spectral.get("rank_status") != expected_rank_status:
+            raise ValueError(f"rank decision {index} has inconsistent rank endpoint semantics")
+        if spectral.get("shared_maximum_basis_timing_eligible") is not False:
+            raise ValueError(f"rank decision {index} does not forbid shared-basis timing")
         if compact.get("validation_status") != "heldout_validated":
             raise ValueError(f"rank decision {index} compact model is not held-out validated")
-        if not 0.0 <= compact_error <= key[3]:
+        if not 0.0 <= compact_error <= key[3] or not 0.0 <= compact_selection_error <= key[3]:
             raise ValueError(f"rank decision {index} compact error exceeds 5 percent")
-        require_sha256(
+        spectral_hash = require_sha256(
             spectral.get("accuracy_artifact_sha256", ""),
             f"rank decision {index} spectral accuracy artifact",
         )
-        require_sha256(
+        compact_hash = require_sha256(
             compact.get("accuracy_artifact_sha256", ""),
             f"rank decision {index} compact accuracy artifact",
         )
+        common_hash = require_sha256(
+            decision.get("common_h_g_fixture_sha256", ""),
+            f"rank decision {index} common H/G fixture",
+        )
+        if spectral_hash != compact_hash or spectral_hash != common_hash:
+            raise ValueError(f"rank decision {index} does not bind both methods to one accuracy archive")
+        if compact.get("identical_observation_and_output_maps") is not True:
+            raise ValueError(f"rank decision {index} compact method lacks identical H/G maps")
+        if compact.get("method_performance_timing_eligible") is not False:
+            raise ValueError(f"rank decision {index} compact accuracy row is timing eligible")
         if exact_gp.get("validation_status") != "perf0_same_law_validated":
             raise ValueError(f"rank decision {index} exact GP lacks PERF-0 qualification")
         if exact_gp.get("fixture_id") != "PERF-0":
@@ -612,6 +634,32 @@ def recursive_source_clean(repository: pathlib.Path) -> tuple[bool, dict[str, st
     return all(value == "" for value in results.values()), results
 
 
+def source_identity(source: Mapping[str, Any]) -> dict[str, str]:
+    """Extract a fail-closed root/FEEC/GMRF identity from runner metadata."""
+
+    try:
+        components = source["submodules"]
+        values = {
+            "root_sha": str(source["head"]),
+            "feec_sha": str(components["feec"]["head"]),
+            "gmrf_sha": str(components["gmrf"]["head"]),
+        }
+        dirty = {
+            "root_dirty": source["dirty"],
+            "feec_dirty": components["feec"]["dirty"],
+            "gmrf_dirty": components["gmrf"]["dirty"],
+        }
+    except (KeyError, TypeError) as error:
+        raise ValueError(f"source metadata is incomplete: {error}") from error
+    for name, value in values.items():
+        if len(value) != 40 or any(character not in "0123456789abcdef" for character in value):
+            raise ValueError(f"source metadata has invalid {name}")
+    for name, value in dirty.items():
+        if value is not False:
+            raise ValueError(f"publication source requires {name}=false")
+    return values
+
+
 def load_one_row(cell_directory: pathlib.Path) -> dict[str, str]:
     path = cell_directory / "study" / "rows.csv"
     with path.open("r", encoding="utf-8", newline="") as stream:
@@ -682,7 +730,10 @@ def classify_failure(return_code: int, runner_manifest: Mapping[str, Any] | None
 
 
 def summarize_cell(
-    cell: CampaignCell, cell_directory: pathlib.Path, return_code: int
+    cell: CampaignCell,
+    cell_directory: pathlib.Path,
+    return_code: int,
+    expected_source_identity: Mapping[str, str],
 ) -> dict[str, Any]:
     manifest_path = cell_directory / "runner-manifest.json"
     try:
@@ -703,6 +754,25 @@ def summarize_cell(
     }
     if return_code != 0:
         summary["status"] = classify_failure(return_code, manifest)
+        return summary
+    if manifest is None or manifest.get("status") != "completed":
+        summary["status"] = "rejected_runner_manifest"
+        summary["rejection_reasons"] = [
+            "successful process lacks a completed runner manifest"
+        ]
+        return summary
+    try:
+        observed_identity = source_identity(manifest["source"])
+    except (KeyError, TypeError, ValueError) as error:
+        summary["status"] = "rejected_source_provenance"
+        summary["rejection_reasons"] = [str(error)]
+        return summary
+    summary["source_identity"] = observed_identity
+    if observed_identity != dict(expected_source_identity):
+        summary["status"] = "rejected_source_mismatch"
+        summary["rejection_reasons"] = [
+            "cell root/FEEC/GMRF revisions differ from the campaign freeze"
+        ]
         return summary
     try:
         row = load_one_row(cell_directory)
@@ -811,6 +881,8 @@ def pair_results(
             record.update(status="rejected_phase_merge", reason=str(error))
             pair_records.append(record)
             continue
+        merged["cold_setup_runner_manifest"] = str(setup_manifest.relative_to(output))
+        merged["query_physical_uq_runner_manifest"] = str(query_manifest.relative_to(output))
         merged["campaign_evidence_tier"] = setup.evidence_tier
         merged["campaign_evidence_role"] = setup.evidence_role
         merged["campaign_run_kind"] = setup.run_kind
@@ -848,6 +920,8 @@ def execute(
     clean, details = recursive_source_clean(repository)
     if profile["execution"]["require_clean_recursive_source"] and not clean:
         raise ValueError(f"publication execution requires a clean recursive source: {details}")
+    frozen_source = fresh.git_metadata(repository)
+    frozen_identity = source_identity(frozen_source)
     if output.exists():
         raise ValueError(f"refusing to overwrite campaign directory {output}")
     output.mkdir(parents=True)
@@ -874,6 +948,7 @@ def execute(
         "selected_evidence_tiers": plan["selected_evidence_tiers"],
         "omitted_evidence_tiers": plan["omitted_evidence_tiers"],
         "source_clean_queries": details,
+        "source_identity_start": frozen_identity,
         "cell_results": [],
         "pair_results": [],
     }
@@ -898,7 +973,9 @@ def execute(
         (cell_directory / "orchestrator.stderr.log").write_text(
             process.stderr, encoding="utf-8"
         )
-        summary = summarize_cell(cell, cell_directory, process.returncode)
+        summary = summarize_cell(
+            cell, cell_directory, process.returncode, frozen_identity
+        )
         summary["command"] = command
         summary["command_text"] = shlex.join(command)
         summaries[cell.cell_id] = summary
@@ -914,10 +991,16 @@ def execute(
             "count": len(combined),
         }
     expected_measured_pairs = sum(cell.run_kind == "measured" for cell in cells) // 2
+    final_identity = source_identity(fresh.git_metadata(repository))
+    campaign["source_identity_end"] = final_identity
     campaign["status"] = (
-        "completed"
-        if len(combined) == expected_measured_pairs
-        else "completed_with_censored_or_rejected_cells"
+        "source_changed_during_campaign"
+        if final_identity != frozen_identity
+        else (
+            "completed"
+            if len(combined) == expected_measured_pairs
+            else "completed_with_censored_or_rejected_cells"
+        )
     )
     atomic_write_json(manifest_path, campaign)
     return 0 if campaign["status"] == "completed" else 1

@@ -35,18 +35,27 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
             "physical_qoi_design_id": "rank_study_selection_and_held_out_wendland_c2_18",
             "reference_discrete_law_id": "exact_full_metric_whitney",
             "common_h_g_fixture_sha256": "a" * 64,
+            "state_dimension": 1000,
             "rank": 256,
             "spectral_low_rank": {
                 "rank": 256,
                 "validation_status": "heldout_validated",
+                "selection_relative_error": 0.01,
                 "heldout_relative_error": 0.01,
+                "lower_failing_rank": 128,
+                "lower_failing_selection_relative_error": 0.06,
+                "rank_status": "low_rank",
                 "timing_basis_source": "partial_exact_requested_mixed_shell",
-                "accuracy_artifact_sha256": "b" * 64,
+                "shared_maximum_basis_timing_eligible": False,
+                "accuracy_artifact_sha256": "a" * 64,
             },
             "whitney_compact": {
                 "validation_status": "heldout_validated",
+                "selection_relative_error": 0.01,
                 "heldout_relative_error": 0.01,
-                "accuracy_artifact_sha256": "c" * 64,
+                "accuracy_artifact_sha256": "a" * 64,
+                "identical_observation_and_output_maps": True,
+                "method_performance_timing_eligible": False,
             },
             "exact_observation_gp": {
                 "validation_status": "perf0_same_law_validated",
@@ -157,6 +166,24 @@ class JuqPerformanceCampaignTests(unittest.TestCase):
             self.write_decisions(path, [self.decision(8, 512, tolerance=0.10)])
             with self.assertRaisesRegex(ValueError, "primary 5 percent"):
                 campaign.load_rank_decisions(path, self.profile)
+
+    def test_source_identity_requires_clean_complete_revisions(self):
+        source = {
+            "head": "a" * 40,
+            "dirty": False,
+            "submodules": {
+                "feec": {"head": "b" * 40, "dirty": False},
+                "gmrf": {"head": "c" * 40, "dirty": False},
+            },
+        }
+        self.assertEqual(
+            campaign.source_identity(source),
+            {"root_sha": "a" * 40, "feec_sha": "b" * 40, "gmrf_sha": "c" * 40},
+        )
+        dirty = copy.deepcopy(source)
+        dirty["submodules"]["gmrf"]["dirty"] = True
+        with self.assertRaisesRegex(ValueError, "gmrf_dirty=false"):
+            campaign.source_identity(dirty)
 
     def test_tiered_cells_are_complete_nested_and_deterministically_randomized(self):
         decisions = self.complete_decisions()

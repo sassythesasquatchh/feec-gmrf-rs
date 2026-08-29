@@ -282,19 +282,91 @@ def analyze(
     campaign_directory: pathlib.Path, rank_decisions: pathlib.Path
 ) -> dict[str, Any]:
     manifest = read_json(campaign_directory / "campaign-manifest.json")
+    if manifest.get("schema_version") != campaign.SCHEMA_VERSION:
+        raise AnalysisError("campaign manifest has the wrong schema")
     if manifest.get("profile") != campaign.PROFILE_NAME:
         raise AnalysisError("campaign manifest has the wrong profile")
     if manifest.get("status") != "completed":
         raise AnalysisError(
             f"campaign is not complete without censors: {manifest.get('status')}"
         )
+    if manifest.get("selected_evidence_tiers") != ["claim_primary"]:
+        raise AnalysisError("C51 adjudication requires exactly the claim_primary tier")
+    start_identity = manifest.get("source_identity_start")
+    end_identity = manifest.get("source_identity_end")
+    if not isinstance(start_identity, dict) or start_identity != end_identity:
+        raise AnalysisError("campaign source identity is missing or changed during execution")
+    try:
+        campaign.source_identity(
+            {
+                "head": start_identity["root_sha"],
+                "dirty": False,
+                "submodules": {
+                    "feec": {"head": start_identity["feec_sha"], "dirty": False},
+                    "gmrf": {"head": start_identity["gmrf_sha"], "dirty": False},
+                },
+            }
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise AnalysisError(f"invalid frozen source identity: {error}") from error
+    plan = read_json(campaign_directory / "campaign-plan.json")
+    if plan.get("schema_version") != campaign.SCHEMA_VERSION or plan.get("status") != "ready":
+        raise AnalysisError("campaign plan is missing or was not ready")
+    if plan.get("selected_evidence_tiers") != ["claim_primary"]:
+        raise AnalysisError("campaign plan does not freeze exactly claim_primary")
+    if plan.get("plan_sha256") != manifest.get("plan_sha256"):
+        raise AnalysisError("campaign plan hash does not match the manifest")
+    cells = plan.get("cells")
+    if not isinstance(cells, list) or campaign.canonical_hash(
+        [
+            {key: value for key, value in cell.items() if key != "command"}
+            for cell in cells
+            if isinstance(cell, dict)
+        ]
+    ) != plan.get("plan_sha256") or any(not isinstance(cell, dict) for cell in cells):
+        raise AnalysisError("campaign cell plan was modified after freezing")
+    rank_hash = campaign.sha256_file(rank_decisions)
+    if rank_hash != manifest.get("rank_decision_sha256") or rank_hash != plan.get(
+        "rank_decision_sha256"
+    ):
+        raise AnalysisError("rank-decision artifact does not match the frozen campaign")
+    profile_hash = campaign.sha256_file(campaign.DEFAULT_PROFILE)
+    if profile_hash != manifest.get("profile_sha256") or profile_hash != plan.get(
+        "profile_sha256"
+    ):
+        raise AnalysisError("performance profile does not match the frozen campaign")
     profile = campaign.read_json(campaign.DEFAULT_PROFILE)
     campaign.validate_profile(profile)
     decisions, decision_payload = campaign.load_rank_decisions(rank_decisions, profile)
-    with (campaign_directory / "combined-rows.csv").open(
+    combined_path = campaign_directory / "combined-rows.csv"
+    combined_record = manifest.get("combined_rows")
+    if not isinstance(combined_record, dict):
+        raise AnalysisError("campaign manifest lacks combined-row provenance")
+    if (
+        combined_record.get("path") != "combined-rows.csv"
+        or combined_record.get("sha256") != campaign.sha256_file(combined_path)
+        or combined_record.get("count") != 36
+    ):
+        raise AnalysisError("combined rows do not match their frozen manifest record")
+    with combined_path.open(
         "r", encoding="utf-8", newline=""
     ) as stream:
         rows = list(csv.DictReader(stream))
+    for row in rows:
+        for prefix in ("cold_setup", "query_physical_uq"):
+            path = pathlib.Path(row.get(f"{prefix}_runner_manifest", ""))
+            if not path.is_absolute():
+                path = campaign_directory / path
+            expected_hash = row.get(f"{prefix}_runner_manifest_sha256")
+            if not path.is_file() or campaign.sha256_file(path) != expected_hash:
+                raise AnalysisError(f"{prefix} runner manifest is missing or modified")
+            runner_manifest = read_json(path)
+            try:
+                identity = campaign.source_identity(runner_manifest["source"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise AnalysisError(f"invalid {prefix} source provenance: {error}") from error
+            if identity != start_identity:
+                raise AnalysisError(f"{prefix} runner source differs from the campaign freeze")
     points = [validate_row(row, decisions, profile) for row in rows]
     if len(points) != 36:
         raise AnalysisError(f"primary campaign requires 36 measured combined rows, found {len(points)}")
