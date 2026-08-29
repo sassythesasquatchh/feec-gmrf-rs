@@ -10,6 +10,7 @@ RUN apt-get update \
         cmake \
         curl \
         git \
+        libfontconfig1-dev \
         libopenblas-dev \
         libpetsc-real-dev \
         libslepc-real-dev \
