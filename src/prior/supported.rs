@@ -865,6 +865,13 @@ fn assemble_supported_matern_graph(
     let n = blocks.mass.nrows();
     let p = blocks.lower.as_ref().map_or(0, |lower| lower.mass.nrows());
     let tau2 = parameters.tau.powi(2);
+    // Every support equation is homogeneous. Multiplying the complete
+    // constraint operator by the positive Matérn amplitude `tau` therefore
+    // leaves its kernel, and hence the represented Gaussian law, unchanged.
+    // It does, however, keep the KKT blocks balanced when the energy scales as
+    // `tau^2`; without this exact row scaling, physically calibrated priors can
+    // lose covariance symmetry solely through finite-precision solves.
+    let constraint_scale = parameters.tau;
     let (ambient, constraint_dimension, lower_ranges, recurrence_ranges) = match parameters.alpha {
         feg_core::MaternAlpha::One => (
             n + p,
@@ -905,22 +912,40 @@ fn assemble_supported_matern_graph(
             push_block(&mut energy, 0, 0, &blocks.local_system, tau2);
             if let Some(lower) = lower {
                 push_block(&mut energy, n, n, &lower.mass, tau2);
-                push_block(&mut constraints, 0, 0, &lower.coupling.transpose(), -1.0);
-                push_block(&mut constraints, 0, n, &lower.mass, 1.0);
+                push_block(
+                    &mut constraints,
+                    0,
+                    0,
+                    &lower.coupling.transpose(),
+                    -constraint_scale,
+                );
+                push_block(&mut constraints, 0, n, &lower.mass, constraint_scale);
             }
         }
         feg_core::MaternAlpha::Two => {
             let y = n + p;
             push_block(&mut energy, y, y, &blocks.mass, tau2);
             if let Some(lower) = lower {
-                push_block(&mut constraints, 0, 0, &lower.coupling.transpose(), -1.0);
-                push_block(&mut constraints, 0, n, &lower.mass, 1.0);
+                push_block(
+                    &mut constraints,
+                    0,
+                    0,
+                    &lower.coupling.transpose(),
+                    -constraint_scale,
+                );
+                push_block(&mut constraints, 0, n, &lower.mass, constraint_scale);
             }
-            push_block(&mut constraints, p, 0, &blocks.local_system, -1.0);
+            push_block(
+                &mut constraints,
+                p,
+                0,
+                &blocks.local_system,
+                -constraint_scale,
+            );
             if let Some(lower) = lower {
-                push_block(&mut constraints, p, n, &lower.coupling, -1.0);
+                push_block(&mut constraints, p, n, &lower.coupling, -constraint_scale);
             }
-            push_block(&mut constraints, p, y, &blocks.mass, 1.0);
+            push_block(&mut constraints, p, y, &blocks.mass, constraint_scale);
         }
         feg_core::MaternAlpha::Three => {
             let y = n + p;
@@ -928,23 +953,41 @@ fn assemble_supported_matern_graph(
             push_block(&mut energy, y, y, &blocks.local_system, tau2);
             if let Some(lower) = lower {
                 push_block(&mut energy, sigma_one, sigma_one, &lower.mass, tau2);
-                push_block(&mut constraints, 0, 0, &lower.coupling.transpose(), -1.0);
-                push_block(&mut constraints, 0, n, &lower.mass, 1.0);
+                push_block(
+                    &mut constraints,
+                    0,
+                    0,
+                    &lower.coupling.transpose(),
+                    -constraint_scale,
+                );
+                push_block(&mut constraints, 0, n, &lower.mass, constraint_scale);
             }
-            push_block(&mut constraints, p, 0, &blocks.local_system, -1.0);
+            push_block(
+                &mut constraints,
+                p,
+                0,
+                &blocks.local_system,
+                -constraint_scale,
+            );
             if let Some(lower) = lower {
-                push_block(&mut constraints, p, n, &lower.coupling, -1.0);
+                push_block(&mut constraints, p, n, &lower.coupling, -constraint_scale);
             }
-            push_block(&mut constraints, p, y, &blocks.mass, 1.0);
+            push_block(&mut constraints, p, y, &blocks.mass, constraint_scale);
             if let Some(lower) = lower {
                 push_block(
                     &mut constraints,
                     p + n,
                     y,
                     &lower.coupling.transpose(),
-                    -1.0,
+                    -constraint_scale,
                 );
-                push_block(&mut constraints, p + n, sigma_one, &lower.mass, 1.0);
+                push_block(
+                    &mut constraints,
+                    p + n,
+                    sigma_one,
+                    &lower.mass,
+                    constraint_scale,
+                );
             }
         }
     }

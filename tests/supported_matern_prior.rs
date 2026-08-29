@@ -292,6 +292,64 @@ fn exact_supported_law_matches_exact_elimination_for_all_supported_alphas() {
 }
 
 #[test]
+fn exact_supported_law_remains_stable_at_physically_calibrated_tau() {
+    let observation = LinearObservation::new(
+        LinearMap::weighted_row(2, &[(0, 1.0), (1, -0.5)]).unwrap(),
+        vec![0.0],
+        GaussianNoise::variance(0.05).unwrap(),
+    )
+    .unwrap();
+
+    for alpha in [MaternAlpha::One, MaternAlpha::Two, MaternAlpha::Three] {
+        let parameters = MaternParameters::new(alpha, 1.3, 20.0).unwrap();
+        let operators = two_by_two_exact_operators();
+        let exact = ExactMaternPriorBuilder::from_operators(operators.clone())
+            .parameters(parameters)
+            .build()
+            .unwrap();
+        let supported = SupportedMaternPriorBuilder::from_operators(operators)
+            .parameters(parameters)
+            .build()
+            .unwrap();
+
+        let mut exact_factor = exact.factor().unwrap();
+        let exact_prior_covariance = exact_factor
+            .pushforward_covariance(&LinearMap::identity(2))
+            .unwrap();
+        let supported_prior_covariance = supported
+            .factor()
+            .unwrap()
+            .pushforward_covariance_audited(&LinearMap::identity(2))
+            .unwrap();
+        assert_covariance_close(
+            &supported_prior_covariance.symmetric,
+            &exact_prior_covariance,
+            &format!("alpha {alpha:?} calibrated prior covariance"),
+        );
+
+        let mut exact_posterior = LinearGaussianModelBuilder::new(exact)
+            .observe(observation.clone())
+            .unwrap()
+            .condition()
+            .unwrap();
+        let supported_posterior = supported
+            .condition(std::slice::from_ref(&observation), &[])
+            .unwrap();
+        let exact_posterior_covariance = exact_posterior
+            .pushforward_covariance(&LinearMap::identity(2))
+            .unwrap();
+        let supported_posterior_covariance = supported_posterior
+            .pushforward_covariance_audited(&LinearMap::identity(2))
+            .unwrap();
+        assert_covariance_close(
+            &supported_posterior_covariance.symmetric,
+            &exact_posterior_covariance,
+            &format!("alpha {alpha:?} calibrated posterior covariance"),
+        );
+    }
+}
+
+#[test]
 fn supported_weighted_physical_trace_matches_dense_reference_and_hutchinson() {
     let supported = SupportedMaternPriorBuilder::from_operators(two_by_two_exact_operators())
         .parameters(MaternParameters::new(MaternAlpha::Two, 1.3, 0.7).unwrap())
