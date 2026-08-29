@@ -209,6 +209,34 @@ class SpectralRankRunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "requires refinement 10"):
                 runner.resolve_profile(profile, 8, None)
 
+    def test_projected_amplitude_calibration_profile_is_focused_and_immutable(self):
+        for refinement, dimension in [(8, 3032), (10, 6130)]:
+            profile = f"projected-amplitude-calibration-v1-n{refinement}"
+            parsed = runner.parse_args(
+                [
+                    "--profile",
+                    profile,
+                    "--refinement",
+                    str(refinement),
+                    "--output",
+                    "/tmp/c51-calibration",
+                ]
+            )
+            self.assertEqual(parsed.profile, profile)
+            resolved = runner.resolve_profile(profile, refinement, None)
+            self.assertEqual(resolved["maximum_rank"], 1)
+            self.assertEqual(resolved["rank_grid"], [1])
+            self.assertEqual(resolved["expected_state_dimension"], dimension)
+            self.assertEqual(
+                resolved["evidence_tier"], "projected_amplitude_calibration"
+            )
+            self.assertFalse(resolved["rank_decision_required"])
+            self.assertTrue(resolved["post_primary"])
+            with self.assertRaisesRegex(ValueError, "requires refinement"):
+                runner.resolve_profile(profile, 10 if refinement == 8 else 8, None)
+            with self.assertRaisesRegex(ValueError, "rejects --maximum-rank"):
+                runner.resolve_profile(profile, refinement, 1)
+
     def test_build_is_locked_release_example(self):
         self.assertEqual(
             runner.build_command("cargo"),

@@ -78,6 +78,20 @@ HIGH_OBSERVATION_PROFILES = {
         "evidence_tier": "high_observation_confirmatory_accuracy",
     },
 }
+PROJECTED_AMPLITUDE_CALIBRATION_PROFILES = {
+    "projected-amplitude-calibration-v1-n8": {
+        "refinement": 8,
+        "state_dimension": 3032,
+        "ranks": (1,),
+        "evidence_tier": "projected_amplitude_calibration",
+    },
+    "projected-amplitude-calibration-v1-n10": {
+        "refinement": 10,
+        "state_dimension": 6130,
+        "ranks": (1,),
+        "evidence_tier": "projected_amplitude_calibration",
+    },
+}
 REPLAY_PROFILES = {
     "high-observation-m2048-replay-v1-n8-r3032": {
         "refinement": 8,
@@ -395,6 +409,28 @@ def resolve_profile(
             "evidence_tier": frozen["evidence_tier"],
             "post_primary": False,
             "post_primary_rationale": "accuracy-only replay selecting the next proof-grade rank solve",
+            "rank_decision_required": False,
+        }
+    if profile in PROJECTED_AMPLITUDE_CALIBRATION_PROFILES:
+        frozen = PROJECTED_AMPLITUDE_CALIBRATION_PROFILES[profile]
+        if refinement != frozen["refinement"]:
+            raise ValueError(
+                f"{profile} requires refinement {frozen['refinement']}, received {refinement}"
+            )
+        if maximum_rank is not None:
+            raise ValueError(f"{profile} has an immutable grid and rejects --maximum-rank")
+        return {
+            "profile": profile,
+            "refinement": refinement,
+            "maximum_rank": frozen["ranks"][-1],
+            "rank_grid": list(frozen["ranks"]),
+            "expected_state_dimension": frozen["state_dimension"],
+            "evidence_tier": frozen["evidence_tier"],
+            "post_primary": True,
+            "post_primary_rationale": (
+                "focused non-leaking physical-RMS calibration; the one-mode "
+                "spectral row is archive bookkeeping only"
+            ),
             "rank_decision_required": False,
         }
     raise ValueError(f"unknown C51 spectral covariance profile {profile}")
@@ -1185,6 +1221,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
             PRIMARY_PROFILE,
             *RANK_EXTENSION_PROFILES,
             *HIGH_OBSERVATION_PROFILES,
+            *PROJECTED_AMPLITUDE_CALIBRATION_PROFILES,
             *REPLAY_PROFILES,
         ),
         default=PRIMARY_PROFILE,

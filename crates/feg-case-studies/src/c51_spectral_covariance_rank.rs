@@ -113,6 +113,17 @@ pub const C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8: &str =
 pub const C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10: &str =
     "high-observation-confirmatory-m4096-v1-n10";
 pub const C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT: usize = 4_096;
+/// Focused evidence profiles for the projected-Whitney amplitude calibration.
+///
+/// The single retained spectral mode is bookkeeping required by this study's
+/// archive schema; it is not a baseline or a rank claim.  These profiles exist
+/// to evaluate the raw and calibrated compact precisions without repeating the
+/// preregistered multi-thousand-mode spectral ladders.
+pub const C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8: &str =
+    "projected-amplitude-calibration-v1-n8";
+pub const C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10: &str =
+    "projected-amplitude-calibration-v1-n10";
+pub const C51_PROJECTED_AMPLITUDE_CALIBRATION_RANKS: [usize; 1] = [1];
 pub const C51_PERFORMANCE_OUTPUT_DESIGN_ID: &str =
     "rank_study_selection_and_held_out_wendland_c2_18";
 pub const C51_PERFORMANCE_RANK_DECISION_SCHEMA_VERSION: &str = "c51-performance-rank-decisions-v2";
@@ -394,8 +405,40 @@ impl C51SpectralCovarianceRankConfig {
         Ok(config)
     }
 
+    /// Focused `m=4096` raw-versus-calibrated projected-Whitney accuracy gate.
+    ///
+    /// Calibration uses the exact FEEC prior RMS on the frozen selection bank;
+    /// the disjoint held-out bank is reserved for evaluation. The one-mode
+    /// spectral row merely satisfies the shared archive contract and is not
+    /// interpreted as a competitive spectral approximation.
+    pub fn projected_amplitude_calibration(refinement: usize) -> Result<Self> {
+        let profile = match refinement {
+            8 => C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8,
+            10 => C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10,
+            _ => {
+                return Err(invalid(
+                    "C51 projected-amplitude calibration refinement must be 8 or 10",
+                ))
+            }
+        };
+        let config = Self {
+            profile: profile.to_string(),
+            refinements: vec![refinement],
+            ranks: C51_PROJECTED_AMPLITUDE_CALIBRATION_RANKS.to_vec(),
+            requested_maximum_rank: None,
+            alphas: vec![MaternAlpha::Two],
+            observation_kernel_radius: C51_FIXED_OBSERVATION_RADIUS,
+            maximum_basis_storage_bytes: 512 * 1024 * 1024,
+            ..Self::smoke()
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn evidence_tier(&self) -> &'static str {
-        if self.is_high_observation_primary() {
+        if self.is_projected_amplitude_calibration() {
+            "projected_amplitude_calibration"
+        } else if self.is_high_observation_primary() {
             "high_observation_primary_accuracy"
         } else if self.is_high_observation_replay() {
             "high_observation_replay_accuracy_only"
@@ -413,7 +456,9 @@ impl C51SpectralCovarianceRankConfig {
     }
 
     pub fn post_primary_rationale(&self) -> Option<&'static str> {
-        if self.is_high_observation_primary() {
+        if self.is_projected_amplitude_calibration() {
+            Some("focused non-leaking physical-RMS amplitude calibration of the projected-Whitney prior; the one-mode spectral bookkeeping row carries no rank or performance claim")
+        } else if self.is_high_observation_primary() {
             Some("claim-bearing pre-performance m=2048 rank gate with 5% primary and 2% sensitivity thresholds")
         } else if self.is_high_observation_replay() {
             Some("accuracy-only replay of previously generated modes to select the next proof-grade exact-request rank; timing and rank-decision export are forbidden")
@@ -445,6 +490,8 @@ impl C51SpectralCovarianceRankConfig {
             C51_HIGH_OBSERVATION_CONFIRMATORY_RANK_EXTENSION_PROFILE_N10 => Some(6_130),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N8 => Some(3_032),
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => Some(6_130),
+            C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8 => Some(3_032),
+            C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10 => Some(6_130),
             _ => None,
         }
     }
@@ -500,11 +547,20 @@ impl C51SpectralCovarianceRankConfig {
         )
     }
 
+    fn is_projected_amplitude_calibration(&self) -> bool {
+        matches!(
+            self.profile.as_str(),
+            C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8
+                | C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10
+        )
+    }
+
     fn is_any_high_observation(&self) -> bool {
         self.is_high_observation_primary()
             || self.is_high_observation_replay()
             || self.is_high_observation_confirmatory()
             || self.is_high_observation_confirmatory_rank_extension()
+            || self.is_projected_amplitude_calibration()
             || self.is_high_observation_accuracy()
     }
 
@@ -517,6 +573,7 @@ impl C51SpectralCovarianceRankConfig {
         } else if self.is_high_observation_confirmatory()
             || self.is_high_observation_confirmatory_replay()
             || self.is_high_observation_confirmatory_rank_extension()
+            || self.is_projected_amplitude_calibration()
         {
             &[C51_HIGH_OBSERVATION_CONFIRMATORY_COUNT]
         } else if self.is_high_observation_accuracy() {
@@ -535,6 +592,7 @@ impl C51SpectralCovarianceRankConfig {
         } else if self.is_high_observation_confirmatory()
             || self.is_high_observation_confirmatory_replay()
             || self.is_high_observation_confirmatory_rank_extension()
+            || self.is_projected_amplitude_calibration()
         {
             &[C51CovarianceDesign::HighM4096]
         } else if self.is_high_observation_accuracy() {
@@ -647,6 +705,12 @@ impl C51SpectralCovarianceRankConfig {
             }
             C51_HIGH_OBSERVATION_CONFIRMATORY_PROFILE_N10 => {
                 Some((10, C51_HIGH_OBSERVATION_RANKS_N10.as_slice()))
+            }
+            C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8 => {
+                Some((8, C51_PROJECTED_AMPLITUDE_CALIBRATION_RANKS.as_slice()))
+            }
+            C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10 => {
+                Some((10, C51_PROJECTED_AMPLITUDE_CALIBRATION_RANKS.as_slice()))
             }
             _ => None,
         };
@@ -1948,6 +2012,8 @@ impl C51SpectralCovarianceRankArchive {
                 "exploratory_m2048_replay_no_rank_decision"
             } else if self.config.is_high_observation_confirmatory() {
                 "confirmatory_m4096_only"
+            } else if self.config.is_projected_amplitude_calibration() {
+                "projected_amplitude_calibration_only_no_spectral_rank_decision"
             } else {
                 "contextual_stress_only_no_performance_rank_selection"
             };
@@ -4626,6 +4692,35 @@ mod tests {
             extension.evidence_tier(),
             "high_observation_confirmatory_rank_extension"
         );
+    }
+
+    #[test]
+    fn projected_amplitude_calibration_profiles_freeze_nonleaking_m4096_gate() {
+        for (refinement, dimension, profile) in [
+            (8, 3_032, C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8),
+            (10, 6_130, C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10),
+        ] {
+            let config =
+                C51SpectralCovarianceRankConfig::projected_amplitude_calibration(refinement)
+                    .unwrap();
+            assert_eq!(config.profile, profile);
+            assert_eq!(config.refinements, [refinement]);
+            assert_eq!(config.expected_state_dimension(), Some(dimension));
+            assert_eq!(config.ranks, [1]);
+            assert_eq!(config.alphas, [MaternAlpha::Two]);
+            assert_eq!(config.high_observation_counts(), [4_096]);
+            assert_eq!(
+                config.covariance_designs(),
+                [C51CovarianceDesign::HighM4096]
+            );
+            assert_eq!(config.evidence_tier(), "projected_amplitude_calibration");
+            assert!(config.post_primary_rationale().is_some());
+
+            let mut mutated = config;
+            mutated.ranks = vec![2];
+            assert!(mutated.validate().is_err());
+        }
+        assert!(C51SpectralCovarianceRankConfig::projected_amplitude_calibration(6).is_err());
     }
 
     #[test]

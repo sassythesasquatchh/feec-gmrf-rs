@@ -7,7 +7,8 @@ use feg_case_studies::c51_spectral_covariance_rank::{
     C51_HIGH_OBSERVATION_CONFIRMATORY_REPLAY_PROFILE_N8, C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N10,
     C51_HIGH_OBSERVATION_PRIMARY_PROFILE_N8, C51_HIGH_OBSERVATION_PROFILE_N10,
     C51_HIGH_OBSERVATION_PROFILE_N8, C51_HIGH_OBSERVATION_REPLAY_PROFILE_N10,
-    C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10,
+    C51_HIGH_OBSERVATION_REPLAY_PROFILE_N8, C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10,
+    C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8, C51_SPECTRAL_RANK_EXTENSION_PROFILE_N10,
     C51_SPECTRAL_RANK_EXTENSION_PROFILE_N8,
 };
 use std::env;
@@ -228,6 +229,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
             C51SpectralCovarianceRankConfig::high_observation_confirmatory_rank_extension_n10()?
+        }
+        C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8
+        | C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N10 => {
+            let expected_refinement = if profile == C51_PROJECTED_AMPLITUDE_CALIBRATION_PROFILE_N8 {
+                8
+            } else {
+                10
+            };
+            validate_focused_profile_arguments(
+                &profile,
+                refinement,
+                expected_refinement,
+                maximum_rank,
+            )?;
+            if basis_workspace.is_some()
+                || rank_decision_output.is_some()
+                || perf0_archive.is_some()
+            {
+                return Err(
+                    "the projected-amplitude calibration profile accepts no replay or rank-decision artifacts"
+                        .into(),
+                );
+            }
+            C51SpectralCovarianceRankConfig::projected_amplitude_calibration(expected_refinement)?
         }
         _ => return Err(format!("unknown C51 spectral covariance profile {profile}").into()),
     };
