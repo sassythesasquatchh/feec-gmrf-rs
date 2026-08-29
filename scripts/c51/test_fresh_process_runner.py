@@ -222,6 +222,29 @@ class FreshProcessRunnerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sensor count must be one of"):
             runner.requested_resource_selection(arguments)
 
+    def test_exact_juq_profile_adds_augmented_same_law_method_without_mutating_v1(self):
+        common = [
+            "--resource-method",
+            "fm_aug",
+            "--refinement",
+            "8",
+            "--observation-class",
+            "fixed_footprint_magnetic_volume",
+            "--sensor-count",
+            "4096",
+            "--repeated-data",
+            "1",
+            "--workload-phase",
+            "cold_setup",
+            "--cgroup-mode",
+            "required",
+        ]
+        exact = runner.parse_args(["--profile", "juq-exact-performance-v1", *common])
+        self.assertEqual(runner.requested_resource_selection(exact)["method"], "fm_aug")
+        original = runner.parse_args(["--profile", "juq-performance-v1", *common])
+        with self.assertRaisesRegex(ValueError, "method must be one of"):
+            runner.requested_resource_selection(original)
+
     def test_performance_eligibility_rejects_shared_spectral_basis(self):
         selection = {
             "method": "spectral_low_rank",

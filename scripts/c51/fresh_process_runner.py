@@ -42,7 +42,8 @@ THREAD_ENV_NAMES = (
     "RAYON_NUM_THREADS",
     "FAER_NUM_THREADS",
 )
-SUPPORTED_PROFILES = ("smoke", "juq-performance-v1")
+SUPPORTED_PROFILES = ("smoke", "juq-performance-v1", "juq-exact-performance-v1")
+PUBLICATION_PROFILES = ("juq-performance-v1", "juq-exact-performance-v1")
 RESOURCE_METHODS = (
     "fm_direct",
     "fm_aug",
@@ -63,6 +64,11 @@ JUQ_PERFORMANCE_SENSOR_COUNTS = (512, 2048, 4096, 5184)
 JUQ_PERFORMANCE_REPEATED_DATA_COUNTS = (1, 100)
 JUQ_PERFORMANCE_METHODS = (
     "whitney_compact",
+    "exact_observation_gp",
+    "spectral_low_rank",
+)
+JUQ_EXACT_PERFORMANCE_METHODS = (
+    "fm_aug",
     "exact_observation_gp",
     "spectral_low_rank",
 )
@@ -717,8 +723,8 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
         )
         if any(value is not None for value in resource_values):
             raise ValueError("resource selectors require --resource-method")
-        if args.profile == "juq-performance-v1":
-            raise ValueError("juq-performance-v1 supports only one method-phase resource cell")
+        if args.profile in PUBLICATION_PROFILES:
+            raise ValueError(f"{args.profile} supports only one method-phase resource cell")
         return None
     required = {
         "--refinement": args.refinement,
@@ -758,41 +764,47 @@ def requested_resource_selection(args: argparse.Namespace) -> dict[str, Any] | N
         "spectral_rank": args.spectral_rank,
         "workload_phase": args.workload_phase,
     }
-    if args.profile == "juq-performance-v1":
-        validate_juq_performance_selection(selection)
+    if args.profile in PUBLICATION_PROFILES:
+        validate_juq_performance_selection(selection, args.profile)
     return selection
 
 
-def validate_juq_performance_selection(selection: Mapping[str, Any]) -> None:
+def validate_juq_performance_selection(
+    selection: Mapping[str, Any], profile: str = "juq-performance-v1"
+) -> None:
     if selection["refinement"] not in JUQ_PERFORMANCE_REFINEMENTS:
         raise ValueError(
-            "juq-performance-v1 refinement must be one of "
+            f"{profile} refinement must be one of "
             + ", ".join(map(str, JUQ_PERFORMANCE_REFINEMENTS))
         )
     if selection["observation_class"] != "fixed_footprint_magnetic_volume":
         raise ValueError(
-            "juq-performance-v1 requires the frozen fixed-footprint magnetic-volume design"
+            f"{profile} requires the frozen fixed-footprint magnetic-volume design"
         )
     if selection["sensor_target_kind"] != "count":
-        raise ValueError("juq-performance-v1 requires an exact frozen scalar sensor count")
+        raise ValueError(f"{profile} requires an exact frozen scalar sensor count")
     if selection["sensor_target_value"] not in JUQ_PERFORMANCE_SENSOR_COUNTS:
         raise ValueError(
-            "juq-performance-v1 sensor count must be one of "
+            f"{profile} sensor count must be one of "
             + ", ".join(map(str, JUQ_PERFORMANCE_SENSOR_COUNTS))
         )
     if selection["repeated_data_count"] not in JUQ_PERFORMANCE_REPEATED_DATA_COUNTS:
         raise ValueError(
-            "juq-performance-v1 replacement-data count must be one of "
+            f"{profile} replacement-data count must be one of "
             + ", ".join(map(str, JUQ_PERFORMANCE_REPEATED_DATA_COUNTS))
         )
-    if selection["method"] not in JUQ_PERFORMANCE_METHODS:
+    methods = (
+        JUQ_EXACT_PERFORMANCE_METHODS
+        if profile == "juq-exact-performance-v1"
+        else JUQ_PERFORMANCE_METHODS
+    )
+    if selection["method"] not in methods:
         raise ValueError(
-            "juq-performance-v1 method must be one of "
-            + ", ".join(JUQ_PERFORMANCE_METHODS)
+            f"{profile} method must be one of " + ", ".join(methods)
         )
     if selection["workload_phase"] not in ("cold_setup", "query_physical_uq"):
         raise ValueError(
-            "juq-performance-v1 requires cold_setup or the common query_physical_uq phase"
+            f"{profile} requires cold_setup or the common query_physical_uq phase"
         )
 
 
@@ -829,14 +841,14 @@ def resource_scope(
             "publication_crossover_eligible": False,
             "reason": "the all-method accuracy archive shares one process and cannot own method RSS",
         }
-    publication_profile = profile == "juq-performance-v1"
+    publication_profile = profile in PUBLICATION_PROFILES
     return {
         "kind": "method_phase",
         "row_attribution_eligible": True,
         "publication_crossover_eligible": publication_profile,
         "selection": dict(selection),
         "reason": (
-            "juq-performance-v1 cell is provisionally attributable; final eligibility requires the row gate and a valid paired phase"
+            f"{profile} cell is provisionally attributable; final eligibility requires the row gate and a valid paired phase"
             if publication_profile
             else "one process owns one method-phase RSS measurement; discovery rows are not publication crossover evidence"
         ),
@@ -1047,7 +1059,7 @@ def plan(args: argparse.Namespace, repository: pathlib.Path) -> dict[str, Any]:
         "replicate": args.replicate,
         "profile_support": {
             "supported": list(SUPPORTED_PROFILES),
-            "note": "smoke supports discovery; juq-performance-v1 accepts only one frozen method-phase resource cell",
+            "note": "smoke supports discovery; each JUQ profile accepts one frozen method-phase resource cell",
         },
         "resource_scope": resource_scope(selection, args.profile),
         "repository": str(repository),
@@ -1086,9 +1098,9 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
     except ValueError as error:
         print(str(error), file=sys.stderr)
         return 2
-    if args.profile == "juq-performance-v1" and args.cgroup_mode != "required":
+    if args.profile in PUBLICATION_PROFILES and args.cgroup_mode != "required":
         print(
-            "juq-performance-v1 requires --cgroup-mode required for process-tree RSS",
+            f"{args.profile} requires --cgroup-mode required for process-tree RSS",
             file=sys.stderr,
         )
         return 2
@@ -1125,7 +1137,7 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
         "replicate": args.replicate,
         "profile_support": {
             "supported": list(SUPPORTED_PROFILES),
-            "note": "smoke supports discovery; juq-performance-v1 is one immutable isolated resource cell",
+            "note": "smoke supports discovery; each JUQ profile is one immutable isolated resource cell",
         },
         "resource_scope": resource_scope(selection, args.profile),
         "runner": {
@@ -1203,7 +1215,7 @@ def run_benchmark(args: argparse.Namespace, script_path: pathlib.Path) -> int:
                 study_output / "rows.csv",
                 selection,
                 result.manifest["peak_rss_archive_process"],
-                require_performance_eligible=args.profile == "juq-performance-v1",
+                require_performance_eligible=args.profile in PUBLICATION_PROFILES,
             )
         elif selection is not None:
             result.manifest["peak_rss_row_attribution"] = unavailable(

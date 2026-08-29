@@ -3315,6 +3315,55 @@ fn run_selected_supported_resource(
         "the sparse LU backend does not expose separate numeric factorization",
     );
     row.combined_factor_setup_ns = duration_measurement(setup_elapsed);
+    if selection.phase == C51ResourcePhase::QueryPhysicalUq {
+        let values = repeated_observation_values(
+            design.sensor_count,
+            selection.repeated_data_count,
+            config.seed,
+        );
+        let repeated_start = Instant::now();
+        let mut final_posterior = None;
+        for (index, data) in values.iter().enumerate() {
+            if index + 1 == values.len() {
+                let posterior =
+                    prepared.condition_with_observation_values(std::slice::from_ref(data))?;
+                std::hint::black_box(problem.physical_qoi.apply(posterior.mean())?);
+                final_posterior = Some(posterior);
+            } else {
+                let mean =
+                    prepared.latent_mean_with_observation_values(std::slice::from_ref(data))?;
+                std::hint::black_box(problem.physical_qoi.apply(&mean)?);
+            }
+        }
+        row.repeated_data_ns = duration_measurement(repeated_start.elapsed());
+        let posterior =
+            final_posterior.expect("positive replacement-data count produces a posterior");
+        let physical_start = Instant::now();
+        let covariance = posterior.pushforward_covariance(&problem.physical_qoi)?;
+        let covariance_action = dense_rows_times_vector(
+            &covariance,
+            &problem.physical_qoi_probe,
+            "C51 supported physical covariance",
+        )?;
+        std::hint::black_box(&covariance_action);
+        std::hint::black_box(dot(&problem.physical_qoi_probe, &covariance_action)?);
+        row.physical_qoi_ns = duration_measurement(physical_start.elapsed());
+        let variance_start = Instant::now();
+        let variances = dense_rows_diagonal(&covariance, "C51 supported physical covariance")?;
+        row.variance_estimation_ns = duration_measurement(variance_start.elapsed());
+        row.covariance_action_ns = C51Measurement::unavailable(
+            "the common physical-UQ workload excludes latent covariance actions",
+        );
+        row.sampling_ns = C51Measurement::unavailable(
+            "the common physical-UQ workload excludes latent state sampling",
+        );
+        row.physical_transformed_variance_min_raw =
+            C51Measurement::Measured(minimum_raw(&variances));
+        row.physical_transformed_variance_negative_count =
+            C51Measurement::Measured(negative_count(&variances));
+        row.common_physical_uq_workload_eligible = true;
+        row.full_uq_workload_eligible = false;
+    }
     Ok(row)
 }
 
@@ -5590,6 +5639,7 @@ mod tests {
     #[test]
     fn common_physical_query_excludes_latent_work_for_compact_and_exact_gp() {
         for method in [
+            C51MethodId::FullMetricAugmented,
             C51MethodId::WhitneyCompact,
             C51MethodId::ExactObservationSpaceGp,
         ] {
