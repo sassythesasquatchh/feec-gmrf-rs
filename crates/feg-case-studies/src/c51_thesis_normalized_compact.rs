@@ -28,20 +28,21 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str =
-    "c51-thesis-normalized-flux-cochain-v4";
+    "c51-thesis-normalized-flux-cochain-v5";
 pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str =
     "c51/thesis-normalized-flux-cochain-accuracy";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v4-n8";
+    "thesis-magnetic-trace-normalized-flux-cochain-v5-n8";
 pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v4-n10";
+    "thesis-magnetic-trace-normalized-flux-cochain-v5-n10";
 pub const C51_SURFACE_FLUX_QOI_DESIGN_ID: &str = "c51-midplane-quadrant-fluxes-v1";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
 pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
 pub const C51_THESIS_TRACE_PROBES: usize = 512;
 pub const C51_THESIS_TRACE_BATCHES: usize = 8;
 pub const C51_THESIS_TRACE_SEED: u64 = 0xC51B_7ACE;
-pub const C51_THESIS_OBSERVATION_COUNT: usize = 4_096;
+pub const C51_THESIS_OBSERVATION_COUNT_N8: usize = 4_096;
+pub const C51_THESIS_OBSERVATION_COUNT_N10: usize = 8_192;
 pub const C51_THESIS_SELECTION_FLUX_COUNT: usize = 64;
 pub const C51_THESIS_HELD_OUT_FLUX_COUNT: usize = 64;
 
@@ -62,9 +63,15 @@ pub struct C51ThesisNormalizedCompactConfig {
 
 impl C51ThesisNormalizedCompactConfig {
     pub fn publication(refinement: usize) -> Result<Self> {
-        let profile = match refinement {
-            8 => C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8,
-            10 => C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10,
+        let (profile, observation_count) = match refinement {
+            8 => (
+                C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8,
+                C51_THESIS_OBSERVATION_COUNT_N8,
+            ),
+            10 => (
+                C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10,
+                C51_THESIS_OBSERVATION_COUNT_N10,
+            ),
             _ => {
                 return Err(feec_gmrf::FeecGmrfError::InvalidParameter(
                     "C51 thesis-normalized refinement must be 8 or 10".to_string(),
@@ -80,7 +87,7 @@ impl C51ThesisNormalizedCompactConfig {
             target_b_rms_tesla: C51_THESIS_TARGET_B_RMS_TESLA,
             observation_noise_variance_weber_squared: C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER
                 .powi(2),
-            observation_count: C51_THESIS_OBSERVATION_COUNT,
+            observation_count,
             trace_probes: C51_THESIS_TRACE_PROBES,
             trace_batches: C51_THESIS_TRACE_BATCHES,
             trace_seed: C51_THESIS_TRACE_SEED,
@@ -300,13 +307,14 @@ impl C51ThesisNormalizedCompactReport {
 
     fn write_summary_csv(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,local_prior_heldout_primary,local_posterior_heldout_primary,surface_prior_heldout_primary,surface_posterior_heldout_primary")?;
-        writeln!(writer, "{},{},{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e}",
+        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,observation_to_state_ratio,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,local_prior_heldout_primary,local_posterior_heldout_primary,surface_prior_heldout_primary,surface_posterior_heldout_primary")?;
+        writeln!(writer, "{},{},{},{},{},{:.17e},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e}",
             C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
             self.config.profile,
             self.config.refinement,
             self.state_dimension,
             self.config.observation_count,
+            self.config.observation_count as f64 / self.state_dimension as f64,
             C51_THESIS_SELECTION_FLUX_COUNT,
             C51_THESIS_HELD_OUT_FLUX_COUNT,
             self.config.observation_noise_variance_weber_squared,
@@ -408,6 +416,11 @@ impl C51ThesisNormalizedCompactReport {
             writer,
             "observation_count: {}",
             self.config.observation_count
+        )?;
+        writeln!(
+            writer,
+            "observation_to_state_ratio: {:.17e}",
+            self.config.observation_count as f64 / self.state_dimension as f64
         )?;
         writeln!(
             writer,
@@ -606,6 +619,16 @@ mod tests {
         assert!((calibration.precision_scale - 36.0).abs() < 1.0e-12);
         assert!((calibration.tau_multiplier - 6.0).abs() < 1.0e-12);
         assert!((calibration.normalized_b_rms - 0.10).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn publication_profiles_hold_high_data_density() {
+        let n8 = C51ThesisNormalizedCompactConfig::publication(8).unwrap();
+        let n10 = C51ThesisNormalizedCompactConfig::publication(10).unwrap();
+        assert_eq!(n8.observation_count, C51_THESIS_OBSERVATION_COUNT_N8);
+        assert_eq!(n10.observation_count, C51_THESIS_OBSERVATION_COUNT_N10);
+        assert!(n8.observation_count > 3_032);
+        assert!(n10.observation_count > 6_130);
     }
 
     #[test]
