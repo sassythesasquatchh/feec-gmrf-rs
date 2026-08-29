@@ -43,10 +43,11 @@ pub use crate::operator::{
 };
 pub use crate::physical::{
     calibrate_prior_to_physical_rms, calibrate_prior_to_physical_rms_with_method,
-    calibrate_prior_to_weighted_physical_rms, calibrate_prior_to_weighted_physical_rms_with_method,
-    magnetic_field_map, outward_boundary_flux_map_3d, reconstructed_barycenter_1form_map,
-    scalar_field_l2_rms_weights, MagneticFieldMaps3d, MagneticVolumeSensorBank3d, PhysicalMap,
-    PhysicalRmsCalibration, WendlandC2Kernel3d,
+    calibrate_prior_to_posterior_physical_rms, calibrate_prior_to_weighted_physical_rms,
+    calibrate_prior_to_weighted_physical_rms_with_method, magnetic_field_map,
+    outward_boundary_flux_map_3d, reconstructed_barycenter_1form_map, scalar_field_l2_rms_weights,
+    MagneticFieldMaps3d, MagneticVolumeSensorBank3d, PhysicalMap, PhysicalRmsCalibration,
+    PosteriorPhysicalRmsCalibration, PosteriorPhysicalRmsCalibrationOptions, WendlandC2Kernel3d,
 };
 pub use crate::prior::supported::{
     AuditedSupportedCovariance, PreparedSupportedMaternModel, SupportedCovarianceSymmetryAudit,

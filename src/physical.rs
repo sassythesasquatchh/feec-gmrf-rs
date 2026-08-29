@@ -1,6 +1,9 @@
 //! Physical outputs represented as explicit compositions of FEEC operators.
 
-use crate::model::DerivedQuantity;
+use crate::infer::Posterior;
+use crate::model::{
+    DerivedQuantity, LinearConstraint, LinearGaussianModelBuilder, LinearObservation,
+};
 use crate::operator::LinearMap;
 use crate::prior::GaussianPrior;
 use crate::{FeecGmrfError, Result};
@@ -442,6 +445,240 @@ impl PhysicalRmsCalibration {
     }
 }
 
+/// Controls a one-parameter calibration of prior precision against posterior
+/// physical RMS after a fixed linear-Gaussian conditioning design.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PosteriorPhysicalRmsCalibrationOptions {
+    /// Required relative error in the achieved posterior RMS.
+    pub relative_tolerance: f64,
+    /// Maximum log-scale bisection steps after a bracket has been found.
+    pub maximum_iterations: usize,
+    /// Maximum geometric expansions used to bracket the target.
+    pub maximum_bracket_expansions: usize,
+    /// Positive factor by which the precision scale is expanded or contracted.
+    pub bracket_expansion_factor: f64,
+}
+
+impl Default for PosteriorPhysicalRmsCalibrationOptions {
+    fn default() -> Self {
+        Self {
+            relative_tolerance: 1.0e-6,
+            maximum_iterations: 32,
+            maximum_bracket_expansions: 16,
+            bracket_expansion_factor: 4.0,
+        }
+    }
+}
+
+impl PosteriorPhysicalRmsCalibrationOptions {
+    pub fn validate(self) -> Result<Self> {
+        if !self.relative_tolerance.is_finite() || self.relative_tolerance <= 0.0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "posterior RMS calibration tolerance must be finite and positive".to_string(),
+            ));
+        }
+        if self.maximum_iterations == 0 || self.maximum_bracket_expansions == 0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "posterior RMS calibration iteration limits must be positive".to_string(),
+            ));
+        }
+        if !self.bracket_expansion_factor.is_finite() || self.bracket_expansion_factor <= 1.0 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "posterior RMS calibration bracket factor must be finite and greater than one"
+                    .to_string(),
+            ));
+        }
+        Ok(self)
+    }
+}
+
+/// Result of calibrating one prior-precision scalar to a posterior physical RMS.
+///
+/// The observation operators and noise model are held fixed. For a Matérn
+/// prior, [`Self::tau_multiplier`] is the scalar applied to `tau` before the
+/// model is conditioned again. This is distinct from scaling an already
+/// conditioned covariance: the returned [`Posterior`] is the coherent
+/// posterior of the recalibrated prior and the original likelihood.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PosteriorPhysicalRmsCalibration {
+    pub uncalibrated_rms: f64,
+    pub target_rms: f64,
+    pub achieved_rms: f64,
+    pub precision_scale: f64,
+    pub relative_error: f64,
+    pub bracket_expansions: usize,
+    pub iterations: usize,
+}
+
+impl PosteriorPhysicalRmsCalibration {
+    /// Scalar multiplying a Matérn `tau` whose precision is proportional to
+    /// `tau^2`.
+    pub fn tau_multiplier(self) -> f64 {
+        self.precision_scale.sqrt()
+    }
+}
+
+/// Calibrate one global prior-precision scalar so the conditioned model has a
+/// requested RMS physical standard deviation.
+///
+/// Every trial uses the same observations, observation noise, hard
+/// constraints, and physical map. The scalar is found by bracketed bisection
+/// in log precision, exploiting the monotone decrease of posterior covariance
+/// with increasing proper prior precision. The final posterior is rebuilt at
+/// the selected scale; no post-hoc covariance multiplication is performed.
+pub fn calibrate_prior_to_posterior_physical_rms(
+    prior: &GaussianPrior,
+    observations: &[LinearObservation],
+    constraints: &[LinearConstraint],
+    physical_map: &LinearMap,
+    target_rms: f64,
+    options: PosteriorPhysicalRmsCalibrationOptions,
+) -> Result<(GaussianPrior, Posterior, PosteriorPhysicalRmsCalibration)> {
+    let options = options.validate()?;
+    if !target_rms.is_finite() || target_rms <= 0.0 {
+        return Err(FeecGmrfError::InvalidParameter(
+            "target posterior physical RMS must be finite and positive".to_string(),
+        ));
+    }
+    if physical_map.output_dimension() == 0 {
+        return Err(FeecGmrfError::InvalidParameter(
+            "posterior physical RMS calibration requires at least one output".to_string(),
+        ));
+    }
+
+    let evaluate = |scale: f64| -> Result<(GaussianPrior, Posterior, f64)> {
+        let scaled = prior.with_precision_scale(scale)?;
+        let mut builder = LinearGaussianModelBuilder::new(scaled.clone());
+        for observation in observations {
+            builder = builder.observe(observation.clone())?;
+        }
+        for constraint in constraints {
+            builder = builder.constrain(constraint.clone())?;
+        }
+        let mut posterior = builder.condition()?;
+        let covariance = posterior.pushforward_covariance(physical_map)?;
+        let rms = covariance_mean_marginal_rms(&covariance)?;
+        Ok((scaled, posterior, rms))
+    };
+
+    let (uncalibrated_prior, uncalibrated_posterior, uncalibrated_rms) = evaluate(1.0)?;
+    let relative_error = (uncalibrated_rms - target_rms).abs() / target_rms;
+    if relative_error <= options.relative_tolerance {
+        return Ok((
+            uncalibrated_prior,
+            uncalibrated_posterior,
+            PosteriorPhysicalRmsCalibration {
+                uncalibrated_rms,
+                target_rms,
+                achieved_rms: uncalibrated_rms,
+                precision_scale: 1.0,
+                relative_error,
+                bracket_expansions: 0,
+                iterations: 0,
+            },
+        ));
+    }
+
+    let mut lower_scale;
+    let mut lower_rms;
+    let mut upper_scale;
+    let mut upper_rms;
+    let mut bracket_expansions = 0;
+    if uncalibrated_rms > target_rms {
+        lower_scale = 1.0;
+        lower_rms = uncalibrated_rms;
+        upper_scale = 1.0;
+        upper_rms = uncalibrated_rms;
+        while upper_rms > target_rms && bracket_expansions < options.maximum_bracket_expansions {
+            upper_scale *= options.bracket_expansion_factor;
+            if !upper_scale.is_finite() {
+                break;
+            }
+            upper_rms = evaluate(upper_scale)?.2;
+            bracket_expansions += 1;
+        }
+    } else {
+        upper_scale = 1.0;
+        upper_rms = uncalibrated_rms;
+        lower_scale = 1.0;
+        lower_rms = uncalibrated_rms;
+        while lower_rms < target_rms && bracket_expansions < options.maximum_bracket_expansions {
+            lower_scale /= options.bracket_expansion_factor;
+            if !lower_scale.is_finite() || lower_scale <= 0.0 {
+                break;
+            }
+            lower_rms = evaluate(lower_scale)?.2;
+            bracket_expansions += 1;
+        }
+    }
+    if !(lower_scale < upper_scale && lower_rms >= target_rms && upper_rms <= target_rms) {
+        return Err(FeecGmrfError::Inference(format!(
+            "could not bracket posterior physical RMS target {target_rms:.16e}: scale/rms lower {lower_scale:.16e}/{lower_rms:.16e}, upper {upper_scale:.16e}/{upper_rms:.16e}"
+        )));
+    }
+
+    for iteration in 1..=options.maximum_iterations {
+        let scale = (lower_scale * upper_scale).sqrt();
+        let (scaled, posterior, rms) = evaluate(scale)?;
+        let relative_error = (rms - target_rms).abs() / target_rms;
+        if relative_error <= options.relative_tolerance {
+            return Ok((
+                scaled,
+                posterior,
+                PosteriorPhysicalRmsCalibration {
+                    uncalibrated_rms,
+                    target_rms,
+                    achieved_rms: rms,
+                    precision_scale: scale,
+                    relative_error,
+                    bracket_expansions,
+                    iterations: iteration,
+                },
+            ));
+        }
+        if rms > target_rms {
+            lower_scale = scale;
+            lower_rms = rms;
+        } else {
+            upper_scale = scale;
+            upper_rms = rms;
+        }
+    }
+    Err(FeecGmrfError::Inference(format!(
+        "posterior physical RMS calibration did not reach relative tolerance {:.6e} after {} iterations; final bracket scale/rms lower {:.16e}/{:.16e}, upper {:.16e}/{:.16e}",
+        options.relative_tolerance,
+        options.maximum_iterations,
+        lower_scale,
+        lower_rms,
+        upper_scale,
+        upper_rms
+    )))
+}
+
+fn covariance_mean_marginal_rms(covariance: &[Vec<f64>]) -> Result<f64> {
+    if covariance.is_empty()
+        || covariance
+            .iter()
+            .any(|row| row.len() != covariance.len() || row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(FeecGmrfError::Dimension(
+            "physical covariance must be nonempty, square, and finite".to_string(),
+        ));
+    }
+    let mean_variance = covariance
+        .iter()
+        .enumerate()
+        .map(|(index, row)| row[index])
+        .sum::<f64>()
+        / covariance.len() as f64;
+    if !mean_variance.is_finite() || mean_variance <= 0.0 {
+        return Err(FeecGmrfError::Inference(
+            "physical covariance has non-positive mean marginal variance".to_string(),
+        ));
+    }
+    Ok(mean_variance.sqrt())
+}
+
 /// Scale a prior so the mean marginal variance of `physical_map * x` is
 /// `target_rms^2`.
 ///
@@ -735,6 +972,64 @@ mod tests {
         assert!((report.uncalibrated_rms - 3.0_f64.sqrt()).abs() < 1e-12);
         assert!((report.precision_scale - 3.0).abs() < 1e-12);
         assert_eq!(calibrated.mean(), prior.mean());
+    }
+
+    #[test]
+    fn posterior_rms_calibration_reconditions_instead_of_scaling_output_covariance() {
+        let prior = GaussianPrior::new(vec![0.0], SparseMat::diagonal(1, 1.0)).unwrap();
+        let identity = LinearMap::identity(1);
+        let observation = LinearObservation::new(
+            identity.clone(),
+            vec![0.0],
+            crate::model::GaussianNoise::variance(1.0).unwrap(),
+        )
+        .unwrap();
+        let (calibrated, mut posterior, report) = calibrate_prior_to_posterior_physical_rms(
+            &prior,
+            &[observation],
+            &[],
+            &identity,
+            0.25,
+            PosteriorPhysicalRmsCalibrationOptions::default(),
+        )
+        .unwrap();
+
+        // For Q=s and unit observation precision, posterior variance is
+        // 1/(s+1). Target variance 1/16 therefore requires s=15.
+        assert!((report.precision_scale - 15.0).abs() < 2.0e-5);
+        assert!((report.tau_multiplier() - 15.0_f64.sqrt()).abs() < 3.0e-6);
+        assert!(report.relative_error <= 1.0e-6);
+        let calibrated_action = calibrated.precision().apply_checked(&[1.0]).unwrap();
+        assert!((calibrated_action[0] - 15.0).abs() < 2.0e-5);
+        let covariance = posterior.pushforward_covariance(&identity).unwrap();
+        assert!((covariance[0][0] - 1.0 / 16.0).abs() < 2.0e-7);
+    }
+
+    #[test]
+    fn posterior_rms_calibration_rejects_unreachable_noise_limited_target() {
+        let prior = GaussianPrior::new(vec![0.0], SparseMat::diagonal(1, 1.0)).unwrap();
+        let identity = LinearMap::identity(1);
+        let observation = LinearObservation::new(
+            identity.clone(),
+            vec![0.0],
+            crate::model::GaussianNoise::variance(1.0).unwrap(),
+        )
+        .unwrap();
+        let result = calibrate_prior_to_posterior_physical_rms(
+            &prior,
+            &[observation],
+            &[],
+            &identity,
+            2.0,
+            PosteriorPhysicalRmsCalibrationOptions {
+                maximum_bracket_expansions: 4,
+                ..PosteriorPhysicalRmsCalibrationOptions::default()
+            },
+        );
+        let Err(error) = result else {
+            panic!("noise-limited target unexpectedly calibrated");
+        };
+        assert!(error.to_string().contains("could not bracket"));
     }
 
     #[test]

@@ -23,9 +23,10 @@ use common::linalg::nalgebra::Matrix;
 use common::linalg::petsc::{petsc_read_eigenvals, petsc_read_eigenvecs};
 #[cfg(feature = "external-solvers")]
 use feec_gmrf::prelude::{
-    calibrate_prior_to_physical_rms, AuditedSupportedCovariance, EssentialBoundaryConditions,
-    ExactFormOperators, ExactMaternPriorBuilder, LinearGaussianModelBuilder, LinearObservation,
-    MagneticFieldMaps3d, MaternPriorBuilder, SupportedCovarianceSymmetryAudit,
+    calibrate_prior_to_physical_rms, calibrate_prior_to_posterior_physical_rms,
+    AuditedSupportedCovariance, EssentialBoundaryConditions, ExactFormOperators,
+    ExactMaternPriorBuilder, LinearGaussianModelBuilder, LinearObservation, MagneticFieldMaps3d,
+    MaternPriorBuilder, PosteriorPhysicalRmsCalibrationOptions, SupportedCovarianceSymmetryAudit,
     SupportedMaternPriorBuilder,
 };
 #[cfg(any(feature = "external-solvers", test))]
@@ -57,7 +58,7 @@ use std::io::{BufWriter, Write};
 use std::path::Path;
 use std::process::Command;
 
-pub const C51_SPECTRAL_COVARIANCE_SCHEMA_VERSION: &str = "c51-spectral-covariance-rank-v3";
+pub const C51_SPECTRAL_COVARIANCE_SCHEMA_VERSION: &str = "c51-spectral-covariance-rank-v4";
 pub const C51_SPECTRAL_COVARIANCE_STUDY_ID: &str = "c51/spectral-covariance-rank";
 pub const C51_SPECTRAL_RANK_GRID: [usize; 12] = [
     32, 64, 128, 256, 512, 768, 1_024, 1_280, 1_536, 1_792, 2_000, 2_048,
@@ -1037,6 +1038,24 @@ pub struct C51CompactAccuracyRow {
     /// Independent posterior covariance error after applying the frozen prior
     /// calibration; this bank is not used to choose the scalar.
     pub calibrated_held_out: Option<C51CovarianceErrorMetrics>,
+    /// Exact-FEEC posterior RMS on the selection bank. This diagnostic target
+    /// is selected before the held-out bank is inspected.
+    pub posterior_calibration_target_rms: Option<f64>,
+    /// Raw projected posterior RMS on the selection bank at the original tau.
+    pub posterior_calibration_uncalibrated_rms: Option<f64>,
+    /// Reconditioned projected posterior RMS achieved by the scalar solve.
+    pub posterior_calibration_achieved_rms: Option<f64>,
+    /// Scalar applied to the raw projected prior precision before conditioning.
+    pub posterior_calibration_precision_scale: Option<f64>,
+    /// Equivalent scalar applied to the Matérn tau parameter.
+    pub posterior_calibration_tau_multiplier: Option<f64>,
+    pub posterior_calibration_relative_error: Option<f64>,
+    pub posterior_calibration_bracket_expansions: Option<usize>,
+    pub posterior_calibration_iterations: Option<usize>,
+    /// Selection error of the coherent posterior rebuilt at calibrated tau.
+    pub posterior_calibrated_selection: Option<C51CovarianceErrorMetrics>,
+    /// Held-out error of the coherent posterior rebuilt at calibrated tau.
+    pub posterior_calibrated_held_out: Option<C51CovarianceErrorMetrics>,
     pub latent_mass_action_relative_errors: Option<[f64; 2]>,
     pub latent_mass_action_maximum_relative_error: Option<f64>,
     pub method_performance_timing_eligible: bool,
@@ -1183,6 +1202,28 @@ impl C51SpectralCovarianceRankArchive {
                     && row.calibration_tau_multiplier.is_some()
                     && row.calibrated_selection.is_some()
                     && row.calibrated_held_out.is_some();
+                let posterior_calibration_complete = row.posterior_calibration_target_rms.is_some()
+                    && row.posterior_calibration_uncalibrated_rms.is_some()
+                    && row.posterior_calibration_achieved_rms.is_some()
+                    && row.posterior_calibration_precision_scale.is_some()
+                    && row.posterior_calibration_tau_multiplier.is_some()
+                    && row.posterior_calibration_relative_error.is_some()
+                    && row.posterior_calibration_bracket_expansions.is_some()
+                    && row.posterior_calibration_iterations.is_some()
+                    && row.posterior_calibrated_selection.is_some()
+                    && row.posterior_calibrated_held_out.is_some();
+                let posterior_calibration_present = row.posterior_calibration_target_rms.is_some()
+                    || row.posterior_calibration_uncalibrated_rms.is_some()
+                    || row.posterior_calibration_achieved_rms.is_some()
+                    || row.posterior_calibration_precision_scale.is_some()
+                    || row.posterior_calibration_tau_multiplier.is_some()
+                    || row.posterior_calibration_relative_error.is_some()
+                    || row.posterior_calibration_bracket_expansions.is_some()
+                    || row.posterior_calibration_iterations.is_some()
+                    || row.posterior_calibrated_selection.is_some()
+                    || row.posterior_calibrated_held_out.is_some();
+                let posterior_calibration_required =
+                    self.config.is_projected_amplitude_calibration();
                 let calibration_valid = if !measured {
                     true
                 } else if let (Some(target), Some(raw), Some(scale), Some(tau_multiplier)) = (
@@ -1198,12 +1239,43 @@ impl C51SpectralCovarianceRankArchive {
                 } else {
                     false
                 };
+                let posterior_calibration_valid = if !posterior_calibration_required {
+                    !posterior_calibration_present
+                } else if !measured {
+                    true
+                } else if let (
+                    Some(target),
+                    Some(raw),
+                    Some(achieved),
+                    Some(scale),
+                    Some(tau_multiplier),
+                    Some(relative_error),
+                ) = (
+                    row.posterior_calibration_target_rms,
+                    row.posterior_calibration_uncalibrated_rms,
+                    row.posterior_calibration_achieved_rms,
+                    row.posterior_calibration_precision_scale,
+                    row.posterior_calibration_tau_multiplier,
+                    row.posterior_calibration_relative_error,
+                ) {
+                    [target, raw, achieved, scale, tau_multiplier]
+                        .into_iter()
+                        .all(|value| value.is_finite() && value > 0.0)
+                        && relative_error.is_finite()
+                        && relative_error >= 0.0
+                        && relative_error <= 1.0e-5
+                        && (tau_multiplier.powi(2) - scale).abs() <= 1.0e-12 * scale
+                        && (relative_error - (achieved - target).abs() / target).abs() <= 1.0e-12
+                } else {
+                    false
+                };
                 if row.method_performance_timing_eligible
                     || !C51_HIGH_OBSERVATION_COUNTS.contains(&row.observation_count)
                     || measured
                         != (row.selection.is_some()
                             && row.held_out.is_some()
                             && calibration_complete
+                            && (!posterior_calibration_required || posterior_calibration_complete)
                             && row.latent_mass_action_relative_errors.is_some()
                             && row.latent_mass_action_maximum_relative_error.is_some())
                     || (!measured
@@ -1212,8 +1284,10 @@ impl C51SpectralCovarianceRankArchive {
                             || row.calibration_precision_scale.is_some()
                             || row.calibration_tau_multiplier.is_some()
                             || row.calibrated_selection.is_some()
-                            || row.calibrated_held_out.is_some()))
+                            || row.calibrated_held_out.is_some()
+                            || posterior_calibration_present))
                     || !calibration_valid
+                    || !posterior_calibration_valid
                     || (measured && !row.unavailable_reason.is_empty())
                     || (!measured && row.unavailable_reason.is_empty())
                 {
@@ -1900,6 +1974,28 @@ impl C51SpectralCovarianceRankArchive {
                 "calibrated_heldout_e_dir",
                 "calibrated_heldout_e_corr",
                 "calibrated_heldout_e_primary",
+                "posterior_calibration_policy",
+                "posterior_calibration_bank",
+                "posterior_calibration_target_rms",
+                "posterior_calibration_uncalibrated_rms",
+                "posterior_calibration_achieved_rms",
+                "posterior_calibration_precision_scale",
+                "posterior_calibration_tau_multiplier",
+                "posterior_calibration_relative_error",
+                "posterior_calibration_bracket_expansions",
+                "posterior_calibration_iterations",
+                "posterior_calibrated_selection_e_f",
+                "posterior_calibrated_selection_e_2",
+                "posterior_calibrated_selection_e_diag",
+                "posterior_calibrated_selection_e_dir",
+                "posterior_calibrated_selection_e_corr",
+                "posterior_calibrated_selection_e_primary",
+                "posterior_calibrated_heldout_e_f",
+                "posterior_calibrated_heldout_e_2",
+                "posterior_calibrated_heldout_e_diag",
+                "posterior_calibrated_heldout_e_dir",
+                "posterior_calibrated_heldout_e_corr",
+                "posterior_calibrated_heldout_e_primary",
                 "latent_mass_action_probe_0_relative_error",
                 "latent_mass_action_probe_1_relative_error",
                 "latent_mass_action_maximum_relative_error",
@@ -1953,6 +2049,46 @@ impl C51SpectralCovarianceRankArchive {
             }
             append_metrics(&mut record, row.calibrated_selection);
             append_metrics(&mut record, row.calibrated_held_out);
+            if row.posterior_calibration_target_rms.is_some() {
+                record.extend([
+                    "exact_feec_posterior_selection_bank_physical_rms_by_prior_tau".to_string(),
+                    "selection".to_string(),
+                    format_float(
+                        row.posterior_calibration_target_rms
+                            .expect("validated posterior calibration target"),
+                    ),
+                    format_float(
+                        row.posterior_calibration_uncalibrated_rms
+                            .expect("validated raw posterior RMS"),
+                    ),
+                    format_float(
+                        row.posterior_calibration_achieved_rms
+                            .expect("validated calibrated posterior RMS"),
+                    ),
+                    format_float(
+                        row.posterior_calibration_precision_scale
+                            .expect("validated posterior calibration precision scale"),
+                    ),
+                    format_float(
+                        row.posterior_calibration_tau_multiplier
+                            .expect("validated posterior calibration tau multiplier"),
+                    ),
+                    format_float(
+                        row.posterior_calibration_relative_error
+                            .expect("validated posterior calibration relative error"),
+                    ),
+                    row.posterior_calibration_bracket_expansions
+                        .expect("validated posterior calibration bracket expansions")
+                        .to_string(),
+                    row.posterior_calibration_iterations
+                        .expect("validated posterior calibration iterations")
+                        .to_string(),
+                ]);
+            } else {
+                record.extend((0..10).map(|_| String::new()));
+            }
+            append_metrics(&mut record, row.posterior_calibrated_selection);
+            append_metrics(&mut record, row.posterior_calibrated_held_out);
             match row.latent_mass_action_relative_errors {
                 Some(errors) => record.extend([
                     format_float(errors[0]),
@@ -2093,6 +2229,26 @@ impl C51SpectralCovarianceRankArchive {
         writeln!(writer, "  evaluation_bank: held_out")?;
         writeln!(writer, "  held_out_used_for_calibration: false")?;
         writeln!(writer, "  raw_projected_result_retained: true")?;
+        if self.config.is_projected_amplitude_calibration() {
+            writeln!(writer, "projected_posterior_amplitude_calibration:")?;
+            writeln!(writer, "  status: evaluated")?;
+            writeln!(writer, "  role: approximation_shape_diagnostic")?;
+            writeln!(writer, "  stage: prior_tau_before_conditioning")?;
+            writeln!(writer, "  parameter_changed: tau_only")?;
+            writeln!(writer, "  observation_operator_and_noise_fixed: true")?;
+            writeln!(
+                writer,
+                "  target: exact_feec_posterior_selection_bank_physical_rms"
+            )?;
+            writeln!(writer, "  calibration_bank: selection")?;
+            writeln!(writer, "  evaluation_bank: held_out")?;
+            writeln!(writer, "  held_out_used_for_calibration: false")?;
+            writeln!(writer, "  posthoc_covariance_scaling: false")?;
+            writeln!(writer, "  operational_without_reference_target: false")?;
+        } else {
+            writeln!(writer, "projected_posterior_amplitude_calibration:")?;
+            writeln!(writer, "  status: not_evaluated_for_profile")?;
+        }
         writeln!(
             writer,
             "observation_noise_variance: {:.17e}",
@@ -3237,7 +3393,7 @@ fn evaluate_compact_accuracy(
             GaussianNoise::variance(config.observation_noise_variance)?,
         )?;
         let mut posterior = LinearGaussianModelBuilder::new(compact_prior.clone())
-            .observe(observation)?
+            .observe(observation.clone())?
             .condition()?;
         let calibrated_observation = LinearObservation::new(
             design.full.clone(),
@@ -3247,6 +3403,27 @@ fn evaluate_compact_accuracy(
         let mut calibrated_posterior = LinearGaussianModelBuilder::new(calibrated_prior.clone())
             .observe(calibrated_observation)?
             .condition()?;
+        let posterior_calibrated = if config.is_projected_amplitude_calibration() {
+            let posterior_target_rms = covariance_rms(&exact.selection.symmetric)?;
+            let (_, mut posterior, calibration) = calibrate_prior_to_posterior_physical_rms(
+                &compact_prior,
+                std::slice::from_ref(&observation),
+                &[],
+                selection_full,
+                posterior_target_rms,
+                PosteriorPhysicalRmsCalibrationOptions {
+                    relative_tolerance: 1.0e-5,
+                    maximum_iterations: 24,
+                    maximum_bracket_expansions: 12,
+                    bracket_expansion_factor: 4.0,
+                },
+            )?;
+            let selection = posterior.pushforward_covariance(selection_full)?;
+            let held_out = posterior.pushforward_covariance(held_out_full)?;
+            Some((calibration, selection, held_out))
+        } else {
+            None
+        };
         let selection_covariance = posterior.pushforward_covariance(selection_full)?;
         let held_out_covariance = posterior.pushforward_covariance(held_out_full)?;
         let calibrated_selection_covariance =
@@ -3264,6 +3441,18 @@ fn evaluate_compact_accuracy(
             covariance_error_metrics(&calibrated_selection_covariance, &exact.selection.symmetric)?;
         let calibrated_held_out =
             covariance_error_metrics(&calibrated_held_out_covariance, &exact.held_out.symmetric)?;
+        let posterior_calibrated_selection = posterior_calibrated
+            .as_ref()
+            .map(|(_, covariance, _)| {
+                covariance_error_metrics(covariance, &exact.selection.symmetric)
+            })
+            .transpose()?;
+        let posterior_calibrated_held_out = posterior_calibrated
+            .as_ref()
+            .map(|(_, _, covariance)| {
+                covariance_error_metrics(covariance, &exact.held_out.symmetric)
+            })
+            .transpose()?;
         let latent_errors = latent_action_errors(
             operators.state().mass(),
             &approximate_latent_actions,
@@ -3309,6 +3498,31 @@ fn evaluate_compact_accuracy(
             "whitney_compact_projected_physical_rms_calibrated",
             &calibrated_held_out_covariance,
         );
+        if let Some((_, selection_covariance, held_out_covariance)) = &posterior_calibrated {
+            archive_covariance(
+                &mut archive.covariances,
+                refinement,
+                alpha,
+                design.kind,
+                None,
+                "selection",
+                "whitney_compact_projected_posterior_rms_calibrated",
+                selection_covariance,
+            );
+            archive_covariance(
+                &mut archive.covariances,
+                refinement,
+                alpha,
+                design.kind,
+                None,
+                "held_out",
+                "whitney_compact_projected_posterior_rms_calibrated",
+                held_out_covariance,
+            );
+        }
+        let posterior_calibration = posterior_calibrated
+            .as_ref()
+            .map(|(calibration, _, _)| *calibration);
         archive.compact_accuracy_rows.push(C51CompactAccuracyRow {
             refinement,
             state_dimension,
@@ -3325,6 +3539,24 @@ fn evaluate_compact_accuracy(
             calibration_tau_multiplier: Some(calibration.tau_multiplier()),
             calibrated_selection: Some(calibrated_selection),
             calibrated_held_out: Some(calibrated_held_out),
+            posterior_calibration_target_rms: posterior_calibration
+                .map(|calibration| calibration.target_rms),
+            posterior_calibration_uncalibrated_rms: posterior_calibration
+                .map(|calibration| calibration.uncalibrated_rms),
+            posterior_calibration_achieved_rms: posterior_calibration
+                .map(|calibration| calibration.achieved_rms),
+            posterior_calibration_precision_scale: posterior_calibration
+                .map(|calibration| calibration.precision_scale),
+            posterior_calibration_tau_multiplier: posterior_calibration
+                .map(|calibration| calibration.tau_multiplier()),
+            posterior_calibration_relative_error: posterior_calibration
+                .map(|calibration| calibration.relative_error),
+            posterior_calibration_bracket_expansions: posterior_calibration
+                .map(|calibration| calibration.bracket_expansions),
+            posterior_calibration_iterations: posterior_calibration
+                .map(|calibration| calibration.iterations),
+            posterior_calibrated_selection,
+            posterior_calibrated_held_out,
             latent_mass_action_relative_errors: Some(latent_errors),
             latent_mass_action_maximum_relative_error: Some(
                 latent_errors.into_iter().fold(0.0, f64::max),
@@ -3365,6 +3597,16 @@ fn append_unavailable_compact_rows(
             calibration_tau_multiplier: None,
             calibrated_selection: None,
             calibrated_held_out: None,
+            posterior_calibration_target_rms: None,
+            posterior_calibration_uncalibrated_rms: None,
+            posterior_calibration_achieved_rms: None,
+            posterior_calibration_precision_scale: None,
+            posterior_calibration_tau_multiplier: None,
+            posterior_calibration_relative_error: None,
+            posterior_calibration_bracket_expansions: None,
+            posterior_calibration_iterations: None,
+            posterior_calibrated_selection: None,
+            posterior_calibrated_held_out: None,
             latent_mass_action_relative_errors: None,
             latent_mass_action_maximum_relative_error: None,
             method_performance_timing_eligible: false,
@@ -4874,6 +5116,16 @@ mod tests {
                 calibration_tau_multiplier: Some(0.8),
                 calibrated_selection: Some(decision_test_metrics(0.02)),
                 calibrated_held_out: Some(decision_test_metrics(0.03)),
+                posterior_calibration_target_rms: Some(1.0),
+                posterior_calibration_uncalibrated_rms: Some(0.8),
+                posterior_calibration_achieved_rms: Some(1.0),
+                posterior_calibration_precision_scale: Some(0.64),
+                posterior_calibration_tau_multiplier: Some(0.8),
+                posterior_calibration_relative_error: Some(0.0),
+                posterior_calibration_bracket_expansions: Some(1),
+                posterior_calibration_iterations: Some(4),
+                posterior_calibrated_selection: Some(decision_test_metrics(0.01)),
+                posterior_calibrated_held_out: Some(decision_test_metrics(0.02)),
                 latent_mass_action_relative_errors: Some([0.01, 0.01]),
                 latent_mass_action_maximum_relative_error: Some(0.01),
                 method_performance_timing_eligible: false,

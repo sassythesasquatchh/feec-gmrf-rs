@@ -276,8 +276,19 @@ The fresh-process resource row recomputes the raw projected RMS through
 `calibrate_prior_to_physical_rms`, charges that factorization and its nine
 covariance solves to `prior_build_ns`, and includes their memory in peak RSS.
 
+The focused `projected-amplitude-calibration-v1-n8` and `-n10` profiles also
+archive a second, explicitly diagnostic calibration. It solves for one scalar
+Matérn `tau` such that the *conditioned* projected model matches the exact FEEC
+posterior physical RMS on `G_sel`, while holding `H`, the observation-noise
+model, and all other parameters fixed. Every trial rebuilds and reconditions
+the Gaussian model; no posterior covariance is multiplied after the fact. The
+same frozen scalar is then evaluated on the disjoint held-out bank. Because
+this target is supplied by the exact reference, it diagnoses approximation
+shape and is not described as an operational calibration available without a
+reference or validation target.
+
 After producing new accuracy attempts with schema
-`c51-spectral-covariance-rank-v3`, freeze the calibration and spectral rank:
+`c51-spectral-covariance-rank-v4`, freeze the calibration and spectral rank:
 
 ```text
 python3 scripts/c51/derive_exact_rank_decisions.py \
