@@ -2,9 +2,6 @@
 # this makefile outside the FEEC source directory avoids cross-platform stale
 # objects and Ubuntu's SLEPc `clean:`/FEEC `clean::` target conflict.
 
-SOURCE_DIR ?= /workspace/feec/petsc-solver
-VPATH := ${SOURCE_DIR}
-
 include ${SLEPC_DIR}/lib/slepc/conf/slepc_common
 
 .PHONY: all

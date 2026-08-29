@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
 from typing import Sequence
@@ -69,6 +70,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         for directory in (REPOSITORY, REPOSITORY / "feec", REPOSITORY / "gmrf-rs"):
             run(["git", "config", "--global", "--add", "safe.directory", str(directory)])
         PETSC_BUILD.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(REPOSITORY / "feec/petsc-solver/ghiep.c", PETSC_BUILD / "ghiep.c")
         run(
             [
                 "make",

@@ -26,6 +26,7 @@ class DockerExactCampaignTests(unittest.TestCase):
         with (
             mock.patch.object(pathlib.Path, "is_file", return_value=True),
             mock.patch.object(pathlib.Path, "mkdir"),
+            mock.patch.object(campaign.shutil, "copy2") as copy2,
             mock.patch.object(os, "access", return_value=True),
             mock.patch.object(campaign, "slepc_root", return_value=pathlib.Path("/slepc")),
             mock.patch.object(
@@ -44,6 +45,10 @@ class DockerExactCampaignTests(unittest.TestCase):
             )
 
         self.assertEqual(status, 0)
+        copy2.assert_called_once_with(
+            pathlib.Path("/workspace/feec/petsc-solver/ghiep.c"),
+            pathlib.Path("/target/c51-petsc-solver/ghiep.c"),
+        )
         build = next(command for command, _ in commands if command[0] == "make")
         self.assertEqual(build[0:3], ["make", "-C", "/target/c51-petsc-solver"])
         self.assertTrue(build[4].endswith("/scripts/c51/docker/petsc-solver.mk"))
