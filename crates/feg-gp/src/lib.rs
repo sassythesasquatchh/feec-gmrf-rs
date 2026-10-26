@@ -1136,6 +1136,11 @@ impl PreparedSpectralOutput<'_> {
         self.posterior.feature_covariance(&self.output_features)
     }
 
+    /// Posterior marginal variances in the cached output space.
+    pub fn variances(&self) -> Result<Vec<f64>, GpError> {
+        self.posterior.feature_variances(&self.output_features)
+    }
+
     /// Posterior output mean and diagonal covariance for replacement data.
     pub fn moments(&self, observation_values: &[f64]) -> Result<ConditionedGp, GpError> {
         Ok(ConditionedGp {
@@ -1358,6 +1363,11 @@ impl PreparedSpectralPosterior {
         self.prepare_output(output_matrix)?.covariance_action(input)
     }
 
+    /// Posterior marginal variances after a sparse output map.
+    pub fn output_variances(&self, output_matrix: &CsrMatrix) -> Result<Vec<f64>, GpError> {
+        self.prepare_output(output_matrix)?.variances()
+    }
+
     /// Draw a latent posterior sample from independent standard normals.
     pub fn latent_sample_from_standard_normal(
         &self,
@@ -1465,25 +1475,65 @@ impl PreparedSpectralPosterior {
     }
 
     fn feature_variances(&self, features: &Mat<f64>) -> Result<Vec<f64>, GpError> {
-        let mut variances = Vec::with_capacity(features.nrows());
-        for row in 0..features.nrows() {
-            let feature = (0..features.ncols())
-                .map(|col| features[(row, col)])
-                .collect::<Vec<_>>();
-            let covariance_feature = self.latent_covariance_action(&feature)?;
-            // Preserve the computed quadratic form, including a possible tiny
-            // negative roundoff residual, so callers can archive and apply
-            // their explicit uncertainty-stabilization policy.  This prepared
-            // comparator must not silently hide material instability.
-            variances.push(
-                feature
-                    .iter()
-                    .zip(covariance_feature)
-                    .map(|(left, right)| left * right)
-                    .sum::<f64>(),
-            );
+        if features.ncols() != self.latent_dimension() {
+            return Err(GpError::LatentVectorDimensionMismatch {
+                expected: self.latent_dimension(),
+                got: features.ncols(),
+            });
         }
-        Ok(variances)
+        let output_count = features.nrows();
+        match self.strategy {
+            LowRankConditioningStrategy::ObservationSpace => {
+                // C_z = I - B^T (B B^T + sigma^2 I)^-1 B. Solve all
+                // output-feature right-hand sides together so complete field
+                // diagonals do not require one dense solve per output row.
+                let mut projected = Mat::from_fn(
+                    self.observation_count(),
+                    output_count,
+                    |observation, output| {
+                        (0..self.latent_dimension())
+                            .map(|latent| {
+                                self.observation_features[(observation, latent)]
+                                    * features[(output, latent)]
+                            })
+                            .sum::<f64>()
+                    },
+                );
+                let unsolved = projected.clone();
+                self.factor.solve_in_place(projected.as_mut());
+                Ok((0..output_count)
+                    .map(|output| {
+                        let prior = (0..self.latent_dimension())
+                            .map(|latent| features[(output, latent)].powi(2))
+                            .sum::<f64>();
+                        let removed = (0..self.observation_count())
+                            .map(|observation| {
+                                unsolved[(observation, output)] * projected[(observation, output)]
+                            })
+                            .sum::<f64>();
+                        prior - removed
+                    })
+                    .collect())
+            }
+            LowRankConditioningStrategy::LatentSpace => {
+                // C_z = sigma^2 (B^T B + sigma^2 I)^-1. The transposed
+                // output-feature matrix supplies all quadratic-form right-hand
+                // sides in one factor solve.
+                let mut solved =
+                    Mat::from_fn(self.latent_dimension(), output_count, |latent, output| {
+                        features[(output, latent)]
+                    });
+                self.factor.solve_in_place(solved.as_mut());
+                Ok((0..output_count)
+                    .map(|output| {
+                        self.noise_variance
+                            * (0..self.latent_dimension())
+                                .map(|latent| features[(output, latent)] * solved[(latent, output)])
+                                .sum::<f64>()
+                    })
+                    .collect())
+            }
+        }
     }
 
     fn feature_covariance(&self, features: &Mat<f64>) -> Result<Mat<f64>, GpError> {
@@ -1658,6 +1708,15 @@ impl SpectralMaternGp {
     pub fn prior_output_covariance(&self, output_matrix: &CsrMatrix) -> Result<Mat<f64>, GpError> {
         let output_features = sparse_dense_product(output_matrix, &self.feature_matrix())?;
         Ok(full_covariance_from_feature_matrix(&output_features))
+    }
+
+    /// Prior marginal variances after a sparse output map.
+    ///
+    /// This computes only the output diagonal from the low-rank features and
+    /// never materializes the full output covariance.
+    pub fn prior_output_variances(&self, output_matrix: &CsrMatrix) -> Result<Vec<f64>, GpError> {
+        let output_features = sparse_dense_product(output_matrix, &self.feature_matrix())?;
+        Ok(diagonal_from_feature_matrix(&output_features))
     }
 
     /// Apply the prior covariance in a requested sparse output space.
@@ -4368,12 +4427,20 @@ mod tests {
             })
         ));
         let prior_output_covariance = gp.prior_output_covariance(&output).unwrap();
+        let prior_output_variances = gp.prior_output_variances(&output).unwrap();
         let expected_prior_output_covariance = sparse_covariance_pushforward(&output, &covariance);
         assert_matrix_close(
             &prior_output_covariance,
             &expected_prior_output_covariance,
             5.0e-13,
         );
+        for index in 0..2 {
+            assert_close(
+                prior_output_variances[index],
+                expected_prior_output_covariance[(idx(index), idx(index))],
+                5.0e-13,
+            );
+        }
         let prior_output_input = [0.4, -0.9];
         let prior_output_action = gp
             .prior_output_covariance_action(&output, &prior_output_input)
@@ -4411,6 +4478,8 @@ mod tests {
         );
         let diagonal_only = prepared.output_moments(&output, &values).unwrap();
         let cached_diagonal_only = cached_output.moments(&values).unwrap();
+        let variance_only = prepared.output_variances(&output).unwrap();
+        let cached_variance_only = cached_output.variances().unwrap();
         for index in 0..2 {
             assert_close(
                 diagonal_only.variance[index],
@@ -4419,6 +4488,12 @@ mod tests {
             );
             assert_close(
                 cached_diagonal_only.variance[index],
+                diagonal_only.variance[index],
+                5.0e-13,
+            );
+            assert_close(variance_only[index], diagonal_only.variance[index], 5.0e-13);
+            assert_close(
+                cached_variance_only[index],
                 diagonal_only.variance[index],
                 5.0e-13,
             );

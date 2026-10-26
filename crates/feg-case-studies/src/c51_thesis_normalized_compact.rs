@@ -4,46 +4,61 @@
 //! independently scaled to the same domain-wide RMS of `B = D1 A` in the
 //! degree-2 FEEC mass norm. Training rows, local diagnostics, and fixed surface
 //! flux QoIs pair directly with the integral 2-cochain; none uses pointwise or
-//! cell-barycentre reconstruction. A secondary, explicitly labelled benchmark
-//! calibration uses only the designated surface-flux selection bank to set one
-//! coherent posterior amplitude, then evaluates the disjoint held-out bank.
+//! cell-barycentre reconstruction. This primary development path deliberately
+//! applies no output-family-specific posterior amplitude calibration.
 
-use crate::c51_benchmark::C51RunMetadata;
 use crate::c51_magnetic_sensor_design::{
-    assemble_c51_flux_cochain_split, assemble_c51_surface_flux_split, C51_FLUX_COCHAIN_DESIGN_ID,
-    C51_FLUX_COCHAIN_DESIGN_SEED, C51_FLUX_COCHAIN_HELD_OUT_COUNT,
-    C51_FLUX_COCHAIN_SELECTION_COUNT, C51_SURFACE_FLUX_QOI_DESIGN_ID,
+    assemble_c51_flux_cochain_split, assemble_c51_surface_flux_split,
+    C51_FLUX_COCHAIN_HELD_OUT_COUNT, C51_FLUX_COCHAIN_SELECTION_COUNT,
 };
-use crate::c51_spectral_covariance_rank::{covariance_error_metrics, C51CovarianceErrorMetrics};
+use common::linalg::nalgebra::{Matrix, Vector as FeecVector};
 use feec_gmrf::prelude::{
-    calibrate_prior_to_posterior_physical_rms, covariance_mean_marginal_rms,
     pullback_quadratic_form, AdjacentMaternPriorBuilder, EssentialBoundaryElimination,
     ExactFormOperators, GaussianNoise, HutchinsonVarianceConfig, LinearGaussianModelBuilder,
-    LinearObservation, MaternAlpha, MaternParameters, PosteriorPhysicalRmsCalibration,
-    PosteriorPhysicalRmsCalibrationOptions, Result, SupportedMaternPriorBuilder, VarianceMethod,
+    LinearMap, LinearObservation, LinearPdeSystem, MaternAlpha, MaternParameters, PdeResidualNoise,
+    Result, SparseMat, SupportedMaternPriorBuilder, VarianceMethod,
 };
-use manifold::{gen::cartesian::CartesianMeshInfo, geometry::coord::simplex::SimplexHandleExt};
+use formoniq::{
+    problems::reduced_linear::build_reduced_hodge_laplace_1form_system,
+    reduction::{EssentialBoundarySpec, PrescribedDof},
+};
+use manifold::{
+    gen::cartesian::CartesianMeshInfo, geometry::coord::simplex::SimplexHandleExt,
+    topology::complex::Complex,
+};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
 pub const C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION: &str =
-    "c51-thesis-normalized-flux-cochain-v7";
-pub const C51_THESIS_NORMALIZED_COMPACT_STUDY_ID: &str =
-    "c51/thesis-normalized-flux-cochain-accuracy";
-pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v7-n8";
-pub const C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10: &str =
-    "thesis-magnetic-trace-normalized-flux-cochain-v7-n10";
+    "c51-development-thesis-normalized-flux-cochain-v8";
 pub const C51_THESIS_TARGET_B_RMS_TESLA: f64 = 0.10;
 pub const C51_FLUX_NOISE_STANDARD_DEVIATION_WEBER: f64 = 5.0e-4;
 pub const C51_THESIS_TRACE_PROBES: usize = 512;
 pub const C51_THESIS_TRACE_BATCHES: usize = 8;
 pub const C51_THESIS_TRACE_SEED: u64 = 0xC51B_7ACE;
-pub const C51_THESIS_OBSERVATION_COUNT_N8: usize = 4_096;
-pub const C51_THESIS_OBSERVATION_COUNT_N10: usize = 8_192;
 pub const C51_THESIS_SELECTION_FLUX_COUNT: usize = C51_FLUX_COCHAIN_SELECTION_COUNT;
 pub const C51_THESIS_HELD_OUT_FLUX_COUNT: usize = C51_FLUX_COCHAIN_HELD_OUT_COUNT;
+const C51_VECTOR_OUTPUT_DIMENSION: usize = 9;
+const C51_REFERENCE_VARIANCE_RELATIVE_FLOOR: f64 = 1.0e-12;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct C51CovarianceErrorMetrics {
+    pub relative_frobenius: f64,
+    pub relative_spectral: f64,
+    pub maximum_relative_diagonal: f64,
+    pub maximum_relative_directional: f64,
+    pub relative_correlation_frobenius: f64,
+}
+
+impl C51CovarianceErrorMetrics {
+    pub fn primary_envelope(self) -> f64 {
+        self.relative_frobenius
+            .max(self.maximum_relative_diagonal)
+            .max(self.maximum_relative_directional)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct C51ThesisNormalizedCompactConfig {
@@ -58,27 +73,23 @@ pub struct C51ThesisNormalizedCompactConfig {
     pub trace_probes: usize,
     pub trace_batches: usize,
     pub trace_seed: u64,
+    pub pde_residual_standard_deviations: Vec<f64>,
 }
 
 impl C51ThesisNormalizedCompactConfig {
-    pub fn publication(refinement: usize) -> Result<Self> {
-        let (profile, observation_count) = match refinement {
-            8 => (
-                C51_THESIS_NORMALIZED_COMPACT_PROFILE_N8,
-                C51_THESIS_OBSERVATION_COUNT_N8,
-            ),
-            10 => (
-                C51_THESIS_NORMALIZED_COMPACT_PROFILE_N10,
-                C51_THESIS_OBSERVATION_COUNT_N10,
-            ),
-            _ => {
-                return Err(feec_gmrf::FeecGmrfError::InvalidParameter(
-                    "C51 thesis-normalized refinement must be 8 or 10".to_string(),
-                ))
-            }
-        };
+    pub fn development(refinement: usize, observation_count: usize) -> Result<Self> {
+        if refinement < 2 {
+            return Err(feec_gmrf::FeecGmrfError::InvalidParameter(
+                "C51 development refinement must be at least two".to_string(),
+            ));
+        }
+        if observation_count == 0 {
+            return Err(feec_gmrf::FeecGmrfError::InvalidParameter(
+                "C51 development observation count must be positive".to_string(),
+            ));
+        }
         Ok(Self {
-            profile: profile.to_string(),
+            profile: format!("development-thesis-normalized-n{refinement}-m{observation_count}"),
             refinement,
             alpha: MaternAlpha::Two,
             kappa: 4.0,
@@ -90,6 +101,7 @@ impl C51ThesisNormalizedCompactConfig {
             trace_probes: C51_THESIS_TRACE_PROBES,
             trace_batches: C51_THESIS_TRACE_BATCHES,
             trace_seed: C51_THESIS_TRACE_SEED,
+            pde_residual_standard_deviations: vec![1.0e-1, 1.0e-3, 1.0e-5],
         })
     }
 }
@@ -106,7 +118,6 @@ pub struct C51ThesisTraceCalibration {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct C51ThesisNormalizedCompactReport {
-    pub metadata: C51RunMetadata,
     pub config: C51ThesisNormalizedCompactConfig,
     pub state_dimension: usize,
     pub full_cochain_dimension: usize,
@@ -122,18 +133,83 @@ pub struct C51ThesisNormalizedCompactReport {
     pub surface_prior_held_out: C51CovarianceErrorMetrics,
     pub surface_posterior_selection: C51CovarianceErrorMetrics,
     pub surface_posterior_held_out: C51CovarianceErrorMetrics,
-    pub surface_posterior_calibration: PosteriorPhysicalRmsCalibration,
-    pub calibrated_prior_b_rms_tesla: f64,
-    pub calibrated_local_posterior_selection: C51CovarianceErrorMetrics,
-    pub calibrated_local_posterior_held_out: C51CovarianceErrorMetrics,
-    pub calibrated_surface_posterior_selection: C51CovarianceErrorMetrics,
-    pub calibrated_surface_posterior_held_out: C51CovarianceErrorMetrics,
+    pub weak_residual_manufactured_deterministic_relative_l2_error: f64,
+    pub weak_residual_rows: Vec<C51WeakResidualDevelopmentRow>,
+    pub latent_field_wide: C51FieldWideVarianceReport,
+    pub flux_field_wide: C51FieldWideVarianceReport,
+    pub covariance_action_errors: C51FieldWideCovarianceActionErrors,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct C51WeakResidualDevelopmentRow {
+    pub residual_standard_deviation: f64,
+    pub exact_augmented_deterministic_relative_l2_error: f64,
+    pub compact_deterministic_relative_l2_error: f64,
+    pub compact_exact_mean_relative_l2_error: f64,
+    pub exact_augmented_residual_dual_norm: f64,
+    pub compact_residual_dual_norm: f64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct C51FieldWideVarianceReport {
+    pub output_kind: String,
+    pub variance_units: String,
+    pub rows: Vec<C51FieldWideVarianceRow>,
+    pub prior_variance_error: C51FieldWideErrorSummary,
+    pub posterior_variance_error: C51FieldWideErrorSummary,
+    pub posterior_prior_ratio_error: C51FieldWideErrorSummary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct C51FieldWideVarianceRow {
+    pub index: usize,
+    pub exact_prior_variance: f64,
+    pub compact_prior_variance: f64,
+    pub exact_posterior_variance: f64,
+    pub compact_posterior_variance: f64,
+    pub exact_posterior_prior_ratio: f64,
+    pub compact_posterior_prior_ratio: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct C51FieldWideErrorSummary {
+    pub count: usize,
+    pub relative_error_floor: f64,
+    pub near_zero_reference_count: usize,
+    pub median_relative_error: f64,
+    pub percentile_90_relative_error: f64,
+    pub percentile_99_relative_error: f64,
+    pub maximum_relative_error: f64,
+    pub median_absolute_error: f64,
+    pub percentile_90_absolute_error: f64,
+    pub percentile_99_absolute_error: f64,
+    pub maximum_absolute_error: f64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct C51FieldWideCovarianceActionErrors {
+    pub seed: u64,
+    pub probe_count: usize,
+    pub latent_prior_maximum_relative_mass_error: f64,
+    pub latent_posterior_maximum_relative_mass_error: f64,
+    pub flux_prior_maximum_relative_energy_error: f64,
+    pub flux_posterior_maximum_relative_energy_error: f64,
 }
 
 pub fn run_c51_thesis_normalized_compact(
     config: &C51ThesisNormalizedCompactConfig,
-    metadata: C51RunMetadata,
 ) -> Result<C51ThesisNormalizedCompactReport> {
+    if config.pde_residual_standard_deviations.is_empty()
+        || config
+            .pde_residual_standard_deviations
+            .iter()
+            .any(|value| !value.is_finite() || *value <= 0.0)
+    {
+        return Err(feec_gmrf::FeecGmrfError::InvalidParameter(
+            "C51 weak-residual standard deviations must be non-empty, finite, and positive"
+                .to_string(),
+        ));
+    }
     let mesh = CartesianMeshInfo::new_unit_scaled(3, config.refinement, 1.0);
     let (topology, coordinates) = mesh.compute_coord_complex();
     let metric = coordinates.to_edge_lengths(&topology);
@@ -162,6 +238,8 @@ pub fn run_c51_thesis_normalized_compact(
                 .to_string(),
         )
     })?;
+    let state_mass = operators.state().mass().clone();
+    let flux_mass = outgoing.upper().mass().clone();
     let flux_cochain = outgoing.active_derivative().clone();
     let magnetic_energy = pullback_quadratic_form(&flux_cochain, outgoing.upper().mass())?;
     let flux_elimination =
@@ -249,34 +327,146 @@ pub fn run_c51_thesis_normalized_compact(
     let compact_surface_selection = compact_posterior.pushforward_covariance(&surface_selection)?;
     let compact_surface_held_out = compact_posterior.pushforward_covariance(&surface_held_out)?;
 
-    let target_surface_posterior_rms = covariance_mean_marginal_rms(&exact_surface_selection)?;
-    let (_, mut calibrated_compact_posterior, surface_posterior_calibration) =
-        calibrate_prior_to_posterior_physical_rms(
-            &compact,
-            std::slice::from_ref(&observation),
-            &[],
-            &surface_selection,
-            target_surface_posterior_rms,
-            PosteriorPhysicalRmsCalibrationOptions {
-                relative_tolerance: 1.0e-5,
-                maximum_iterations: 24,
-                maximum_bracket_expansions: 12,
-                bracket_expansion_factor: 4.0,
-            },
-        )?;
-    let calibrated_selection =
-        calibrated_compact_posterior.pushforward_covariance(flux_split.selection())?;
-    let calibrated_held_out =
-        calibrated_compact_posterior.pushforward_covariance(flux_split.held_out())?;
-    let calibrated_surface_selection =
-        calibrated_compact_posterior.pushforward_covariance(&surface_selection)?;
-    let calibrated_surface_held_out =
-        calibrated_compact_posterior.pushforward_covariance(&surface_held_out)?;
-    let calibrated_prior_b_rms_tesla =
-        compact_calibration.normalized_b_rms / surface_posterior_calibration.tau_multiplier();
+    let identity = LinearMap::identity(raw_exact.state_dimension());
+    let exact_latent_prior_variances = exact_prior.pushforward_variances(&identity)?;
+    let compact_latent_prior_variances = compact_prior
+        .pushforward_variance_estimate(&identity, VarianceMethod::Exact)?
+        .values;
+    let exact_latent_posterior_variances = exact_posterior.pushforward_variances(&identity)?;
+    let compact_latent_posterior_variances = compact_posterior
+        .pushforward_variance_estimate(&identity, VarianceMethod::Exact)?
+        .values;
+    let latent_field_wide = build_field_wide_variance_report(
+        "active_1form_cochain",
+        "active_1form_coefficient_squared",
+        &exact_latent_prior_variances,
+        &compact_latent_prior_variances,
+        &exact_latent_posterior_variances,
+        &compact_latent_posterior_variances,
+    )?;
+
+    let exact_flux_prior_variances = exact_prior.pushforward_variances(&flux_cochain)?;
+    let compact_flux_prior_variances = compact_prior
+        .pushforward_variance_estimate(&flux_cochain, VarianceMethod::Exact)?
+        .values;
+    let exact_flux_posterior_variances = exact_posterior.pushforward_variances(&flux_cochain)?;
+    let compact_flux_posterior_variances = compact_posterior
+        .pushforward_variance_estimate(&flux_cochain, VarianceMethod::Exact)?
+        .values;
+    let flux_field_wide = build_field_wide_variance_report(
+        "active_d1_flux_cochain",
+        "weber_squared",
+        &exact_flux_prior_variances,
+        &compact_flux_prior_variances,
+        &exact_flux_posterior_variances,
+        &compact_flux_posterior_variances,
+    )?;
+
+    let covariance_action_probe_count = 4;
+    let covariance_action_seed = config.trace_seed ^ 0xF13D_A11C;
+    let mut covariance_rng = StdRng::seed_from_u64(covariance_action_seed);
+    let mut latent_prior_maximum_relative_mass_error = 0.0_f64;
+    let mut latent_posterior_maximum_relative_mass_error = 0.0_f64;
+    let mut flux_prior_maximum_relative_energy_error = 0.0_f64;
+    let mut flux_posterior_maximum_relative_energy_error = 0.0_f64;
+    for _ in 0..covariance_action_probe_count {
+        let latent_probe = rademacher_probe(raw_exact.state_dimension(), &mut covariance_rng);
+        let exact_prior_action = exact_prior.covariance_action(&latent_probe)?;
+        let compact_prior_action = compact_prior.covariance_action(&latent_probe)?;
+        latent_prior_maximum_relative_mass_error = latent_prior_maximum_relative_mass_error.max(
+            metric_relative_vector_error(&compact_prior_action, &exact_prior_action, &state_mass)?,
+        );
+        let exact_posterior_action = exact_posterior.covariance_action(&latent_probe)?;
+        let compact_posterior_action = compact_posterior.covariance_action(&latent_probe)?;
+        latent_posterior_maximum_relative_mass_error = latent_posterior_maximum_relative_mass_error
+            .max(metric_relative_vector_error(
+                &compact_posterior_action,
+                &exact_posterior_action,
+                &state_mass,
+            )?);
+
+        let flux_probe = rademacher_probe(flux_cochain.output_dimension(), &mut covariance_rng);
+        let flux_rhs = flux_cochain.apply_transpose(&flux_probe)?;
+        let exact_prior_flux_action =
+            flux_cochain.apply(&exact_prior.covariance_action(&flux_rhs)?)?;
+        let compact_prior_flux_action =
+            flux_cochain.apply(&compact_prior.covariance_action(&flux_rhs)?)?;
+        flux_prior_maximum_relative_energy_error =
+            flux_prior_maximum_relative_energy_error.max(metric_relative_vector_error(
+                &compact_prior_flux_action,
+                &exact_prior_flux_action,
+                &flux_mass,
+            )?);
+        let exact_posterior_flux_action =
+            flux_cochain.apply(&exact_posterior.covariance_action(&flux_rhs)?)?;
+        let compact_posterior_flux_action =
+            flux_cochain.apply(&compact_posterior.covariance_action(&flux_rhs)?)?;
+        flux_posterior_maximum_relative_energy_error = flux_posterior_maximum_relative_energy_error
+            .max(metric_relative_vector_error(
+                &compact_posterior_flux_action,
+                &exact_posterior_flux_action,
+                &flux_mass,
+            )?);
+    }
+    let covariance_action_errors = C51FieldWideCovarianceActionErrors {
+        seed: covariance_action_seed,
+        probe_count: covariance_action_probe_count,
+        latent_prior_maximum_relative_mass_error,
+        latent_posterior_maximum_relative_mass_error,
+        flux_prior_maximum_relative_energy_error,
+        flux_posterior_maximum_relative_energy_error,
+    };
+
+    let boundary = homogeneous_full_relative_boundary(&topology);
+    let pde_assembly = build_reduced_hodge_laplace_1form_system(&topology, &metric, &boundary)
+        .map_err(feec_gmrf::FeecGmrfError::Assembly)?;
+    if pde_assembly.state_dimension() != raw_exact.state_dimension() {
+        return Err(feec_gmrf::FeecGmrfError::Dimension(format!(
+            "C51 weak PDE dimension {} differs from prior state dimension {}",
+            pde_assembly.state_dimension(),
+            raw_exact.state_dimension()
+        )));
+    }
+    let manufactured_state = deterministic_manufactured_state(pde_assembly.state_dimension());
+    let rhs = &pde_assembly.operator * FeecVector::from_vec(manufactured_state.clone())
+        + &pde_assembly.residual_bias;
+    let pde_system = LinearPdeSystem::from_reduced_assembly(pde_assembly)?
+        .with_form_space(1, 3)?
+        .with_right_hand_side(rhs.as_slice())?;
+    let deterministic = pde_system.solve_deterministic()?;
+    let weak_residual_manufactured_deterministic_relative_l2_error =
+        pde_system.relative_state_l2_error(deterministic.active(), &manufactured_state)?;
+    let mut weak_residual_rows = Vec::with_capacity(config.pde_residual_standard_deviations.len());
+    for &residual_standard_deviation in &config.pde_residual_standard_deviations {
+        let noise =
+            PdeResidualNoise::mass_weighted_l2_standard_deviation(residual_standard_deviation)?;
+        let observation = pde_system.weak_residual_observation(noise)?;
+        let exact_pde_posterior = exact.condition(std::slice::from_ref(&observation), &[])?;
+        let compact_pde_posterior = LinearGaussianModelBuilder::new(compact.clone())
+            .observe(observation.clone())?
+            .condition()?;
+        weak_residual_rows.push(C51WeakResidualDevelopmentRow {
+            residual_standard_deviation,
+            exact_augmented_deterministic_relative_l2_error: pde_system
+                .relative_state_l2_error(exact_pde_posterior.mean(), deterministic.active())?,
+            compact_deterministic_relative_l2_error: pde_system
+                .relative_state_l2_error(compact_pde_posterior.mean(), deterministic.active())?,
+            compact_exact_mean_relative_l2_error: pde_system.relative_state_l2_error(
+                compact_pde_posterior.mean(),
+                exact_pde_posterior.mean(),
+            )?,
+            exact_augmented_residual_dual_norm: residual_dual_norm(
+                &pde_system,
+                exact_pde_posterior.mean(),
+            )?,
+            compact_residual_dual_norm: residual_dual_norm(
+                &pde_system,
+                compact_pde_posterior.mean(),
+            )?,
+        });
+    }
 
     Ok(C51ThesisNormalizedCompactReport {
-        metadata,
         config: config.clone(),
         state_dimension: raw_exact.state_dimension(),
         full_cochain_dimension: raw_exact.cochain_dimension(),
@@ -310,24 +500,11 @@ pub fn run_c51_thesis_normalized_compact(
             &compact_surface_held_out,
             &exact_surface_held_out,
         )?,
-        surface_posterior_calibration,
-        calibrated_prior_b_rms_tesla,
-        calibrated_local_posterior_selection: covariance_error_metrics(
-            &calibrated_selection,
-            &exact_selection,
-        )?,
-        calibrated_local_posterior_held_out: covariance_error_metrics(
-            &calibrated_held_out,
-            &exact_held_out,
-        )?,
-        calibrated_surface_posterior_selection: covariance_error_metrics(
-            &calibrated_surface_selection,
-            &exact_surface_selection,
-        )?,
-        calibrated_surface_posterior_held_out: covariance_error_metrics(
-            &calibrated_surface_held_out,
-            &exact_surface_held_out,
-        )?,
+        weak_residual_manufactured_deterministic_relative_l2_error,
+        weak_residual_rows,
+        latent_field_wide,
+        flux_field_wide,
+        covariance_action_errors,
     })
 }
 
@@ -343,16 +520,6 @@ impl C51ThesisNormalizedCompactReport {
                 ("prior", "heldout", &self.local_prior_held_out),
                 ("posterior", "selection", &self.local_posterior_selection),
                 ("posterior", "heldout", &self.local_posterior_held_out),
-                (
-                    "posterior_amplitude_calibrated",
-                    "selection",
-                    &self.calibrated_local_posterior_selection,
-                ),
-                (
-                    "posterior_amplitude_calibrated",
-                    "heldout",
-                    &self.calibrated_local_posterior_held_out,
-                ),
             ],
         )?;
         self.write_error_csv(
@@ -363,25 +530,21 @@ impl C51ThesisNormalizedCompactReport {
                 ("prior", "heldout", &self.surface_prior_held_out),
                 ("posterior", "selection", &self.surface_posterior_selection),
                 ("posterior", "heldout", &self.surface_posterior_held_out),
-                (
-                    "posterior_amplitude_calibrated",
-                    "selection",
-                    &self.calibrated_surface_posterior_selection,
-                ),
-                (
-                    "posterior_amplitude_calibrated",
-                    "heldout",
-                    &self.calibrated_surface_posterior_held_out,
-                ),
             ],
         )?;
-        self.write_manifest(&directory.join("manifest.yaml"))
+        self.write_weak_residual_csv(&directory.join("weak_residual_pde.csv"))?;
+        self.write_field_wide_variances_csv(&directory.join("field_wide_variances.csv"))?;
+        self.write_field_wide_summary_csv(&directory.join("field_wide_accuracy_summary.csv"))?;
+        self.write_covariance_action_errors_csv(
+            &directory.join("field_wide_covariance_actions.csv"),
+        )?;
+        Ok(())
     }
 
     fn write_summary_csv(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
-        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,observation_to_state_ratio,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,local_prior_heldout_primary,local_posterior_heldout_primary,surface_prior_heldout_primary,surface_posterior_heldout_primary,posterior_calibration_precision_scale,posterior_calibration_tau_multiplier,calibrated_prior_b_rms_tesla,calibrated_local_posterior_heldout_primary,calibrated_surface_posterior_heldout_primary")?;
-        writeln!(writer, "{},{},{},{},{},{:.17e},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+        writeln!(writer, "schema_version,profile,refinement,state_dimension,observation_count,observation_to_state_ratio,selection_flux_count,heldout_flux_count,observation_noise_variance_weber_squared,target_b_rms_tesla,exact_raw_b_rms,exact_normalized_b_rms,exact_precision_scale,exact_tau_multiplier,exact_trace_relative_standard_error,compact_raw_b_rms,compact_normalized_b_rms,compact_precision_scale,compact_tau_multiplier,compact_trace_relative_standard_error,local_prior_heldout_primary,local_posterior_heldout_primary,surface_prior_heldout_primary,surface_posterior_heldout_primary")?;
+        writeln!(writer, "{},{},{},{},{},{:.17e},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e}",
             C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
             self.config.profile,
             self.config.refinement,
@@ -393,10 +556,12 @@ impl C51ThesisNormalizedCompactReport {
             self.config.observation_noise_variance_weber_squared,
             self.config.target_b_rms_tesla,
             self.exact.raw_b_rms,
+            self.exact.normalized_b_rms,
             self.exact.precision_scale,
             self.exact.tau_multiplier,
             option_float(self.exact.weighted_trace_relative_standard_error),
             self.compact.raw_b_rms,
+            self.compact.normalized_b_rms,
             self.compact.precision_scale,
             self.compact.tau_multiplier,
             option_float(self.compact.weighted_trace_relative_standard_error),
@@ -404,11 +569,6 @@ impl C51ThesisNormalizedCompactReport {
             self.local_posterior_held_out.primary_envelope(),
             self.surface_prior_held_out.primary_envelope(),
             self.surface_posterior_held_out.primary_envelope(),
-            self.surface_posterior_calibration.precision_scale,
-            self.surface_posterior_calibration.tau_multiplier(),
-            self.calibrated_prior_b_rms_tesla,
-            self.calibrated_local_posterior_held_out.primary_envelope(),
-            self.calibrated_surface_posterior_held_out.primary_envelope(),
         )?;
         writer.flush()?;
         Ok(())
@@ -441,240 +601,352 @@ impl C51ThesisNormalizedCompactReport {
         Ok(())
     }
 
-    fn write_manifest(&self, path: &Path) -> Result<()> {
+    fn write_weak_residual_csv(&self, path: &Path) -> Result<()> {
         let mut writer = BufWriter::new(File::create(path)?);
         writeln!(
             writer,
-            "schema_version: {C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION}"
+            "schema_version,profile,refinement,state_dimension,pde_operator,test_space_dual_weight,manufactured_deterministic_relative_l2_error,residual_standard_deviation,exact_augmented_deterministic_relative_l2_error,compact_deterministic_relative_l2_error,compact_exact_mean_relative_l2_error,exact_augmented_residual_dual_norm,compact_residual_dual_norm"
         )?;
-        writeln!(writer, "study_id: {C51_THESIS_NORMALIZED_COMPACT_STUDY_ID}")?;
-        writeln!(writer, "profile: {}", self.config.profile)?;
-        writeln!(writer, "normalization:")?;
+        for row in &self.weak_residual_rows {
+            writeln!(
+                writer,
+                "{},{},{},{},reduced_hodge_laplace_1form,sigma^-2_projected_sparse_M_test^-1,{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+                C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
+                self.config.profile,
+                self.config.refinement,
+                self.state_dimension,
+                self.weak_residual_manufactured_deterministic_relative_l2_error,
+                row.residual_standard_deviation,
+                row.exact_augmented_deterministic_relative_l2_error,
+                row.compact_deterministic_relative_l2_error,
+                row.compact_exact_mean_relative_l2_error,
+                row.exact_augmented_residual_dual_norm,
+                row.compact_residual_dual_norm,
+            )?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_field_wide_variances_csv(&self, path: &Path) -> Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
         writeln!(
             writer,
-            "  policy: thesis_domain_averaged_feec_magnetic_trace"
+            "schema_version,profile,refinement,output_kind,variance_units,index,exact_prior_variance,compact_prior_variance,exact_posterior_variance,compact_posterior_variance,exact_posterior_prior_ratio,compact_posterior_prior_ratio"
         )?;
-        writeln!(writer, "  equation: volume_inverse_trace_M2_D1_Qinv_D1T")?;
-        writeln!(writer, "  stage: prior_before_conditioning")?;
+        for report in [&self.latent_field_wide, &self.flux_field_wide] {
+            for row in &report.rows {
+                writeln!(
+                    writer,
+                    "{},{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+                    C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
+                    self.config.profile,
+                    self.config.refinement,
+                    report.output_kind,
+                    report.variance_units,
+                    row.index,
+                    row.exact_prior_variance,
+                    row.compact_prior_variance,
+                    row.exact_posterior_variance,
+                    row.compact_posterior_variance,
+                    row.exact_posterior_prior_ratio,
+                    row.compact_posterior_prior_ratio,
+                )?;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_field_wide_summary_csv(&self, path: &Path) -> Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
         writeln!(
             writer,
-            "  target_b_rms_tesla: {:.17e}",
-            self.config.target_b_rms_tesla
+            "schema_version,profile,refinement,output_kind,variance_units,quantity,count,relative_error_floor,near_zero_reference_count,median_relative_error,percentile_90_relative_error,percentile_99_relative_error,maximum_relative_error,median_absolute_error,percentile_90_absolute_error,percentile_99_absolute_error,maximum_absolute_error"
         )?;
-        writeln!(writer, "  sensor_rows_used_for_normalization: false")?;
-        writeln!(writer, "  heldout_rows_used_for_normalization: false")?;
-        writeln!(writer, "  estimator: deterministic_batched_hutchinson")?;
-        writeln!(writer, "  probes: {}", self.config.trace_probes)?;
-        writeln!(writer, "  batches: {}", self.config.trace_batches)?;
-        writeln!(writer, "  seed: {}", self.config.trace_seed)?;
+        for report in [&self.latent_field_wide, &self.flux_field_wide] {
+            for (quantity, summary) in [
+                ("prior_variance", &report.prior_variance_error),
+                ("posterior_variance", &report.posterior_variance_error),
+                (
+                    "posterior_prior_variance_ratio",
+                    &report.posterior_prior_ratio_error,
+                ),
+            ] {
+                writeln!(
+                    writer,
+                    "{},{},{},{},{},{},{},{:.17e},{},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
+                    C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
+                    self.config.profile,
+                    self.config.refinement,
+                    report.output_kind,
+                    report.variance_units,
+                    quantity,
+                    summary.count,
+                    summary.relative_error_floor,
+                    summary.near_zero_reference_count,
+                    summary.median_relative_error,
+                    summary.percentile_90_relative_error,
+                    summary.percentile_99_relative_error,
+                    summary.maximum_relative_error,
+                    summary.median_absolute_error,
+                    summary.percentile_90_absolute_error,
+                    summary.percentile_99_absolute_error,
+                    summary.maximum_absolute_error,
+                )?;
+            }
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn write_covariance_action_errors_csv(&self, path: &Path) -> Result<()> {
+        let errors = self.covariance_action_errors;
+        let mut writer = BufWriter::new(File::create(path)?);
         writeln!(
             writer,
-            "observation_design_id: {C51_FLUX_COCHAIN_DESIGN_ID}"
-        )?;
-        writeln!(writer, "local_qoi_design_id: {C51_FLUX_COCHAIN_DESIGN_ID}")?;
-        writeln!(
-            writer,
-            "surface_qoi_design_id: {C51_SURFACE_FLUX_QOI_DESIGN_ID}"
-        )?;
-        writeln!(writer, "cochain_row_semantics: exact_integral_flux_dofs")?;
-        writeln!(writer, "cell_barycenter_reconstruction_used: false")?;
-        writeln!(
-            writer,
-            "compact_inverse_ordering: boundary_first_full_relative"
-        )?;
-        writeln!(writer, "row_order_seed: {C51_FLUX_COCHAIN_DESIGN_SEED}")?;
-        writeln!(writer, "state_dimension: {}", self.state_dimension)?;
-        writeln!(
-            writer,
-            "full_cochain_dimension: {}",
-            self.full_cochain_dimension
-        )?;
-        writeln!(
-            writer,
-            "magnetic_output_dimension: {}",
-            self.magnetic_output_dimension
-        )?;
-        writeln!(
-            writer,
-            "observation_count: {}",
-            self.config.observation_count
-        )?;
-        writeln!(
-            writer,
-            "observation_to_state_ratio: {:.17e}",
-            self.config.observation_count as f64 / self.state_dimension as f64
-        )?;
-        writeln!(
-            writer,
-            "selection_flux_count: {C51_THESIS_SELECTION_FLUX_COUNT}"
-        )?;
-        writeln!(
-            writer,
-            "heldout_flux_count: {C51_THESIS_HELD_OUT_FLUX_COUNT}"
-        )?;
-        writeln!(
-            writer,
-            "observation_noise_variance_weber_squared: {:.17e}",
-            self.config.observation_noise_variance_weber_squared
-        )?;
-        writeln!(writer, "posterior_amplitude_calibration:")?;
-        writeln!(
-            writer,
-            "  policy: exact_reference_mean_marginal_surface_flux_rms_by_prior_precision"
-        )?;
-        writeln!(writer, "  bank: selection")?;
-        writeln!(writer, "  heldout_rows_used: false")?;
-        writeln!(writer, "  likelihood_reconditioned: true")?;
-        writeln!(writer, "  posthoc_covariance_scaling: false")?;
-        writeln!(
-            writer,
-            "  production_target_source: external_physical_calibration_required"
-        )?;
-        writeln!(
-            writer,
-            "  target_posterior_rms_weber: {:.17e}",
-            self.surface_posterior_calibration.target_rms
-        )?;
-        writeln!(
-            writer,
-            "  uncalibrated_posterior_rms_weber: {:.17e}",
-            self.surface_posterior_calibration.uncalibrated_rms
-        )?;
-        writeln!(
-            writer,
-            "  achieved_posterior_rms_weber: {:.17e}",
-            self.surface_posterior_calibration.achieved_rms
-        )?;
-        writeln!(
-            writer,
-            "  precision_scale: {:.17e}",
-            self.surface_posterior_calibration.precision_scale
+            "schema_version,profile,refinement,seed,probe_count,latent_prior_maximum_relative_mass_error,latent_posterior_maximum_relative_mass_error,flux_prior_maximum_relative_energy_error,flux_posterior_maximum_relative_energy_error"
         )?;
         writeln!(
             writer,
-            "  tau_multiplier: {:.17e}",
-            self.surface_posterior_calibration.tau_multiplier()
+            "{},{},{},{},{},{:.17e},{:.17e},{:.17e},{:.17e}",
+            C51_THESIS_NORMALIZED_COMPACT_SCHEMA_VERSION,
+            self.config.profile,
+            self.config.refinement,
+            errors.seed,
+            errors.probe_count,
+            errors.latent_prior_maximum_relative_mass_error,
+            errors.latent_posterior_maximum_relative_mass_error,
+            errors.flux_prior_maximum_relative_energy_error,
+            errors.flux_posterior_maximum_relative_energy_error,
         )?;
-        writeln!(
-            writer,
-            "  relative_error: {:.17e}",
-            self.surface_posterior_calibration.relative_error
-        )?;
-        writeln!(
-            writer,
-            "  bracket_expansions: {}",
-            self.surface_posterior_calibration.bracket_expansions
-        )?;
-        writeln!(
-            writer,
-            "  iterations: {}",
-            self.surface_posterior_calibration.iterations
-        )?;
-        writeln!(
-            writer,
-            "  prior_b_rms_after_calibration_tesla: {:.17e}",
-            self.calibrated_prior_b_rms_tesla
-        )?;
-        writeln!(writer, "errors:")?;
-        writeln!(
-            writer,
-            "  local_prior_selection_primary: {:.17e}",
-            self.local_prior_selection.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  local_prior_heldout_primary: {:.17e}",
-            self.local_prior_held_out.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  local_posterior_selection_primary: {:.17e}",
-            self.local_posterior_selection.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  local_posterior_heldout_primary: {:.17e}",
-            self.local_posterior_held_out.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  surface_prior_selection_primary: {:.17e}",
-            self.surface_prior_selection.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  surface_prior_heldout_primary: {:.17e}",
-            self.surface_prior_held_out.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  surface_posterior_selection_primary: {:.17e}",
-            self.surface_posterior_selection.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  surface_posterior_heldout_primary: {:.17e}",
-            self.surface_posterior_held_out.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  calibrated_local_posterior_selection_primary: {:.17e}",
-            self.calibrated_local_posterior_selection.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  calibrated_local_posterior_heldout_primary: {:.17e}",
-            self.calibrated_local_posterior_held_out.primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  calibrated_surface_posterior_selection_primary: {:.17e}",
-            self.calibrated_surface_posterior_selection
-                .primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "  calibrated_surface_posterior_heldout_primary: {:.17e}",
-            self.calibrated_surface_posterior_held_out
-                .primary_envelope()
-        )?;
-        writeln!(
-            writer,
-            "root_sha: {}",
-            option_yaml(self.metadata.root_sha.as_deref())
-        )?;
-        writeln!(
-            writer,
-            "feec_sha: {}",
-            option_yaml(self.metadata.feec_sha.as_deref())
-        )?;
-        writeln!(
-            writer,
-            "gmrf_sha: {}",
-            option_yaml(self.metadata.gmrf_sha.as_deref())
-        )?;
-        writeln!(
-            writer,
-            "root_dirty: {}",
-            option_bool(self.metadata.root_dirty)
-        )?;
-        writeln!(
-            writer,
-            "feec_dirty: {}",
-            option_bool(self.metadata.feec_dirty)
-        )?;
-        writeln!(
-            writer,
-            "gmrf_dirty: {}",
-            option_bool(self.metadata.gmrf_dirty)
-        )?;
-        writeln!(writer, "command: {:?}", self.metadata.command)?;
         writer.flush()?;
         Ok(())
     }
 }
 
-fn trace_calibration(
+fn build_field_wide_variance_report(
+    output_kind: &str,
+    variance_units: &str,
+    exact_prior: &[f64],
+    compact_prior: &[f64],
+    exact_posterior: &[f64],
+    compact_posterior: &[f64],
+) -> Result<C51FieldWideVarianceReport> {
+    let dimension = exact_prior.len();
+    if dimension == 0
+        || compact_prior.len() != dimension
+        || exact_posterior.len() != dimension
+        || compact_posterior.len() != dimension
+    {
+        return Err(feec_gmrf::FeecGmrfError::Dimension(
+            "C51 field-wide variance vectors must be non-empty and aligned".to_string(),
+        ));
+    }
+    if exact_prior
+        .iter()
+        .chain(compact_prior)
+        .any(|value| !value.is_finite() || *value <= 0.0)
+        || exact_posterior
+            .iter()
+            .chain(compact_posterior)
+            .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(feec_gmrf::FeecGmrfError::Inference(
+            "C51 exact field-wide variances must be finite with proper positive priors and non-negative posteriors"
+                .to_string(),
+        ));
+    }
+    let exact_ratio = exact_posterior
+        .iter()
+        .zip(exact_prior)
+        .map(|(posterior, prior)| posterior / prior)
+        .collect::<Vec<_>>();
+    let compact_ratio = compact_posterior
+        .iter()
+        .zip(compact_prior)
+        .map(|(posterior, prior)| posterior / prior)
+        .collect::<Vec<_>>();
+    let rows = (0..dimension)
+        .map(|index| C51FieldWideVarianceRow {
+            index,
+            exact_prior_variance: exact_prior[index],
+            compact_prior_variance: compact_prior[index],
+            exact_posterior_variance: exact_posterior[index],
+            compact_posterior_variance: compact_posterior[index],
+            exact_posterior_prior_ratio: exact_ratio[index],
+            compact_posterior_prior_ratio: compact_ratio[index],
+        })
+        .collect();
+    Ok(C51FieldWideVarianceReport {
+        output_kind: output_kind.to_string(),
+        variance_units: variance_units.to_string(),
+        rows,
+        prior_variance_error: field_wide_error_summary(compact_prior, exact_prior)?,
+        posterior_variance_error: field_wide_error_summary(compact_posterior, exact_posterior)?,
+        posterior_prior_ratio_error: field_wide_error_summary(&compact_ratio, &exact_ratio)?,
+    })
+}
+
+pub(crate) fn field_wide_error_summary(
+    candidate: &[f64],
+    reference: &[f64],
+) -> Result<C51FieldWideErrorSummary> {
+    if candidate.is_empty() || candidate.len() != reference.len() {
+        return Err(feec_gmrf::FeecGmrfError::Dimension(
+            "C51 field-wide error vectors must be non-empty and aligned".to_string(),
+        ));
+    }
+    let maximum_reference = reference
+        .iter()
+        .map(|value| value.abs())
+        .fold(0.0_f64, f64::max);
+    let relative_error_floor = (1.0e-12 * maximum_reference).max(f64::MIN_POSITIVE);
+    let near_zero_reference_count = reference
+        .iter()
+        .filter(|value| value.abs() < relative_error_floor)
+        .count();
+    let mut absolute_errors = candidate
+        .iter()
+        .zip(reference)
+        .map(|(candidate, reference)| (candidate - reference).abs())
+        .collect::<Vec<_>>();
+    let mut relative_errors = absolute_errors
+        .iter()
+        .zip(reference)
+        .map(|(absolute, reference)| absolute / reference.abs().max(relative_error_floor))
+        .collect::<Vec<_>>();
+    absolute_errors.sort_by(f64::total_cmp);
+    relative_errors.sort_by(f64::total_cmp);
+    Ok(C51FieldWideErrorSummary {
+        count: candidate.len(),
+        relative_error_floor,
+        near_zero_reference_count,
+        median_relative_error: sorted_percentile(&relative_errors, 0.50),
+        percentile_90_relative_error: sorted_percentile(&relative_errors, 0.90),
+        percentile_99_relative_error: sorted_percentile(&relative_errors, 0.99),
+        maximum_relative_error: *relative_errors.last().expect("non-empty error vector"),
+        median_absolute_error: sorted_percentile(&absolute_errors, 0.50),
+        percentile_90_absolute_error: sorted_percentile(&absolute_errors, 0.90),
+        percentile_99_absolute_error: sorted_percentile(&absolute_errors, 0.99),
+        maximum_absolute_error: *absolute_errors.last().expect("non-empty error vector"),
+    })
+}
+
+fn sorted_percentile(sorted: &[f64], probability: f64) -> f64 {
+    let index = (probability * (sorted.len() - 1) as f64).ceil() as usize;
+    sorted[index]
+}
+
+pub(crate) fn rademacher_probe<R: Rng + ?Sized>(dimension: usize, rng: &mut R) -> Vec<f64> {
+    let normalization = (dimension as f64).sqrt();
+    (0..dimension)
+        .map(|_| (if rng.gen::<bool>() { 1.0 } else { -1.0 }) / normalization)
+        .collect()
+}
+
+pub(crate) fn metric_relative_vector_error(
+    candidate: &[f64],
+    reference: &[f64],
+    metric: &SparseMat,
+) -> Result<f64> {
+    if candidate.len() != reference.len()
+        || metric.nrows() != reference.len()
+        || metric.ncols() != reference.len()
+    {
+        return Err(feec_gmrf::FeecGmrfError::Dimension(
+            "C51 metric covariance-action comparison dimensions do not align".to_string(),
+        ));
+    }
+    let difference = candidate
+        .iter()
+        .zip(reference)
+        .map(|(candidate, reference)| candidate - reference)
+        .collect::<Vec<_>>();
+    let numerator = metric_vector_norm(&difference, metric)?;
+    let denominator = metric_vector_norm(reference, metric)?;
+    if denominator == 0.0 {
+        return Err(feec_gmrf::FeecGmrfError::Inference(
+            "C51 exact covariance action has zero metric norm".to_string(),
+        ));
+    }
+    Ok(numerator / denominator)
+}
+
+fn metric_vector_norm(vector: &[f64], metric: &SparseMat) -> Result<f64> {
+    let weighted = metric
+        .apply_checked(vector)
+        .map_err(feec_gmrf::FeecGmrfError::Dimension)?;
+    let squared = vector
+        .iter()
+        .zip(weighted)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    if !squared.is_finite() || squared < -1.0e-12 {
+        return Err(feec_gmrf::FeecGmrfError::Inference(
+            "C51 covariance action produced an invalid metric norm".to_string(),
+        ));
+    }
+    Ok(squared.max(0.0).sqrt())
+}
+
+pub(crate) fn homogeneous_full_relative_boundary(topology: &Complex) -> EssentialBoundarySpec {
+    EssentialBoundarySpec {
+        state: homogeneous_boundary_dofs(topology, 1),
+        auxiliary: homogeneous_boundary_dofs(topology, 0),
+    }
+}
+
+fn homogeneous_boundary_dofs(topology: &Complex, grade: usize) -> Vec<PrescribedDof> {
+    topology
+        .boundary_subcomplex_simplices(grade)
+        .into_iter()
+        .map(|simplex| PrescribedDof {
+            index: simplex.kidx,
+            value: 0.0,
+        })
+        .collect()
+}
+
+pub(crate) fn deterministic_manufactured_state(dimension: usize) -> Vec<f64> {
+    (0..dimension)
+        .map(|index| {
+            let coordinate = index as f64 + 1.0;
+            (0.173 * coordinate).sin() + 0.35 * (0.071 * coordinate).cos()
+        })
+        .collect()
+}
+
+pub(crate) fn residual_dual_norm(system: &LinearPdeSystem, state: &[f64]) -> Result<f64> {
+    let residual = system.residual_quantity("weak_residual")?;
+    let mut values = residual.operator().apply(state)?;
+    for (value, bias) in values.iter_mut().zip(residual.bias()) {
+        *value += bias;
+    }
+    let inverse = system
+        .assembly()
+        .state_mass_inverse
+        .as_ref()
+        .ok_or_else(|| {
+            feec_gmrf::FeecGmrfError::Inference(
+                "C51 weak-residual dual norm requires the test-mass inverse".to_string(),
+            )
+        })?;
+    let weighted = LinearMap::from_feec_csr(inverse)?.apply(&values)?;
+    let squared = values
+        .iter()
+        .zip(weighted)
+        .map(|(left, right)| left * right)
+        .sum::<f64>();
+    if !squared.is_finite() || squared < -1.0e-12 {
+        return Err(feec_gmrf::FeecGmrfError::Inference(
+            "C51 weak-residual dual norm is non-finite or negative".to_string(),
+        ));
+    }
+    Ok(squared.max(0.0).sqrt())
+}
+
+pub(crate) fn trace_calibration(
     weighted_trace: f64,
     relative_standard_error: Option<f64>,
     target_b_rms: f64,
@@ -707,6 +979,184 @@ fn option_float(value: Option<f64>) -> String {
         .unwrap_or_default()
 }
 
+pub fn covariance_error_metrics(
+    approximation: &[Vec<f64>],
+    reference: &[Vec<f64>],
+) -> Result<C51CovarianceErrorMetrics> {
+    validate_covariance_rows(approximation)?;
+    validate_covariance_rows(reference)?;
+    if approximation.len() != reference.len() {
+        return Err(feec_gmrf::FeecGmrfError::Dimension(
+            "C51 covariance matrices have different dimensions".to_string(),
+        ));
+    }
+    let maximum_reference_variance = reference
+        .iter()
+        .enumerate()
+        .map(|(index, row)| row[index])
+        .fold(0.0, f64::max);
+    if !maximum_reference_variance.is_finite() || maximum_reference_variance <= 0.0 {
+        return Err(feec_gmrf::FeecGmrfError::Inference(
+            "C51 reference covariance has no positive finite diagonal".to_string(),
+        ));
+    }
+    for (index, row) in reference.iter().enumerate() {
+        if row[index] <= C51_REFERENCE_VARIANCE_RELATIVE_FLOOR * maximum_reference_variance {
+            return Err(feec_gmrf::FeecGmrfError::Inference(format!(
+                "C51 reference variance {index} is materially near zero"
+            )));
+        }
+    }
+    let dimension = reference.len();
+    let reference_matrix = covariance_rows_to_matrix(reference);
+    let approximation_matrix = covariance_rows_to_matrix(approximation);
+    let difference = &approximation_matrix - &reference_matrix;
+    let reference_frobenius = reference_matrix.norm();
+    let reference_spectral = covariance_spectral_norm(&reference_matrix);
+    if reference_frobenius == 0.0 || reference_spectral == 0.0 {
+        return Err(feec_gmrf::FeecGmrfError::Inference(
+            "C51 covariance reference norm is zero".to_string(),
+        ));
+    }
+    let maximum_relative_diagonal = (0..dimension)
+        .map(|index| {
+            (approximation[index][index] - reference[index][index]).abs() / reference[index][index]
+        })
+        .fold(0.0, f64::max);
+    let maximum_relative_directional = covariance_metric_directions(dimension)
+        .into_iter()
+        .map(|direction| {
+            let reference_value = covariance_quadratic(reference, &direction);
+            if !reference_value.is_finite() || reference_value <= 0.0 {
+                return Err(feec_gmrf::FeecGmrfError::Inference(
+                    "C51 directional reference covariance is non-positive".to_string(),
+                ));
+            }
+            Ok(
+                (covariance_quadratic(approximation, &direction) - reference_value).abs()
+                    / reference_value,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .fold(0.0, f64::max);
+    let reference_correlation = covariance_correlation_matrix(reference)?;
+    let approximation_correlation = covariance_correlation_matrix(approximation)?;
+    let correlation_difference = &approximation_correlation - &reference_correlation;
+    let metrics = C51CovarianceErrorMetrics {
+        relative_frobenius: difference.norm() / reference_frobenius,
+        relative_spectral: covariance_spectral_norm(&difference) / reference_spectral,
+        maximum_relative_diagonal,
+        maximum_relative_directional,
+        relative_correlation_frobenius: correlation_difference.norm()
+            / reference_correlation.norm(),
+    };
+    if [
+        metrics.relative_frobenius,
+        metrics.relative_spectral,
+        metrics.maximum_relative_diagonal,
+        metrics.maximum_relative_directional,
+        metrics.relative_correlation_frobenius,
+    ]
+    .iter()
+    .any(|value| !value.is_finite() || *value < 0.0)
+    {
+        return Err(feec_gmrf::FeecGmrfError::Inference(
+            "C51 covariance metric is non-finite or negative".to_string(),
+        ));
+    }
+    Ok(metrics)
+}
+
+fn validate_covariance_rows(covariance: &[Vec<f64>]) -> Result<()> {
+    if covariance.is_empty()
+        || covariance
+            .iter()
+            .any(|row| row.len() != covariance.len() || row.iter().any(|value| !value.is_finite()))
+    {
+        return Err(feec_gmrf::FeecGmrfError::Dimension(
+            "C51 covariance must be nonempty, square, and finite".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn covariance_metric_directions(dimension: usize) -> Vec<Vec<f64>> {
+    let mut directions = (0..dimension)
+        .map(|index| {
+            let mut direction = vec![0.0; dimension];
+            direction[index] = 1.0;
+            direction
+        })
+        .collect::<Vec<_>>();
+    if dimension == C51_VECTOR_OUTPUT_DIMENSION {
+        for (left, right) in [(0, 1), (0, 2), (1, 2)] {
+            for sign in [-1.0, 1.0] {
+                let mut direction = vec![0.0; dimension];
+                for kernel in 0..3 {
+                    direction[3 * kernel + left] = 1.0;
+                    direction[3 * kernel + right] = sign;
+                }
+                let norm = direction
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f64>()
+                    .sqrt();
+                for value in &mut direction {
+                    *value /= norm;
+                }
+                directions.push(direction);
+            }
+        }
+    }
+    directions
+}
+
+fn covariance_quadratic(matrix: &[Vec<f64>], direction: &[f64]) -> f64 {
+    direction
+        .iter()
+        .enumerate()
+        .map(|(row, left)| {
+            direction
+                .iter()
+                .enumerate()
+                .map(|(column, right)| left * matrix[row][column] * right)
+                .sum::<f64>()
+        })
+        .sum()
+}
+
+fn covariance_correlation_matrix(covariance: &[Vec<f64>]) -> Result<Matrix> {
+    let dimension = covariance.len();
+    let mut correlation = Matrix::zeros(dimension, dimension);
+    for row in 0..dimension {
+        for column in 0..dimension {
+            if covariance[row][row] <= 0.0 || covariance[column][column] <= 0.0 {
+                return Err(feec_gmrf::FeecGmrfError::Inference(
+                    "C51 covariance correlation requires positive diagonal".to_string(),
+                ));
+            }
+            correlation[(row, column)] = covariance[row][column]
+                / (covariance[row][row] * covariance[column][column]).sqrt();
+        }
+    }
+    Ok(correlation)
+}
+
+fn covariance_rows_to_matrix(rows: &[Vec<f64>]) -> Matrix {
+    Matrix::from_fn(rows.len(), rows.len(), |row, column| rows[row][column])
+}
+
+fn covariance_spectral_norm(matrix: &Matrix) -> f64 {
+    matrix
+        .clone()
+        .svd(false, false)
+        .singular_values
+        .iter()
+        .copied()
+        .fold(0.0, f64::max)
+}
+
 fn metrics_csv(metrics: &C51CovarianceErrorMetrics) -> String {
     format!(
         "{:.17e},{:.17e},{:.17e},{:.17e},{:.17e},{:.17e}",
@@ -717,18 +1167,6 @@ fn metrics_csv(metrics: &C51CovarianceErrorMetrics) -> String {
         metrics.relative_correlation_frobenius,
         metrics.primary_envelope(),
     )
-}
-
-fn option_yaml(value: Option<&str>) -> String {
-    value
-        .map(|value| format!("{value:?}"))
-        .unwrap_or_else(|| "null".to_string())
-}
-
-fn option_bool(value: Option<bool>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "null".to_string())
 }
 
 #[cfg(test)]
@@ -744,13 +1182,107 @@ mod tests {
     }
 
     #[test]
-    fn publication_profiles_hold_high_data_density() {
-        let n8 = C51ThesisNormalizedCompactConfig::publication(8).unwrap();
-        let n10 = C51ThesisNormalizedCompactConfig::publication(10).unwrap();
-        assert_eq!(n8.observation_count, C51_THESIS_OBSERVATION_COUNT_N8);
-        assert_eq!(n10.observation_count, C51_THESIS_OBSERVATION_COUNT_N10);
-        assert!(n8.observation_count > 3_032);
-        assert!(n10.observation_count > 6_130);
+    fn development_config_exposes_mesh_and_observation_workload() {
+        let config = C51ThesisNormalizedCompactConfig::development(4, 128).unwrap();
+        assert_eq!(config.refinement, 4);
+        assert_eq!(config.observation_count, 128);
+        assert_eq!(config.target_b_rms_tesla, C51_THESIS_TARGET_B_RMS_TESLA);
+        assert!(config.profile.contains("development"));
+        assert!(C51ThesisNormalizedCompactConfig::development(1, 128).is_err());
+        assert!(C51ThesisNormalizedCompactConfig::development(4, 0).is_err());
+    }
+
+    #[test]
+    fn weak_pde_uses_feec_projected_sparse_mass_inverse() {
+        let mesh = CartesianMeshInfo::new_unit_scaled(3, 4, 1.0);
+        let (topology, coordinates) = mesh.compute_coord_complex();
+        let metric = coordinates.to_edge_lengths(&topology);
+        let boundary = homogeneous_full_relative_boundary(&topology);
+        let assembly = build_reduced_hodge_laplace_1form_system(&topology, &metric, &boundary)
+            .expect("FEEC should assemble the projected sparse inverse");
+        let inverse = assembly
+            .state_mass_inverse
+            .as_ref()
+            .expect("the reduced 1-form system should expose its FEEC inverse");
+        assert_eq!(inverse.nrows(), assembly.state_dimension());
+        assert_eq!(inverse.ncols(), assembly.state_dimension());
+        assert!(
+            inverse.nnz() < inverse.nrows() * inverse.ncols(),
+            "the C51 path must not replace FEEC's sparse inverse with a dense matrix"
+        );
+    }
+
+    #[test]
+    fn field_wide_error_summary_reports_requested_quantiles_and_floor() {
+        let summary = field_wide_error_summary(&[1.1, 0.8, 3.0], &[1.0, 1.0, 2.0]).unwrap();
+        assert_eq!(summary.count, 3);
+        assert_eq!(summary.near_zero_reference_count, 0);
+        assert!((summary.relative_error_floor - 2.0e-12).abs() < 1.0e-24);
+        assert!((summary.median_relative_error - 0.2).abs() < 1.0e-12);
+        assert!((summary.percentile_90_relative_error - 0.5).abs() < 1.0e-12);
+        assert!((summary.percentile_99_relative_error - 0.5).abs() < 1.0e-12);
+        assert!((summary.maximum_relative_error - 0.5).abs() < 1.0e-12);
+        assert!((summary.maximum_absolute_error - 1.0).abs() < 1.0e-12);
+    }
+
+    #[test]
+    fn weak_residual_small_noise_converges_and_exact_representations_agree() {
+        let mut config = C51ThesisNormalizedCompactConfig::development(4, 32).unwrap();
+        config.trace_probes = 32;
+        config.trace_batches = 4;
+        config.pde_residual_standard_deviations = vec![1.0e-1, 1.0e-3, 1.0e-5];
+        let report = run_c51_thesis_normalized_compact(&config).unwrap();
+        assert!(report.weak_residual_manufactured_deterministic_relative_l2_error < 1.0e-10);
+        assert_eq!(report.weak_residual_rows.len(), 3);
+        let first = report.weak_residual_rows.first().unwrap();
+        let last = report.weak_residual_rows.last().unwrap();
+        assert!(
+            last.exact_augmented_deterministic_relative_l2_error
+                < first.exact_augmented_deterministic_relative_l2_error
+        );
+        assert!(
+            last.compact_deterministic_relative_l2_error
+                < first.compact_deterministic_relative_l2_error
+        );
+        assert_eq!(report.latent_field_wide.rows.len(), report.state_dimension);
+        assert_eq!(
+            report.flux_field_wide.rows.len(),
+            report.magnetic_output_dimension
+        );
+        for field in [&report.latent_field_wide, &report.flux_field_wide] {
+            assert!(field
+                .rows
+                .iter()
+                .all(|row| row.exact_posterior_prior_ratio >= 0.0
+                    && row.exact_posterior_prior_ratio <= 1.0 + 1.0e-8
+                    && row.compact_posterior_prior_ratio >= 0.0
+                    && row.compact_posterior_prior_ratio <= 1.0 + 1.0e-8));
+            assert!(field
+                .posterior_prior_ratio_error
+                .maximum_relative_error
+                .is_finite());
+        }
+        assert!(report
+            .covariance_action_errors
+            .flux_posterior_maximum_relative_energy_error
+            .is_finite());
+
+        let directory = std::env::temp_dir().join(format!(
+            "c51_weak_residual_development_{}",
+            std::process::id()
+        ));
+        if directory.exists() {
+            fs::remove_dir_all(&directory).unwrap();
+        }
+        report.write_directory(&directory).unwrap();
+        assert!(directory.join("weak_residual_pde.csv").is_file());
+        assert!(directory.join("field_wide_variances.csv").is_file());
+        assert!(directory.join("field_wide_accuracy_summary.csv").is_file());
+        assert!(directory
+            .join("field_wide_covariance_actions.csv")
+            .is_file());
+        assert!(!directory.join("manifest.yaml").exists());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

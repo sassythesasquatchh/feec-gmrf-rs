@@ -17,17 +17,22 @@ pub use crate::hodge::{
 };
 pub use crate::infer::{
     CholeskyOrderingKind, DirectPhaseResourceUsage, ExactObservationCovarianceBlocks,
-    ExactObservationCovarianceProvenance, ExactObservationPosterior,
-    ExactObservationPosteriorDiagnostics, FactoredGaussianPrior, FactorizationDiagnostics,
-    HutchinsonVarianceConfig, LinearConditioningDiagnostics, LinearObservationUpdateDiagnostics,
-    MonteCarloVarianceConfig, Posterior, PreparedLinearGaussianModel, ProbeDistribution,
-    RepeatedSolveResourceUsage, ResourceMeasurement, SparseCholeskyDiagnostics,
-    SparseDirectResourceReport, SparseDirectSolverKind, VarianceEstimate, VarianceEstimator,
-    VarianceFloor, VarianceMethod, WeightedCovarianceTraceEstimate, WeightedVarianceEstimate,
+    ExactObservationCovarianceProvenance, ExactObservationDiagonalBlocks,
+    ExactObservationDiagonalPosterior, ExactObservationDiagonalPosteriorDiagnostics,
+    ExactObservationPosterior, ExactObservationPosteriorDiagnostics, FactoredGaussianPrior,
+    FactorizationDiagnostics, HutchinsonVarianceConfig, LinearConditioningDiagnostics,
+    LinearObservationUpdateDiagnostics, MonteCarloVarianceConfig, Posterior,
+    PreparedLinearGaussianModel, ProbeDistribution, RepeatedSolveResourceUsage,
+    ResourceMeasurement, SparseCholeskyDiagnostics, SparseDirectResourceReport,
+    SparseDirectSolverKind, VarianceEstimate, VarianceEstimator, VarianceFloor, VarianceMethod,
+    WeightedCovarianceTraceEstimate, WeightedVarianceEstimate,
 };
 pub use crate::linear_pde::{
-    DeterministicLinearPdeSolution, LinearPdeModelBuilder, LinearPdeSystem, PdeResidualNoise,
+    joint_block_map, DeterministicLinearPdeSolution, JointLinearPdeModelBuilder,
+    LinearPdeModelBuilder, LinearPdeSystem, PdeResidualNoise,
 };
+pub use crate::magnetostatics::LinearMagnetostaticSystem;
+pub use crate::mesh::TaggedTetrahedralMesh;
 pub use crate::model::nonlinear::{
     NonlinearLaplaceModelBuilder, NonlinearPosterior, NonlinearResidualEvaluation,
     NonlinearResidualTerm, ResidualModel,
@@ -51,6 +56,7 @@ pub use crate::physical::{
     PhysicalRmsCalibration, PosteriorPhysicalRmsCalibration,
     PosteriorPhysicalRmsCalibrationOptions, WendlandC2Kernel3d,
 };
+pub use crate::physical::{magnetic_point_measurement_map_3d, MagneticPointSensor3d};
 pub use crate::prior::supported::{
     AuditedSupportedCovariance, PreparedSupportedMaternModel, SupportedCovarianceSymmetryAudit,
     SupportedMaternDiagnostics, SupportedMaternLayout, SupportedMaternPosterior,

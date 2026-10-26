@@ -68,6 +68,7 @@ gmrf-core = { path = "gmrf-rs" }
 thiserror = { workspace = true }
 rand = { workspace = true }
 csv = { workspace = true }
+mshio = "0.4.2"
 
 [dev-dependencies]
 nalgebra = { workspace = true }

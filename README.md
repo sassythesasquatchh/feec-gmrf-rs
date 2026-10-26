@@ -224,6 +224,9 @@ The runnable examples provide the complete FEEC assembly around this model:
   electromagnetic 1-form problem, derives magnetic flux and reconstructed
   \(B\), compares an observation-only Matérn model with weak-PDE-residual
   conditioning, and reports engineering quantities of interest.
+- The [linear permeable sphere example](crates/feg-case-studies/examples/permeable_sphere.rs) defines a
+  joint field/excitation posterior, supplies the analytical reference, and
+  exports magnetic fields for ParaView.
 
 ## Installation and optional solvers
 

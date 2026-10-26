@@ -1,5 +1,8 @@
 //! Physical outputs represented as explicit compositions of FEEC operators.
 
+mod point;
+pub use point::{magnetic_point_measurement_map_3d, MagneticPointSensor3d};
+
 use crate::infer::Posterior;
 use crate::model::{
     DerivedQuantity, LinearConstraint, LinearGaussianModelBuilder, LinearObservation,

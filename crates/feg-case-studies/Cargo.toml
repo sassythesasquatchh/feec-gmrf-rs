@@ -32,6 +32,7 @@ gmrf-core = { path = "../../gmrf-rs" }
 faer = { workspace = true }
 rand = { workspace = true }
 rand_distr = { workspace = true }
+nalgebra = { workspace = true }
 libm = "0.2"
 plotters = { version = "0.3", default-features = false, features = ["bitmap_backend", "bitmap_encoder", "ttf"] }
 csv = { workspace = true }
@@ -39,19 +40,18 @@ sha2 = "0.10"
 serde_json = "1"
 
 [[example]]
+name = "permeable_sphere"
+
+[[example]]
 name = "c50_split_inverse_sites"
 required-features = ["experimental"]
 
 [[example]]
-name = "c51_benchmark"
+name = "c51_thesis_normalized_compact"
 required-features = ["experimental"]
 
 [[example]]
-name = "c51_spectral_covariance_rank"
-required-features = ["experimental", "external-solvers"]
-
-[[example]]
-name = "c51_thesis_normalized_compact"
+name = "c51_one_form_pde_uq"
 required-features = ["experimental"]
 
 [[test]]

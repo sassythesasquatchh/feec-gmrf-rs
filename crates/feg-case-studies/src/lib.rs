@@ -9,13 +9,9 @@ pub mod annulus_h_formulation;
 #[cfg(feature = "experimental")]
 pub mod c50_split_inverse_sites;
 #[cfg(feature = "experimental")]
-pub mod c51_benchmark;
-#[cfg(feature = "experimental")]
-pub mod c51_exact_supported_pilot;
-#[cfg(feature = "experimental")]
 pub mod c51_magnetic_sensor_design;
 #[cfg(feature = "experimental")]
-pub mod c51_spectral_covariance_rank;
+pub mod c51_one_form_pde_uq;
 #[cfg(feature = "experimental")]
 pub mod c51_thesis_normalized_compact;
 pub mod cube_mass_inverse_variance;
@@ -115,10 +111,7 @@ pub mod experimental {
     //! maintained study profiles.
 
     pub use crate::c50_split_inverse_sites;
-    pub use crate::c51_benchmark;
-    pub use crate::c51_exact_supported_pilot;
     pub use crate::c51_magnetic_sensor_design;
-    pub use crate::c51_spectral_covariance_rank;
     pub use crate::c51_thesis_normalized_compact;
     pub use crate::cube_voids_coexact_transform;
     pub use crate::cube_zero_form_kernel_validation;

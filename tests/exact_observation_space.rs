@@ -108,6 +108,33 @@ fn operator_level_blocks_match_an_independent_dense_reference() {
 }
 
 #[test]
+fn operator_level_blocks_accept_correlated_noise_covariance() {
+    let kyy = DMatrix::from_row_slice(2, 2, &[1.4, 0.2, 0.2, 1.1]);
+    let kgy = DMatrix::from_row_slice(2, 2, &[0.6, -0.1, 0.3, 0.8]);
+    let kgg = DMatrix::from_row_slice(2, 2, &[1.2, 0.15, 0.15, 0.9]);
+    let noise = DMatrix::from_row_slice(2, 2, &[0.3, 0.1, 0.1, 0.2]);
+    let observations = DVector::from_vec(vec![0.4, -0.7]);
+    let factor = (&kyy + &noise).cholesky().unwrap();
+    let expected_mean = &kgy * factor.solve(&observations);
+    let expected_covariance = &kgg - &kgy * factor.solve(&kgy.transpose());
+
+    let blocks = ExactObservationCovarianceBlocks::new(rows(&kyy), rows(&kgy), rows(&kgg)).unwrap();
+    let posterior = ExactObservationPosterior::from_prior_covariance_blocks_with_noise_covariance(
+        blocks,
+        rows(&noise),
+    )
+    .unwrap();
+    let actual_mean = posterior.output_mean(observations.as_slice()).unwrap();
+    for (actual, expected) in actual_mean.iter().zip(expected_mean.iter()) {
+        assert!((actual - expected).abs() <= 1.0e-12);
+    }
+    assert_matrix_close(
+        &posterior.posterior_output_covariance(),
+        &expected_covariance,
+    );
+}
+
+#[test]
 fn caller_blocks_are_never_silently_symmetrized() {
     let error = ExactObservationCovarianceBlocks::new(
         vec![vec![1.0, 1.0e-15], vec![0.0, 1.0]],
@@ -162,7 +189,7 @@ fn supported_matern_adapter_matches_direct_precision_conditioning() {
     assert!(!audit.residual_aware);
 
     let observation = LinearObservation::new(
-        observation_map,
+        observation_map.clone(),
         observation_value.clone(),
         GaussianNoise::variance(noise_variance).unwrap(),
     )
@@ -184,6 +211,43 @@ fn supported_matern_adapter_matches_direct_precision_conditioning() {
         .flatten()
         .zip(expected_covariance.iter().flatten())
     {
+        assert!((actual - expected).abs() <= 1.0e-10);
+    }
+
+    let diagonal_blocks = ExactObservationDiagonalBlocks::from_supported_matern_factor(
+        &supported.factor().unwrap(),
+        &observation_map,
+        &output_map,
+        1,
+        2,
+    )
+    .unwrap();
+    let diagonal = ExactObservationDiagonalPosterior::from_blocks_with_noise_covariance(
+        diagonal_blocks,
+        vec![vec![noise_variance]],
+    )
+    .unwrap();
+    let diagonal_mean = diagonal.output_mean(&observation_value).unwrap();
+    for (actual, expected) in diagonal_mean.iter().zip(actual_mean) {
+        assert!((actual - expected).abs() <= 1.0e-10);
+    }
+    for (index, variance) in diagonal.posterior_output_variances().iter().enumerate() {
+        assert!((variance - actual_covariance[index][index]).abs() <= 1.0e-10);
+    }
+    let input = vec![0.3, -0.8];
+    let prior_action = supported
+        .factor()
+        .unwrap()
+        .covariance_action(&output_map.apply_transpose(&input).unwrap())
+        .and_then(|action| output_map.apply(&action))
+        .unwrap();
+    let diagonal_action = diagonal
+        .posterior_output_covariance_action_from_prior_action(&input, &prior_action)
+        .unwrap();
+    let full_action = exact_observation
+        .posterior_output_covariance_action(&input)
+        .unwrap();
+    for (actual, expected) in diagonal_action.iter().zip(full_action) {
         assert!((actual - expected).abs() <= 1.0e-10);
     }
 

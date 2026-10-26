@@ -4,7 +4,9 @@ pub mod exact_observation;
 
 pub use exact_observation::{
     ExactObservationCovarianceBlocks, ExactObservationCovarianceProvenance,
-    ExactObservationPosterior, ExactObservationPosteriorDiagnostics,
+    ExactObservationDiagonalBlocks, ExactObservationDiagonalPosterior,
+    ExactObservationDiagonalPosteriorDiagnostics, ExactObservationPosterior,
+    ExactObservationPosteriorDiagnostics,
 };
 
 use crate::boundary::EssentialBoundaryElimination;

@@ -12,6 +12,8 @@ pub mod error;
 pub mod hodge;
 pub mod infer;
 pub mod linear_pde;
+pub mod magnetostatics;
+pub mod mesh;
 pub mod model;
 pub mod operator;
 pub mod physical;

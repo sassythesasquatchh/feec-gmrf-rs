@@ -333,6 +333,7 @@ pub struct MaternPriorMetadata {
     recurrence_inverse: InverseUse,
     normalization: PriorNormalization,
     post_construction_precision_scale: f64,
+    spectrum_matched_potential: bool,
 }
 
 impl MaternPriorMetadata {
@@ -362,8 +363,18 @@ impl MaternPriorMetadata {
         self.adjacent_dimensions
     }
 
+    /// Requested parameters. For a spectrum-matched potential, `alpha`
+    /// describes the differentiated field spectrum rather than the potential.
     pub fn parameters(&self) -> MaternParameters {
         self.parameters
+    }
+
+    /// Whether the precision is `R_(alpha+1) - kappa^2 R_alpha`.
+    /// With exact compatible masses, the requested Matérn spectrum then lives
+    /// on the nonzero exterior-derivative/codifferential modes of the potential.
+    /// Provided inverse metrics retain their explicitly approximate semantics.
+    pub fn is_spectrum_matched_potential(&self) -> bool {
+        self.spectrum_matched_potential
     }
 
     pub fn lower_adjoint_inverse(&self) -> InverseUse {
@@ -834,7 +845,8 @@ impl AdjacentMaternPriorBuilder {
 
     /// Select the degree-`k` inverse metric between repeated Matérn factors.
     ///
-    /// This setting is ignored, and reported as unused, when `alpha = 1`.
+    /// For ordinary `build`, this is unused when `alpha = 1`. Spectrum-matched
+    /// potential construction also needs the next recurrence and uses it.
     pub fn recurrence_inverse(mut self, policy: EliminatedMassInversePolicy) -> Self {
         self.recurrence_inverse = policy;
         self
@@ -855,6 +867,28 @@ impl AdjacentMaternPriorBuilder {
 
     /// Assemble the centered eliminated precision.
     pub fn build(self) -> Result<GaussianPrior> {
+        self.build_with_spectral_correction(false)
+    }
+
+    /// Put the requested Matérn spectrum on differentiated potential modes.
+    ///
+    /// Reuses the existing spectrum-matched construction on the already
+    /// boundary-reduced adjacent operators. For exact masses, a positive Hodge
+    /// eigenmode has precision `tau^2 lambda (kappa^2 + lambda)^alpha`, so
+    /// applying `d` or `delta` yields the requested form spectrum. Projected
+    /// inverse metrics give the corresponding sparse approximation.
+    ///
+    /// Supports alpha one and two. Harmonic modes make this law intrinsic;
+    /// such a precision is rejected unless the supplied compatible space has
+    /// already removed them. No shift, gauge constraint, or jitter is added.
+    pub fn build_spectrum_matched_potential(self) -> Result<GaussianPrior> {
+        self.build_with_spectral_correction(true)
+    }
+
+    fn build_with_spectral_correction(
+        self,
+        spectrum_matched_potential: bool,
+    ) -> Result<GaussianPrior> {
         let Self {
             operators,
             parameters,
@@ -869,6 +903,7 @@ impl AdjacentMaternPriorBuilder {
             lower_adjoint_inverse,
             recurrence_inverse,
             maximum_materialized_dimension,
+            spectrum_matched_potential,
         )
     }
 }
@@ -956,6 +991,12 @@ impl ExactMaternPriorBuilder {
     pub fn build(self) -> Result<GaussianPrior> {
         self.inner.build()
     }
+
+    /// Exact full-mass reference for the spectrum-matched potential law.
+    /// See [`AdjacentMaternPriorBuilder::build_spectrum_matched_potential`].
+    pub fn build_spectrum_matched_potential(self) -> Result<GaussianPrior> {
+        self.inner.build_spectrum_matched_potential()
+    }
 }
 
 fn build_eliminated_adjacent_matern_prior(
@@ -964,7 +1005,13 @@ fn build_eliminated_adjacent_matern_prior(
     lower_adjoint_inverse: EliminatedMassInversePolicy,
     recurrence_inverse: EliminatedMassInversePolicy,
     maximum_materialized_dimension: usize,
+    spectrum_matched_potential: bool,
 ) -> Result<GaussianPrior> {
+    if spectrum_matched_potential && parameters.alpha == MaternAlpha::Three {
+        return Err(FeecGmrfError::Unsupported(
+            "spectrum-matched potentials support alpha one and two".into(),
+        ));
+    }
     let blocks = assemble_exact_matern_blocks(&operators, parameters.kappa)?;
 
     let mut system = blocks.local_system.clone();
@@ -985,30 +1032,43 @@ fn build_eliminated_adjacent_matern_prior(
     };
     let system = crate::operator::validate_proper_precision("adjacent Matérn system", system)?;
 
-    let (precision, recurrence_use) = if parameters.alpha == MaternAlpha::One {
-        (system.scaled(parameters.tau.powi(2)), InverseUse::NotUsed)
-    } else {
-        let recurrence_kind = recurrence_inverse.kind();
-        let mass_inverse = resolve_eliminated_mass_inverse(
-            "recurrence mass inverse",
-            &blocks.mass,
-            recurrence_inverse,
-            maximum_materialized_dimension,
-        )?;
-        (
-            matern_recurrence(&system, &mass_inverse, parameters.alpha, parameters.tau)?,
-            InverseUse::Applied(recurrence_kind),
-        )
-    };
+    let (precision, recurrence_use) =
+        if parameters.alpha == MaternAlpha::One && !spectrum_matched_potential {
+            (system.scaled(parameters.tau.powi(2)), InverseUse::NotUsed)
+        } else {
+            let recurrence_kind = recurrence_inverse.kind();
+            let mass_inverse = resolve_eliminated_mass_inverse(
+                "recurrence mass inverse",
+                &blocks.mass,
+                recurrence_inverse,
+                maximum_materialized_dimension,
+            )?;
+            let precision = if spectrum_matched_potential {
+                let corrected =
+                    feg_infer::prior::sparse_anchor_hodge::spectrum_matched_potential_precision(
+                        &feg_infer::sparse::core_triplet_to_feec_csr(&system),
+                        &feg_infer::sparse::core_triplet_to_feec_csr(&mass_inverse),
+                        parameters.alpha,
+                        parameters.kappa,
+                        parameters.tau,
+                    )
+                    .map_err(FeecGmrfError::Assembly)?;
+                feg_infer::sparse::feec_csr_to_core_triplet(&corrected)
+            } else {
+                matern_recurrence(&system, &mass_inverse, parameters.alpha, parameters.tau)?
+            };
+            (precision, InverseUse::Applied(recurrence_kind))
+        };
 
     let representation = eliminated_adjacent_representation(lower_use, recurrence_use);
-    let metadata = exact_matern_metadata(
+    let mut metadata = exact_matern_metadata(
         &operators,
         parameters,
         representation,
         lower_use,
         recurrence_use,
     );
+    metadata.spectrum_matched_potential = spectrum_matched_potential;
 
     let state_layout = operators.state().boundary_layout().clone();
     let needs_elimination = state_layout.full_dimension() != operators.state().dimension()
@@ -1174,6 +1234,7 @@ fn exact_matern_metadata(
         recurrence_inverse,
         normalization: PriorNormalization::None,
         post_construction_precision_scale: 1.0,
+        spectrum_matched_potential: false,
     }
 }
 
@@ -1528,6 +1589,7 @@ impl<'a> MaternPriorBuilder<'a> {
             recurrence_inverse: recurrence_use,
             normalization,
             post_construction_precision_scale: 1.0,
+            spectrum_matched_potential: false,
         };
         let prior = GaussianPrior::new(mean, precision)?
             .with_form_degree(operators.degree())

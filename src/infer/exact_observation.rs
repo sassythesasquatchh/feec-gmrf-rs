@@ -12,7 +12,10 @@ use crate::prior::supported::{
 };
 use crate::{FeecGmrfError, Result};
 use gmrf_core::types::{DenseMatrix, Vector};
-use gmrf_core::PreparedExactObservationPosterior;
+use gmrf_core::{
+    ExactObservationDiagonalPosteriorDiagnostics as CoreDiagonalDiagnostics,
+    PreparedExactObservationDiagonalPosterior, PreparedExactObservationPosterior,
+};
 
 /// Provenance for covariance blocks accepted by the exact conditioner.
 ///
@@ -45,6 +48,88 @@ pub struct ExactObservationCovarianceBlocks {
     output_observation_covariance: Vec<Vec<f64>>,
     prior_output_covariance: Vec<Vec<f64>>,
     provenance: ExactObservationCovarianceProvenance,
+}
+
+/// Covariance data required for exact observation-space means and all output
+/// marginal variances without constructing a dense output covariance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExactObservationDiagonalBlocks {
+    prior_observation_covariance: Vec<Vec<f64>>,
+    output_observation_covariance: Vec<Vec<f64>>,
+    prior_output_variances: Vec<f64>,
+    provenance: ExactObservationCovarianceProvenance,
+}
+
+impl ExactObservationDiagonalBlocks {
+    /// Build `Kyy`, `Kgy`, and `diag(Kgg)` from exact supported covariance
+    /// actions. The caller explicitly caps both the dense observation factor
+    /// dimension and the stored output-by-observation cross block.
+    pub fn from_supported_matern_factor(
+        factor: &SupportedMaternPosterior,
+        observation_map: &LinearMap,
+        output_map: &LinearMap,
+        maximum_observation_count: usize,
+        maximum_cross_covariance_entries: usize,
+    ) -> Result<Self> {
+        if observation_map.input_dimension() != output_map.input_dimension() {
+            return Err(FeecGmrfError::Dimension(
+                "exact diagonal observation and output maps must share a domain".to_string(),
+            ));
+        }
+        let observation_count = observation_map.output_dimension();
+        let output_count = output_map.output_dimension();
+        if observation_count == 0 || output_count == 0 {
+            return Err(FeecGmrfError::Dimension(
+                "exact diagonal conditioning requires observations and outputs".to_string(),
+            ));
+        }
+        if observation_count > maximum_observation_count {
+            return Err(FeecGmrfError::DenseDiagnosticSizeExceeded {
+                dimension: observation_count,
+                maximum: maximum_observation_count,
+            });
+        }
+        let cross_entries = observation_count.checked_mul(output_count).ok_or_else(|| {
+            FeecGmrfError::Dimension(
+                "exact diagonal output-observation cross-block size overflowed usize".to_string(),
+            )
+        })?;
+        if cross_entries > maximum_cross_covariance_entries {
+            return Err(FeecGmrfError::DenseDiagnosticSizeExceeded {
+                dimension: cross_entries,
+                maximum: maximum_cross_covariance_entries,
+            });
+        }
+        let audited = factor.pushforward_covariance_audited(observation_map)?;
+        let prior_output_variances = factor.pushforward_variances(output_map)?;
+        let mut output_observation_covariance = vec![vec![0.0; observation_count]; output_count];
+        for observation in 0..observation_count {
+            let mut selector = vec![0.0; observation_count];
+            selector[observation] = 1.0;
+            let rhs = observation_map.apply_transpose(&selector)?;
+            let covariance_action = factor.covariance_action(&rhs)?;
+            let output_action = output_map.apply(&covariance_action)?;
+            for (output, value) in output_action.into_iter().enumerate() {
+                output_observation_covariance[output][observation] = value;
+            }
+        }
+        Ok(Self {
+            prior_observation_covariance: audited.symmetric,
+            output_observation_covariance,
+            prior_output_variances,
+            provenance: ExactObservationCovarianceProvenance::SupportedMaternStacked {
+                audit: audited.audit,
+            },
+        })
+    }
+
+    pub fn observation_count(&self) -> usize {
+        self.prior_observation_covariance.len()
+    }
+
+    pub fn output_count(&self) -> usize {
+        self.prior_output_variances.len()
+    }
 }
 
 impl ExactObservationCovarianceBlocks {
@@ -171,6 +256,112 @@ pub struct ExactObservationPosterior {
     provenance: ExactObservationCovarianceProvenance,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExactObservationDiagonalPosteriorDiagnostics {
+    pub observation_count: usize,
+    pub output_count: usize,
+    pub dense_factor_allocated_entries: usize,
+    pub output_observation_covariance_entries: usize,
+    pub prior_output_variance_entries: usize,
+    pub posterior_output_variance_entries: usize,
+    pub persistent_f64_entries: usize,
+}
+
+/// Parent facade for diagonal-only exact observation-space conditioning.
+#[derive(Debug, Clone)]
+pub struct ExactObservationDiagonalPosterior {
+    inner: PreparedExactObservationDiagonalPosterior,
+    provenance: ExactObservationCovarianceProvenance,
+}
+
+impl ExactObservationDiagonalPosterior {
+    pub fn from_blocks_with_noise_covariance(
+        blocks: ExactObservationDiagonalBlocks,
+        noise_covariance: Vec<Vec<f64>>,
+    ) -> Result<Self> {
+        let prior_observation_covariance = dense_from_rows(&blocks.prior_observation_covariance)?;
+        let output_observation_covariance = dense_from_rows(&blocks.output_observation_covariance)?;
+        let prior_output_variances = Vector::from_vec(blocks.prior_output_variances);
+        let noise_covariance = dense_from_rows(&noise_covariance)?;
+        let inner = PreparedExactObservationDiagonalPosterior::from_prior_covariance_blocks_with_noise_covariance(
+            &prior_observation_covariance,
+            &output_observation_covariance,
+            &prior_output_variances,
+            &noise_covariance,
+        )?;
+        Ok(Self {
+            inner,
+            provenance: blocks.provenance,
+        })
+    }
+
+    pub fn output_mean(&self, observations: &[f64]) -> Result<Vec<f64>> {
+        Ok(self
+            .inner
+            .output_mean(&Vector::from_vec(observations.to_vec()))?
+            .iter()
+            .copied()
+            .collect())
+    }
+
+    pub fn prior_output_variances(&self) -> Vec<f64> {
+        self.inner
+            .prior_output_variances()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub fn posterior_output_variances(&self) -> Vec<f64> {
+        self.inner
+            .posterior_output_variances()
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    pub fn posterior_output_covariance_action_from_prior_action(
+        &self,
+        input: &[f64],
+        prior_action: &[f64],
+    ) -> Result<Vec<f64>> {
+        Ok(self
+            .inner
+            .posterior_output_covariance_action_from_prior_action(
+                &Vector::from_vec(input.to_vec()),
+                &Vector::from_vec(prior_action.to_vec()),
+            )?
+            .iter()
+            .copied()
+            .collect())
+    }
+
+    pub fn covariance_provenance(&self) -> &ExactObservationCovarianceProvenance {
+        &self.provenance
+    }
+
+    pub fn diagnostics(&self) -> ExactObservationDiagonalPosteriorDiagnostics {
+        let CoreDiagonalDiagnostics {
+            observation_count,
+            output_count,
+            dense_factor_allocated_entries,
+            output_observation_covariance_entries,
+            prior_output_variance_entries,
+            posterior_output_variance_entries,
+            persistent_f64_entries,
+        } = self.inner.diagnostics();
+        ExactObservationDiagonalPosteriorDiagnostics {
+            observation_count,
+            output_count,
+            dense_factor_allocated_entries,
+            output_observation_covariance_entries,
+            prior_output_variance_entries,
+            posterior_output_variance_entries,
+            persistent_f64_entries,
+        }
+    }
+}
+
 impl ExactObservationPosterior {
     /// Prepare an exact posterior from prior covariance blocks and scalar
     /// independent observation-noise variance.
@@ -188,6 +379,32 @@ impl ExactObservationPosterior {
             &prior_output_covariance,
             noise_variance,
         )?;
+        Ok(Self {
+            inner,
+            provenance: blocks.provenance,
+        })
+    }
+
+    /// Prepare an exact posterior with a caller-supplied dense noise covariance.
+    ///
+    /// The noise covariance uses ordinary row-major parent storage and must be
+    /// finite, exactly symmetric, and dimensionally compatible with `Kyy`.
+    pub fn from_prior_covariance_blocks_with_noise_covariance(
+        blocks: ExactObservationCovarianceBlocks,
+        noise_covariance: Vec<Vec<f64>>,
+    ) -> Result<Self> {
+        let prior_observation_covariance = dense_from_rows(blocks.prior_observation_covariance())?;
+        let output_observation_covariance =
+            dense_from_rows(blocks.output_observation_covariance())?;
+        let prior_output_covariance = dense_from_rows(blocks.prior_output_covariance())?;
+        let noise_covariance = dense_from_rows(&noise_covariance)?;
+        let inner =
+            PreparedExactObservationPosterior::from_prior_covariance_blocks_with_noise_covariance(
+                &prior_observation_covariance,
+                &output_observation_covariance,
+                &prior_output_covariance,
+                &noise_covariance,
+            )?;
         Ok(Self {
             inner,
             provenance: blocks.provenance,

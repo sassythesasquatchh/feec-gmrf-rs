@@ -1,4 +1,7 @@
-//! State-only models for boundary-reduced linear FEEC systems.
+//! Boundary-reduced linear FEEC systems and joint uncertain-input models.
+
+mod joint;
+pub use joint::{joint_block_map, JointLinearPdeModelBuilder};
 
 use crate::boundary::EssentialBoundaryElimination;
 use crate::model::{
@@ -306,6 +309,21 @@ impl LinearPdeSystem {
         )
     }
 
+    /// Build the canonical zero-target weak-residual observation.
+    ///
+    /// Exposing the observation lets proper sparse priors and exact supported
+    /// priors share precisely the same FEEC residual and dual-norm weighting.
+    pub fn weak_residual_observation(&self, noise: PdeResidualNoise) -> Result<LinearObservation> {
+        let precision = self.residual_precision(noise)?;
+        let residual = self.residual_quantity("__pde_residual_observation")?;
+        LinearObservation::with_bias(
+            residual.operator().clone(),
+            vec![0.0; residual.operator().output_dimension()],
+            residual.bias().to_vec(),
+            crate::model::GaussianNoise::precision(precision)?,
+        )
+    }
+
     fn boundary_layout(&self) -> Result<BoundaryLayout> {
         BoundaryLayout::new(
             self.assembly.layout.full_dimension,
@@ -434,16 +452,7 @@ impl<'a> LinearPdeModelBuilder<'a> {
     }
 
     pub fn observe_weak_residual(mut self, noise: PdeResidualNoise) -> Result<Self> {
-        let precision = self.system.residual_precision(noise)?;
-        let residual = self
-            .system
-            .residual_quantity("__pde_residual_observation")?;
-        let observation = LinearObservation::with_bias(
-            residual.operator().clone(),
-            vec![0.0; residual.operator().output_dimension()],
-            residual.bias().to_vec(),
-            crate::model::GaussianNoise::precision(precision)?,
-        )?;
+        let observation = self.system.weak_residual_observation(noise)?;
         self.inner = self.inner.observe(observation)?;
         Ok(self)
     }
@@ -527,6 +536,25 @@ mod tests {
                 PdeResidualNoise::mass_weighted_l2_standard_deviation(0.1).unwrap(),
             );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn weak_residual_observation_is_reusable_across_prior_representations() {
+        let system = diagonal_system(true)
+            .with_right_hand_side(&[2.0, 8.0])
+            .unwrap();
+        let observation = system
+            .weak_residual_observation(
+                PdeResidualNoise::mass_weighted_l2_standard_deviation(0.1).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(observation.operator.apply(&[1.0, 2.0]).unwrap(), [2.0, 8.0]);
+        assert_eq!(observation.values, [0.0, 0.0]);
+        assert_eq!(observation.bias, [-2.0, -8.0]);
+        assert!(matches!(
+            observation.noise,
+            crate::model::GaussianNoise::Precision(_)
+        ));
     }
 
     #[test]
