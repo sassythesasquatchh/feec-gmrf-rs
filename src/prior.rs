@@ -3,7 +3,9 @@
 use crate::boundary::{
     EliminatedLinearMap, EssentialBoundaryConditions, EssentialBoundaryElimination,
 };
-use crate::operator::{add_sparse, FormDegree, FormOperators, LinearMap, SparseMat};
+use crate::operator::{
+    add_sparse, multiply_sparse, BoundaryLayout, FormDegree, FormOperators, LinearMap, SparseMat,
+};
 use crate::{FeecGmrfError, Result};
 pub use feg_core::MaternAlpha;
 use feg_core::SparseTriplet;
@@ -445,6 +447,58 @@ impl MaternPriorBuilder<'static> {
             essential_boundary_conditions: None,
         }
     }
+
+    /// Assemble a homogeneous full-relative Whitney complex and construct its
+    /// projected inverse metrics after boundary elimination.
+    ///
+    /// Both adjacent derivatives use the same relative subcomplex. The lower
+    /// inverse forms the weak codifferential term; the state inverse is used
+    /// between Matérn factors. These sparse inverses approximate compatible
+    /// full-mass inverses. Existing constructors retain their original behavior.
+    pub fn from_feec_homogeneous_full_relative_with_projected_inverses(
+        topology: &Complex,
+        metric: &MeshLengths,
+        degree: usize,
+    ) -> Result<Self> {
+        let relative =
+            formoniq::relative::assemble_whitney_full_relative_operators(topology, metric, degree)
+                .map_err(|error| FeecGmrfError::Assembly(error.to_string()))?;
+        let mass = feg_infer::sparse::feec_csr_to_core_triplet(relative.state().mass());
+        let mut laplacian = SparseMat::new(mass.nrows(), mass.ncols());
+        if let (Some(outgoing), Some(upper)) = (relative.outgoing(), relative.upper()) {
+            let derivative = feg_infer::sparse::feec_csr_to_core_triplet(outgoing.active());
+            let upper_mass = feg_infer::sparse::feec_csr_to_core_triplet(upper.mass());
+            let weighted = multiply_sparse(&upper_mass, &derivative)?;
+            laplacian = multiply_sparse(&derivative.transpose(), &weighted)?;
+        }
+        if let (Some(incoming), Some(lower)) = (relative.incoming(), relative.lower()) {
+            let derivative = feg_infer::sparse::feec_csr_to_core_triplet(incoming.active());
+            let inverse = relative_projected_inverse(topology, metric, degree - 1, lower)?;
+            let coupling = multiply_sparse(&mass, &derivative)?;
+            let solved = multiply_sparse(&coupling, &inverse)?;
+            let lower_term = multiply_sparse(&solved, &coupling.transpose())?;
+            laplacian = add_sparse(&laplacian, &lower_term)?;
+        }
+        let layout = relative.state().layout();
+        let boundary = BoundaryLayout::new(
+            layout.full_dimension,
+            layout.active_dofs.clone(),
+            layout
+                .prescribed_dofs
+                .iter()
+                .map(|entry| (entry.index, entry.value))
+                .collect(),
+        )?;
+        let inverse = relative_projected_inverse(topology, metric, degree, relative.state())?;
+        let operators = FormOperators::new(
+            FormDegree::new(degree, topology.dim())?,
+            topology.dim(),
+            mass,
+            laplacian,
+        )?
+        .with_boundary_layout(boundary)?;
+        Ok(Self::from_operators(operators).mass_inverse(MassInversePolicy::Provided(inverse)))
+    }
 }
 
 impl<'a> MaternPriorBuilder<'a> {
@@ -507,6 +561,22 @@ impl<'a> MaternPriorBuilder<'a> {
 
     /// Assemble the prior precision through the grade-independent recurrence.
     pub fn build(self) -> Result<GaussianPrior> {
+        self.build_with_spectral_correction(false)
+    }
+
+    /// Correct a potential prior so its derivative has the requested Matérn
+    /// spectrum on positive compatible Hodge modes.
+    ///
+    /// For exact compatible masses, the potential precision is
+    /// `tau² lambda (kappa² + lambda)^alpha`. Projected inverses provide the
+    /// sparse approximation. Supports alpha one and two, with positive kappa.
+    /// Harmonic modes can make this law intrinsic: an unshifted Cholesky check
+    /// rejects such a precision. No gauge constraint or jitter is added.
+    pub fn build_spectrum_matched_potential(self) -> Result<GaussianPrior> {
+        self.build_with_spectral_correction(true)
+    }
+
+    fn build_with_spectral_correction(self, spectrum_matched: bool) -> Result<GaussianPrior> {
         let (mut operators, mut projected_inverse) = match self.source {
             MaternSource::Operators(operators) => (*operators, None),
             MaternSource::Feec {
@@ -598,12 +668,32 @@ impl<'a> MaternPriorBuilder<'a> {
             operators.hodge_laplacian(),
             &operators.mass().scaled(self.parameters.kappa.powi(2)),
         )?;
-        let mut precision = matern_recurrence(
-            &system,
-            &mass_inverse,
-            self.parameters.alpha,
-            self.parameters.tau,
-        )?;
+        let mut precision = if spectrum_matched {
+            let corrected =
+                feg_infer::prior::sparse_anchor_hodge::spectrum_matched_potential_precision(
+                    &feg_infer::sparse::core_triplet_to_feec_csr(&system),
+                    &feg_infer::sparse::core_triplet_to_feec_csr(&mass_inverse),
+                    self.parameters.alpha,
+                    self.parameters.kappa,
+                    self.parameters.tau,
+                )
+                .map_err(FeecGmrfError::Assembly)?;
+            feg_infer::sparse::feec_csr_to_gmrf(&corrected)
+                .cholesky_sqrt_lower()
+                .map_err(|error| {
+                    FeecGmrfError::Inference(format!(
+                        "spectrum-matched potential precision is not proper: {error}"
+                    ))
+                })?;
+            feg_infer::sparse::feec_csr_to_core_triplet(&corrected)
+        } else {
+            matern_recurrence(
+                &system,
+                &mass_inverse,
+                self.parameters.alpha,
+                self.parameters.tau,
+            )?
+        };
         apply_normalization(&mut precision, self.normalization)?;
         let mean = resolve_reduced_mean(
             self.mean,
@@ -616,6 +706,28 @@ impl<'a> MaternPriorBuilder<'a> {
             None => Ok(prior),
         }
     }
+}
+
+fn relative_projected_inverse(
+    topology: &Complex,
+    metric: &MeshLengths,
+    degree: usize,
+    space: &formoniq::relative::FullRelativeWhitneySpace,
+) -> Result<SparseMat> {
+    if degree == topology.dim() {
+        return diagonal_inverse(&feg_infer::sparse::feec_csr_to_core_triplet(space.mass()));
+    }
+    let inverse =
+        formoniq::assemble::assemble_reduced_whitney_projected_sparse_inverse_galmat_for_grade(
+            topology,
+            metric,
+            degree,
+            space.layout(),
+        )
+        .map_err(FeecGmrfError::Assembly)?;
+    Ok(feg_infer::sparse::feec_csr_to_core_triplet(
+        &common::linalg::nalgebra::CsrMatrix::from(&inverse),
+    ))
 }
 
 fn resolve_reduced_mean(

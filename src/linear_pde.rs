@@ -1,4 +1,7 @@
-//! State-only models for boundary-reduced linear FEEC systems.
+//! Models for boundary-reduced linear FEEC systems.
+
+mod joint;
+pub use joint::{joint_block_map, JointLinearPdeModelBuilder};
 
 use crate::boundary::EssentialBoundaryElimination;
 use crate::model::{

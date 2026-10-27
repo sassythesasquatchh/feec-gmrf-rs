@@ -198,6 +198,15 @@ The runnable examples provide the complete FEEC assembly around this model:
   electromagnetic 1-form problem, derives magnetic flux and reconstructed
   \(B\), compares an observation-only Matérn model with weak-PDE-residual
   conditioning, and reports engineering quantities of interest.
+- [`permeable_sphere`](crates/feg-case-studies/examples/permeable_sphere.rs)
+  infers an uncertain excitation around a linear magnetic sphere, compares
+  against its analytical solution, and exports magnetic means and uncertainty
+  to ParaView. Generate its mesh and run it with:
+
+  ```sh
+  gmsh -3 geometries/permeable_sphere.geo -format msh41 -o sphere.msh
+  cargo run --release -p feg-case-studies --example permeable_sphere -- sphere.msh out/sphere
+  ```
 
 ## Installation and optional solvers
 
