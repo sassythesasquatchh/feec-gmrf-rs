@@ -1,9 +1,11 @@
 //! Linear permeable sphere with an uncertain excitation.
 //! Usage: permeable_sphere mesh.msh output_dir
 
+use common::linalg::nalgebra::Vector as FeecVector;
+use exterior::field::DiffFormClosure;
 use feec_gmrf::prelude::*;
 use manifold::{
-    geometry::coord::{mesh::MeshCoords, simplex::SimplexHandleExt},
+    geometry::coord::{mesh::MeshCoords, quadrature::SimplexQuadRule, simplex::SimplexHandleExt},
     topology::complex::Complex,
 };
 use nalgebra::Vector3;
@@ -59,7 +61,7 @@ fn main() -> Result<()> {
     .into_iter()
     .collect::<feec_gmrf::Result<Vec<_>>>()?;
     for sensor in &sensors {
-        let x = common::linalg::nalgebra::Vector::from_column_slice(&sensor.position());
+        let x = FeecVector::from_column_slice(&sensor.position());
         let cell = coords
             .find_cell_containing(topology, x.as_view())
             .ok_or("sensor is outside mesh")?;
@@ -245,30 +247,21 @@ fn lifting_map(
             }
         }
     }
-    let subdivisions = 32;
-    let mut matrix = SparseMat::new(topology.nsimplices(1), 3);
-    for edge in topology.skeleton(1).handle_iter() {
-        let v0 = coords.coord(edge.vertices[0]);
-        let v1 = coords.coord(edge.vertices[1]);
-        let x0 = Vector3::new(v0[0], v0[1], v0[2]);
-        let d = Vector3::new(v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2]);
-        for k in 0..3 {
-            let mut xi = [0.0; 3];
-            xi[k] = 1.0;
-            let mut integral = 0.0;
-            for j in 0..subdivisions {
-                for g in [-1.0_f64 / 3.0_f64.sqrt(), 1.0_f64 / 3.0_f64.sqrt()] {
-                    let t = (j as f64 + 0.5 * (1.0 + g)) / subdivisions as f64;
-                    let potential = Vector3::from(reference.lifting((x0 + d * t).into(), xi));
-                    integral += potential.dot(&d) / (2 * subdivisions) as f64;
-                }
-            }
-            if integral != 0.0 {
-                matrix.push(edge.kidx(), k, integral);
-            }
-        }
-    }
-    Ok(LinearMap::new(matrix)?)
+    let basis: [_; 3] = std::array::from_fn(|k| {
+        let mut xi = [0.0; 3];
+        xi[k] = 1.0;
+        DiffFormClosure::one_form(
+            move |x| FeecVector::from_column_slice(&reference.lifting([x[0], x[1], x[2]], xi)),
+            3,
+        )
+    });
+    let quadrature = SimplexQuadRule::segment_gauss_legendre(32);
+    Ok(cochain_projection_map(
+        topology,
+        coords,
+        &basis,
+        Some(&quadrature),
+    )?)
 }
 
 #[cfg(test)]

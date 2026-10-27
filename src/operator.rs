@@ -9,6 +9,51 @@ use std::collections::BTreeSet;
 /// Sparse matrix representation used by public model and map types.
 pub type SparseMat = SparseTripletMatrix;
 
+/// Integrate coordinate-based differential-form basis fields into a cochain map.
+///
+/// Each basis field is one input column. All fields must have the same degree
+/// and use the mesh's ambient coordinates. Integration and simplex orientation
+/// are delegated to FEEC's existing `cochain_projection`; an optional rule
+/// controls quadrature accuracy for non-polynomial fields.
+pub fn cochain_projection_map(
+    topology: &manifold::topology::complex::Complex,
+    coords: &manifold::geometry::coord::mesh::MeshCoords,
+    basis: &[impl exterior::field::DifferentialMultiForm],
+    quadrature: Option<&manifold::geometry::coord::quadrature::SimplexQuadRule>,
+) -> Result<LinearMap> {
+    let first = basis.first().ok_or_else(|| {
+        FeecGmrfError::InvalidParameter("cochain projection needs at least one basis field".into())
+    })?;
+    let degree = first.grade();
+    if degree > topology.dim()
+        || coords.nvertices() != topology.nsimplices(0)
+        || basis
+            .iter()
+            .any(|form| form.grade() != degree || form.dim_ambient() != coords.dim())
+        || quadrature.is_some_and(|rule| rule.dim() != degree)
+    {
+        return Err(FeecGmrfError::Dimension(
+            "cochain basis, quadrature, and mesh dimensions must agree".into(),
+        ));
+    }
+    let columns = basis
+        .iter()
+        .map(|form| {
+            ddf::cochain::cochain_projection(form, topology, coords, quadrature)
+                .coeffs
+                .iter()
+                .copied()
+                .enumerate()
+                .filter(|(_, value)| *value != 0.0)
+                .collect()
+        })
+        .collect::<Vec<_>>();
+    LinearMap::new(
+        SparseMat::from_columns(topology.nsimplices(degree), &columns)
+            .map_err(FeecGmrfError::Assembly)?,
+    )
+}
+
 /// A validated linear map between finite-dimensional spaces.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinearMap {

@@ -3,7 +3,7 @@
 use super::MagneticFieldMaps3d;
 use crate::operator::LinearMap;
 use crate::{FeecGmrfError, Result};
-use common::linalg::nalgebra::Vector;
+use common::linalg::nalgebra::{Matrix, Vector};
 use manifold::{geometry::coord::mesh::MeshCoords, topology::complex::Complex};
 
 /// Position and positively oriented orthonormal measurement axes.
@@ -24,20 +24,13 @@ impl MagneticPointSensor3d {
                 "sensor position and axes must be finite".into(),
             ));
         }
-        for i in 0..3 {
-            for j in 0..3 {
-                let dot: f64 = (0..3).map(|k| axes[i][k] * axes[j][k]).sum();
-                if (dot - if i == j { 1.0 } else { 0.0 }).abs() > 1e-10 {
-                    return Err(FeecGmrfError::InvalidParameter(
-                        "sensor axes must be orthonormal".into(),
-                    ));
-                }
-            }
+        let frame = Matrix::from_fn(3, 3, |i, j| axes[i][j]);
+        if (&frame * frame.transpose() - Matrix::identity(3, 3)).amax() > 1e-10 {
+            return Err(FeecGmrfError::InvalidParameter(
+                "sensor axes must be orthonormal".into(),
+            ));
         }
-        let determinant = axes[0][0] * (axes[1][1] * axes[2][2] - axes[1][2] * axes[2][1])
-            - axes[0][1] * (axes[1][0] * axes[2][2] - axes[1][2] * axes[2][0])
-            + axes[0][2] * (axes[1][0] * axes[2][1] - axes[1][1] * axes[2][0]);
-        if determinant < 0.0 {
+        if frame.determinant() < 0.0 {
             return Err(FeecGmrfError::InvalidParameter(
                 "sensor tripod must have positive orientation".into(),
             ));

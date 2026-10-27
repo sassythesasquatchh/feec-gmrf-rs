@@ -14,6 +14,72 @@ fn map(rows: &[&[f64]]) -> LinearMap {
 }
 
 #[test]
+fn cochain_basis_projection_preserves_oriented_edge_integrals() {
+    use common::linalg::nalgebra::Vector;
+    use exterior::field::DiffFormClosure;
+    use manifold::geometry::coord::quadrature::SimplexQuadRule;
+
+    let (topology, coords) = CartesianMeshInfo::new_unit_scaled(3, 2, 1.0).compute_coord_complex();
+    let basis: [_; 3] = std::array::from_fn(|axis| {
+        DiffFormClosure::one_form(
+            move |_| {
+                let mut value = Vector::zeros(3);
+                value[axis] = 1.0;
+                value
+            },
+            3,
+        )
+    });
+    let rule = SimplexQuadRule::segment_gauss_legendre(32);
+    let projection = cochain_projection_map(&topology, &coords, &basis, Some(&rule)).unwrap();
+    let input = [0.2, -0.4, 0.9];
+    let actual = projection.apply(&input).unwrap();
+    for (edge, value) in topology.skeleton(1).handle_iter().zip(actual) {
+        let a = coords.coord(edge.vertices[0]);
+        let b = coords.coord(edge.vertices[1]);
+        let expected: f64 = (0..3).map(|i| input[i] * (b[i] - a[i])).sum();
+        assert!((value - expected).abs() < 1e-13);
+    }
+
+    // Fundamental theorem for the non-polynomial exact 1-form d(exp(x)).
+    let exact = [DiffFormClosure::one_form(
+        |x| Vector::from_column_slice(&[x[0].exp(), 0.0, 0.0]),
+        3,
+    )];
+    let projected = cochain_projection_map(&topology, &coords, &exact, Some(&rule))
+        .unwrap()
+        .apply(&[1.0])
+        .unwrap();
+    for (edge, value) in topology.skeleton(1).handle_iter().zip(projected) {
+        let a = coords.coord(edge.vertices[0]);
+        let b = coords.coord(edge.vertices[1]);
+        assert!((value - (b[0].exp() - a[0].exp())).abs() < 1e-10);
+    }
+}
+
+#[test]
+fn cochain_basis_projection_rejects_incompatible_fields_and_quadrature() {
+    use common::linalg::nalgebra::Vector;
+    use exterior::field::DiffFormClosure;
+    use manifold::geometry::coord::quadrature::SimplexQuadRule;
+
+    let (topology, coords) = CartesianMeshInfo::new_unit_scaled(3, 1, 1.0).compute_coord_complex();
+    let basis = [
+        DiffFormClosure::scalar(|_| 1.0, 3),
+        DiffFormClosure::one_form(|_| Vector::zeros(3), 3),
+    ];
+    assert!(cochain_projection_map(&topology, &coords, &basis, None).is_err());
+    assert!(cochain_projection_map(
+        &topology,
+        &coords,
+        &basis[1..],
+        Some(&SimplexQuadRule::barycentric(2)),
+    )
+    .is_err());
+    assert!(cochain_projection_map(&topology, &coords, &basis[..0], None).is_err());
+}
+
+#[test]
 fn joint_model_preserves_input_prior_and_matches_dense_coupled_gaussian() {
     let state = GaussianPrior::new(vec![0.2], SparseMat::diagonal(1, 4.0)).unwrap();
     let input = GaussianPrior::new(vec![1.3], SparseMat::diagonal(1, 9.0)).unwrap();
